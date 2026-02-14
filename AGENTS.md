@@ -14,9 +14,11 @@ Guidance for agentic coding assistants operating in this repository.
 
 - `src/main.rs`: process bootstrap, env config, server startup/shutdown
 - `src/server.rs`: MCP tool surface (`join_room`, `search_memory`,
-  `delegate_task`, etc.)
+  `delegate_task`, identity policy tools, etc.)
+- `src/identity.rs`: local signer discovery (git/env/generated),
+  SSH/GPG signing and verification helpers
 - `src/room.rs`: room lifecycle, gossip receive loop, distributed search,
-  delegated task queue
+  delegated task queue, signature verification, whitelist enforcement
 - `src/node.rs`: endpoint/router/gossip/storage assembly
 - `src/storage.rs`: redb-backed memory persistence and search
 - `src/protocol.rs`: P2P wire message enums and topic derivation
@@ -41,15 +43,19 @@ no CI workflow file in repo).
 
 ### Single Test Execution
 
-There are currently no committed `#[test]`/`#[tokio::test]`
-test functions in the repository.
-Use these command forms when tests are added:
+Current unit tests live in `src/protocol.rs` and `src/storage.rs`.
+Use these command forms:
 
 - Run tests matching a name: `cargo test <test_name_substring>`
 - Run one integration test target:
   `cargo test --test <integration_test_file_stem>`
 - Run one exact test and show stdout:
   `cargo test <exact_test_name> -- --exact --nocapture`
+
+Examples:
+
+- `cargo test signer_identity_parse_and_label_roundtrip -- --exact`
+- `cargo test storage::tests::search_applies_query_and_filters -- --exact`
 
 ### Useful Verification Commands
 
@@ -66,6 +72,10 @@ Use these command forms when tests are added:
   - `SMEMO_AGENT` (default: `unknown-agent`)
   - `SMEMO_DATA_DIR` (default: `~/.local/share/smemo` equivalent)
   - `RUST_LOG` (default filter fallback: `warn`)
+  - `SMEMO_SIGNER` (`git`, `none`, `gpg`, `ssh`, `generated`)
+  - `SMEMO_GPG_KEY_ID` / `SMEMO_SIGNING_KEY` (for `SMEMO_SIGNER=gpg`)
+  - `SMEMO_SSH_PRIVATE_KEY` / `SMEMO_SIGNING_KEY` (for `SMEMO_SIGNER=ssh`)
+  - `SMEMO_SSH_PUBLIC_KEY` (optional pubkey value/path for SSH mode)
 
 ## Coding Style and Patterns
 
@@ -130,7 +140,18 @@ Follow existing style in `src/*.rs`.
 
 - Gossip payloads use postcard byte serialization (`protocol.rs`)
 - Tool I/O returned to MCP clients is JSON text (pretty-printed in helper)
+- `P2PMessage` now carries optional signature metadata
+  (`signed_by`, `signature`)
 - Preserve backward compatibility of P2P message enum variants when possible
+
+### Identity and Signature Policy
+
+- Incoming room messages are validated in `RoomManager::verify_incoming_message`
+- Whitelist identities are represented by `SignerIdentity`
+  (`gpg:<key-id>`, `ssh:<public-key>`)
+- If whitelist is non-empty, non-whitelisted identities are rejected
+- If `require_signed=true` for a room, unsigned messages are rejected
+- Outgoing room messages are signed when local signer discovery succeeds
 
 ### Storage Patterns
 
@@ -147,11 +168,14 @@ Follow existing style in `src/*.rs`.
 - Request structs should include `JsonSchema` and clear field docs
   when semantics are non-obvious
 - Use central JSON/error helpers (`ok_json`, `err`) for consistency
+- Identity policy tools currently include:
+  - `set_identity_policy`
+  - `add_whitelisted_identity`
+  - `get_identity_policy`
 
 ## Testing Guidance for New Code
 
-Because the current repo has no committed tests,
-new work should include targeted tests when feasible:
+New work should include targeted tests when feasible:
 
 - Unit tests near modules (`#[cfg(test)] mod tests`) for pure logic
 - Async behavior tests with `#[tokio::test]`

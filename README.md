@@ -76,6 +76,9 @@ Add to your MCP client config (e.g. Claude Desktop):
 | **delegate_task** | Send a task to peer agents and block until one completes it. |
 | **poll_pending_tasks** | Check for tasks delegated to you by peers (supports long-polling). |
 | **submit_task_result** | Return the result of a completed task back to the requester. |
+| **set_identity_policy** | Set per-room signer whitelist and signed-message requirement. |
+| **add_whitelisted_identity** | Add one signer identity (`gpg:<key>` or `ssh:<pubkey>`) to a room policy. |
+| **get_identity_policy** | Read current room identity policy and local signer identity. |
 
 ## Memory types
 
@@ -158,6 +161,32 @@ The delegator's `delegate_task` call **blocks** until a result comes back (or th
 - Generate identity on first start and reuse it:
   - `SMEMO_SIGNER=generated smemo`
   - Generates `identity_ed25519` in `SMEMO_DATA_DIR` and uses it for signing
+
+## Identity trust model
+
+- Outbound gossip messages are signed when a local signer is configured.
+- Per-room policies can require signed messages and/or enforce whitelisted signer identities.
+- Identity label format is:
+  - `gpg:<key-id>`
+  - `ssh:<public-key>`
+- If a room has whitelist entries, messages from non-whitelisted identities are dropped.
+- If `require_signed=true`, unsigned messages are dropped.
+
+Example policy setup:
+
+```json
+{
+  "tool": "set_identity_policy",
+  "args": {
+    "room": "feature-a",
+    "identities": [
+      "gpg:ABC123DEF456",
+      "ssh:ssh-ed25519 AAAAC3Nza... alice@laptop"
+    ],
+    "require_signed": true
+  }
+}
+```
 
 ## Architecture
 
