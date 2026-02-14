@@ -1,3 +1,4 @@
+mod identity;
 mod memory;
 mod node;
 mod protocol;
@@ -13,6 +14,7 @@ use anyhow::Result;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 
+use crate::identity::discover_startup_identity;
 use crate::node::{SmemoNode, SmemoNodeConfig};
 use crate::server::SmemoServer;
 
@@ -45,6 +47,7 @@ async fn main() -> Result<()> {
         SmemoNode::new(SmemoNodeConfig {
             user_name,
             agent_name,
+            signer: discover_startup_identity(data_path.as_deref()).ok().flatten(),
             data_dir: data_path,
         })
         .await?,

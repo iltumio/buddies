@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,8 +10,11 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::identity::{LocalSigner, verify_signature};
 use crate::memory::{MemoryEntry, SearchFilters};
-use crate::protocol::{P2PMessage, P2PMessageBody, TaskResult, TopicId, room_to_topic};
+use crate::protocol::{
+    P2PMessage, P2PMessageBody, SignerIdentity, TaskResult, TopicId, room_to_topic,
+};
 use crate::storage::Storage;
 
 const MAX_PENDING_TASKS: usize = 100;
@@ -49,6 +52,9 @@ pub struct RoomManager {
     incoming_tasks: Arc<Mutex<Vec<PendingTask>>>,
     task_waiters: Arc<Mutex<HashMap<Uuid, oneshot::Sender<TaskResult>>>>,
     task_notify: Arc<tokio::sync::Notify>,
+    signer: Option<LocalSigner>,
+    room_whitelists: Arc<RwLock<HashMap<String, HashSet<SignerIdentity>>>>,
+    require_signed: Arc<RwLock<HashMap<String, bool>>>,
 }
 
 impl RoomManager {
@@ -57,6 +63,7 @@ impl RoomManager {
         user_name: String,
         agent_name: String,
         storage: Arc<Storage>,
+        signer: Option<LocalSigner>,
     ) -> Arc<Self> {
         Arc::new(Self {
             gossip,
@@ -69,7 +76,54 @@ impl RoomManager {
             incoming_tasks: Arc::new(Mutex::new(Vec::new())),
             task_waiters: Arc::new(Mutex::new(HashMap::new())),
             task_notify: Arc::new(tokio::sync::Notify::new()),
+            signer,
+            room_whitelists: Arc::new(RwLock::new(HashMap::new())),
+            require_signed: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    pub fn signer_identity_label(&self) -> Option<String> {
+        self.signer.as_ref().map(|s| s.identity().to_label())
+    }
+
+    pub async fn set_identity_policy(
+        &self,
+        room_name: &str,
+        identities: Vec<SignerIdentity>,
+        require_signed: bool,
+    ) {
+        {
+            let mut whitelists = self.room_whitelists.write().await;
+            whitelists.insert(room_name.to_string(), identities.into_iter().collect());
+        }
+        {
+            let mut modes = self.require_signed.write().await;
+            modes.insert(room_name.to_string(), require_signed);
+        }
+    }
+
+    pub async fn add_whitelisted_identity(&self, room_name: &str, identity: SignerIdentity) {
+        let mut whitelists = self.room_whitelists.write().await;
+        let whitelist = whitelists.entry(room_name.to_string()).or_default();
+        whitelist.insert(identity);
+    }
+
+    pub async fn get_identity_policy(&self, room_name: &str) -> (Vec<String>, bool) {
+        let whitelist = {
+            let whitelists = self.room_whitelists.read().await;
+            whitelists
+                .get(room_name)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| id.to_label())
+                .collect::<Vec<_>>()
+        };
+        let require_signed = {
+            let modes = self.require_signed.read().await;
+            *modes.get(room_name).unwrap_or(&false)
+        };
+        (whitelist, require_signed)
     }
 
     #[allow(dead_code)]
@@ -167,12 +221,31 @@ impl RoomManager {
     }
 
     pub async fn broadcast_to_room(&self, room_name: &str, msg: P2PMessage) -> Result<()> {
+        let msg = self.try_sign_message(msg);
         let rooms = self.rooms.read().await;
         let room = rooms
             .get(room_name)
             .ok_or_else(|| anyhow::anyhow!("not in room: {room_name}"))?;
         room.sender.broadcast(msg.to_bytes()).await?;
         Ok(())
+    }
+
+    fn try_sign_message(&self, mut msg: P2PMessage) -> P2PMessage {
+        let Some(signer) = self.signer.as_ref() else {
+            return msg;
+        };
+        let payload = msg.signing_payload();
+        match signer.sign(&payload) {
+            Ok(signature) => {
+                msg.signed_by = Some(signer.identity());
+                msg.signature = Some(signature);
+                msg
+            }
+            Err(error) => {
+                warn!(%error, "failed to sign outgoing message; sending unsigned");
+                msg
+            }
+        }
     }
 
     pub async fn search_distributed(
@@ -348,6 +421,10 @@ impl RoomManager {
             }
         };
 
+        if !self.verify_incoming_message(room_name, &msg).await {
+            return;
+        }
+
         match msg.body {
             P2PMessageBody::Join { name, agent } => {
                 let mut peers = self.peers.write().await;
@@ -451,6 +528,48 @@ impl RoomManager {
                 if let Some(tx) = waiters.remove(&task_id) {
                     let _ = tx.send(result);
                 }
+            }
+        }
+    }
+
+    async fn verify_incoming_message(&self, room_name: &str, msg: &P2PMessage) -> bool {
+        let whitelist = {
+            let whitelists = self.room_whitelists.read().await;
+            whitelists.get(room_name).cloned().unwrap_or_default()
+        };
+        let must_be_signed = {
+            let modes = self.require_signed.read().await;
+            *modes.get(room_name).unwrap_or(&false)
+        };
+
+        let Some(identity) = msg.signed_by.as_ref() else {
+            if must_be_signed || !whitelist.is_empty() {
+                warn!(room = %room_name, "dropped unsigned message due to identity policy");
+                return false;
+            }
+            return true;
+        };
+
+        let Some(signature) = msg.signature.as_ref() else {
+            warn!(room = %room_name, identity = %identity.to_label(), "dropped unsigned payload");
+            return false;
+        };
+
+        if !whitelist.is_empty() && !whitelist.contains(identity) {
+            warn!(room = %room_name, identity = %identity.to_label(), "identity not in whitelist");
+            return false;
+        }
+
+        let payload = msg.signing_payload();
+        match verify_signature(identity, &payload, signature) {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!(room = %room_name, identity = %identity.to_label(), "signature verification failed");
+                false
+            }
+            Err(error) => {
+                warn!(room = %room_name, identity = %identity.to_label(), %error, "signature verification errored");
+                false
             }
         }
     }

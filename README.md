@@ -141,6 +141,23 @@ The delegator's `delegate_task` call **blocks** until a result comes back (or th
 | `SMEMO_AGENT` | `unknown-agent` | Which agent you're using |
 | `SMEMO_DATA_DIR` | `~/.local/share/smemo` | Where local memories are stored |
 | `RUST_LOG` | `warn` | Log level (logs go to stderr, never pollutes MCP stdio) |
+| `SMEMO_SIGNER` | `git` | Signing identity source: `git`, `none`, `gpg`, `ssh`, `generated` |
+| `SMEMO_GPG_KEY_ID` | unset | GPG key ID when `SMEMO_SIGNER=gpg` (or use `SMEMO_SIGNING_KEY`) |
+| `SMEMO_SSH_PRIVATE_KEY` | unset | SSH private key path when `SMEMO_SIGNER=ssh` |
+| `SMEMO_SSH_PUBLIC_KEY` | inferred | SSH public key value or path when `SMEMO_SIGNER=ssh` |
+| `SMEMO_SIGNING_KEY` | unset | Generic fallback for `SMEMO_GPG_KEY_ID` or `SMEMO_SSH_PRIVATE_KEY` |
+
+### Startup identity options
+
+- Use existing git signing identity (default):
+  - `SMEMO_SIGNER=git`
+  - Reads `git config user.signingkey` and `git config gpg.format`
+- Provide explicit key at startup:
+  - GPG: `SMEMO_SIGNER=gpg SMEMO_GPG_KEY_ID=<key-id> smemo`
+  - SSH: `SMEMO_SIGNER=ssh SMEMO_SSH_PRIVATE_KEY=~/.ssh/id_ed25519 smemo`
+- Generate identity on first start and reuse it:
+  - `SMEMO_SIGNER=generated smemo`
+  - Generates `identity_ed25519` in `SMEMO_DATA_DIR` and uses it for signing
 
 ## Architecture
 

@@ -6,6 +6,7 @@ use iroh::protocol::Router;
 use iroh::Endpoint;
 use iroh_gossip::net::Gossip;
 
+use crate::identity::LocalSigner;
 use crate::room::RoomManager;
 use crate::storage::Storage;
 
@@ -20,6 +21,7 @@ pub struct SmemoNodeConfig {
     pub user_name: String,
     pub agent_name: String,
     pub data_dir: Option<PathBuf>,
+    pub signer: Option<LocalSigner>,
 }
 
 impl SmemoNode {
@@ -44,6 +46,7 @@ impl SmemoNode {
             config.user_name,
             config.agent_name,
             Arc::clone(&storage),
+            config.signer,
         );
 
         Ok(Self {

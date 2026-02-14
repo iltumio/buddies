@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::memory::{MemoryEntry, MemoryKind, SearchFilters};
 use crate::node::SmemoNode;
-use crate::protocol::{P2PMessage, P2PMessageBody, TaskResult};
+use crate::protocol::{P2PMessage, P2PMessageBody, SignerIdentity, TaskResult};
 use crate::ticket::RoomTicket;
 
 #[derive(Clone)]
@@ -106,6 +106,27 @@ pub struct SubmitTaskResultRequest {
     pub success: bool,
     #[schemars(description = "The output (if success) or error message (if failure)")]
     pub output: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetIdentityPolicyRequest {
+    pub room: String,
+    #[schemars(description = "Allowed signer identities like gpg:<key_id> or ssh:<public_key>")]
+    pub identities: Vec<String>,
+    #[schemars(description = "If true, drop unsigned messages even when whitelist is empty")]
+    pub require_signed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddWhitelistedIdentityRequest {
+    pub room: String,
+    #[schemars(description = "Signer identity in form gpg:<key_id> or ssh:<public_key>")]
+    pub identity: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetIdentityPolicyRequest {
+    pub room: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -466,6 +487,76 @@ impl SmemoServer {
         ok_json(&serde_json::json!({
             "submitted": true,
             "task_id": req.task_id,
+        }))
+    }
+
+    #[tool(
+        name = "set_identity_policy",
+        description = "Set per-room identity whitelist and signature requirement. Only whitelisted signed messages are accepted when identities are configured."
+    )]
+    async fn set_identity_policy(
+        &self,
+        Parameters(req): Parameters<SetIdentityPolicyRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut parsed = Vec::with_capacity(req.identities.len());
+        for identity in &req.identities {
+            let id = SignerIdentity::parse(identity)
+                .map_err(|e| err(format!("invalid identity '{identity}': {e}")))?;
+            parsed.push(id);
+        }
+        let require_signed = req.require_signed.unwrap_or(false);
+
+        self.node
+            .room_manager
+            .set_identity_policy(&req.room, parsed, require_signed)
+            .await;
+
+        let (identities, mode) = self.node.room_manager.get_identity_policy(&req.room).await;
+        ok_json(&serde_json::json!({
+            "room": req.room,
+            "require_signed": mode,
+            "identities": identities,
+        }))
+    }
+
+    #[tool(
+        name = "add_whitelisted_identity",
+        description = "Add one allowed signer identity to a room policy. Identity format: gpg:<key_id> or ssh:<public_key>."
+    )]
+    async fn add_whitelisted_identity(
+        &self,
+        Parameters(req): Parameters<AddWhitelistedIdentityRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let identity = SignerIdentity::parse(&req.identity)
+            .map_err(|e| err(format!("invalid identity: {e}")))?;
+        self.node
+            .room_manager
+            .add_whitelisted_identity(&req.room, identity)
+            .await;
+
+        let (identities, mode) = self.node.room_manager.get_identity_policy(&req.room).await;
+        ok_json(&serde_json::json!({
+            "room": req.room,
+            "require_signed": mode,
+            "identities": identities,
+        }))
+    }
+
+    #[tool(
+        name = "get_identity_policy",
+        description = "Get current signer identity policy for a room and local node identity loaded from git config."
+    )]
+    async fn get_identity_policy(
+        &self,
+        Parameters(req): Parameters<GetIdentityPolicyRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let (identities, require_signed) = self.node.room_manager.get_identity_policy(&req.room).await;
+        let local_identity = self.node.room_manager.signer_identity_label();
+        ok_json(&serde_json::json!({
+            "room": req.room,
+            "require_signed": require_signed,
+            "identities": identities,
+            "local_identity": local_identity,
         }))
     }
 }

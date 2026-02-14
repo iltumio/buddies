@@ -101,3 +101,111 @@ impl Storage {
         Ok(removed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::Storage;
+    use crate::memory::{MemoryEntry, MemoryKind, SearchFilters};
+    use uuid::Uuid;
+
+    fn entry(
+        room: &str,
+        title: &str,
+        content: &str,
+        kind: MemoryKind,
+        tags: Vec<&str>,
+        timestamp: u64,
+    ) -> MemoryEntry {
+        MemoryEntry {
+            id: Uuid::new_v4(),
+            author: "tester".to_string(),
+            timestamp,
+            room: room.to_string(),
+            kind,
+            title: title.to_string(),
+            content: content.to_string(),
+            tags: tags.into_iter().map(ToString::to_string).collect(),
+            references: vec![],
+        }
+    }
+
+    fn test_storage() -> Storage {
+        let dir = std::env::temp_dir().join(format!("smemo-storage-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create test dir");
+        Storage::open(&dir.join("smemo.redb")).expect("storage init")
+    }
+
+    #[test]
+    fn list_returns_descending_timestamp_order() {
+        let storage = test_storage();
+
+        let older = entry(
+            "room-a",
+            "older",
+            "first",
+            MemoryKind::Context,
+            vec!["x"],
+            1,
+        );
+        let newer = entry(
+            "room-a",
+            "newer",
+            "second",
+            MemoryKind::Context,
+            vec!["x"],
+            2,
+        );
+
+        storage.store(&older).expect("store older");
+        storage.store(&newer).expect("store newer");
+
+        let filters = SearchFilters {
+            room: Some("room-a".to_string()),
+            kind: None,
+            tags: None,
+        };
+
+        let results = storage.list(&filters, 10).expect("list results");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "newer");
+        assert_eq!(results[1].title, "older");
+    }
+
+    #[test]
+    fn search_applies_query_and_filters() {
+        let storage = test_storage();
+
+        let decision = entry(
+            "room-a",
+            "db decision",
+            "Use postgres",
+            MemoryKind::Decision,
+            vec!["db", "schema"],
+            10,
+        );
+        let status = entry(
+            "room-a",
+            "progress",
+            "Auth module done",
+            MemoryKind::Status,
+            vec!["auth"],
+            11,
+        );
+
+        storage.store(&decision).expect("store decision");
+        storage.store(&status).expect("store status");
+
+        let filters = SearchFilters {
+            room: Some("room-a".to_string()),
+            kind: Some("decision".to_string()),
+            tags: Some(vec!["schema".to_string()]),
+        };
+
+        let matches = storage.search("postgres", &filters, 10).expect("search");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].title, "db decision");
+        assert_eq!(matches[0].kind.to_string(), "decision");
+    }
+}
