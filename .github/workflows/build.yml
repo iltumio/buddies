@@ -85,10 +85,14 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create release
+      - name: Create or update release
         if: steps.tag.outputs.has_tag == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.version }}
-          files: artifacts/*/buddies-*
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/*/buddies-* --clobber
+          else
+            gh release create "$TAG" artifacts/*/buddies-* --generate-notes
+          fi
