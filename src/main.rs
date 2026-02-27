@@ -4,6 +4,7 @@ mod node;
 mod protocol;
 mod room;
 mod server;
+mod skill;
 mod storage;
 mod ticket;
 

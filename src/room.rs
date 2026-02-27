@@ -15,6 +15,7 @@ use crate::memory::{MemoryEntry, SearchFilters};
 use crate::protocol::{
     P2PMessage, P2PMessageBody, SignerIdentity, TaskResult, TopicId, room_to_topic,
 };
+use crate::skill::{SkillSearchFilters, SkillSearchResult, SkillVote};
 use crate::storage::Storage;
 
 const MAX_PENDING_TASKS: usize = 100;
@@ -49,6 +50,7 @@ pub struct RoomManager {
     peers: Arc<RwLock<HashMap<String, HashMap<String, PeerInfo>>>>,
     storage: Arc<Storage>,
     pending_searches: Arc<Mutex<HashMap<Uuid, tokio::sync::mpsc::Sender<Vec<MemoryEntry>>>>>,
+    pending_skill_searches: Arc<Mutex<HashMap<Uuid, tokio::sync::mpsc::Sender<Vec<SkillSearchResult>>>>>,
     incoming_tasks: Arc<Mutex<Vec<PendingTask>>>,
     task_waiters: Arc<Mutex<HashMap<Uuid, oneshot::Sender<TaskResult>>>>,
     task_notify: Arc<tokio::sync::Notify>,
@@ -73,6 +75,7 @@ impl RoomManager {
             peers: Arc::new(RwLock::new(HashMap::new())),
             storage,
             pending_searches: Arc::new(Mutex::new(HashMap::new())),
+            pending_skill_searches: Arc::new(Mutex::new(HashMap::new())),
             incoming_tasks: Arc::new(Mutex::new(Vec::new())),
             task_waiters: Arc::new(Mutex::new(HashMap::new())),
             task_notify: Arc::new(tokio::sync::Notify::new()),
@@ -300,6 +303,64 @@ impl RoomManager {
         Ok(local_results)
     }
 
+    pub async fn search_skills_distributed(
+        &self,
+        room_name: &str,
+        query: &str,
+        filters: &SkillSearchFilters,
+        timeout_secs: u64,
+    ) -> Result<Vec<SkillSearchResult>> {
+        let mut local_results = self.storage.search_skills(query, filters, 50)?;
+
+        let request_id = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<SkillSearchResult>>(32);
+
+        {
+            let mut pending = self.pending_skill_searches.lock().await;
+            pending.insert(request_id, tx);
+        }
+
+        let search_msg = P2PMessage::new(P2PMessageBody::SkillSearchRequest {
+            request_id,
+            query: query.to_string(),
+            filters: filters.clone(),
+        });
+
+        if let Err(e) = self.broadcast_to_room(room_name, search_msg).await {
+            debug!(error = %e, "no peers to search skills (broadcasting failed)");
+        }
+
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                Some(results) = rx.recv() => {
+                    for result in results {
+                        if let Some(existing) = local_results.iter_mut().find(|r| r.entry.hash == result.entry.hash) {
+                            existing.rank += result.rank;
+                        } else {
+                            local_results.push(result);
+                        }
+                    }
+                }
+                () = &mut deadline => {
+                    break;
+                }
+            }
+        }
+
+        {
+            let mut pending = self.pending_skill_searches.lock().await;
+            pending.remove(&request_id);
+        }
+
+        local_results.sort_by(|a, b| b.rank.cmp(&a.rank).then(b.entry.timestamp.cmp(&a.entry.timestamp)));
+        local_results.truncate(50);
+
+        Ok(local_results)
+    }
+
     pub async fn delegate_task(
         &self,
         room_name: &str,
@@ -451,10 +512,10 @@ impl RoomManager {
             }
             P2PMessageBody::StatusUpdate { author, text } => {
                 let mut peers = self.peers.write().await;
-                if let Some(room_peers) = peers.get_mut(room_name) {
-                    if let Some(peer) = room_peers.get_mut(&author) {
-                        peer.last_status = Some(text);
-                    }
+                if let Some(room_peers) = peers.get_mut(room_name)
+                    && let Some(peer) = room_peers.get_mut(&author)
+                {
+                    peer.last_status = Some(text);
                 }
             }
             P2PMessageBody::SearchRequest {
@@ -527,6 +588,60 @@ impl RoomManager {
                 let mut waiters = self.task_waiters.lock().await;
                 if let Some(tx) = waiters.remove(&task_id) {
                     let _ = tx.send(result);
+                }
+            }
+            P2PMessageBody::SkillPublished { entry } => {
+                if let Err(e) = self.storage.store_skill(&entry) {
+                    warn!(error = %e, "failed to store received skill");
+                }
+            }
+            P2PMessageBody::SkillSearchRequest {
+                request_id,
+                query,
+                filters,
+            } => {
+                let results = self
+                    .storage
+                    .search_skills(&query, &filters, 20)
+                    .unwrap_or_default();
+                if !results.is_empty() {
+                    let response = P2PMessage::new(P2PMessageBody::SkillSearchResponse {
+                        request_id,
+                        results,
+                        peer_name: self.user_name.clone(),
+                    });
+                    if let Err(e) = self.broadcast_to_room(room_name, response).await {
+                        debug!(error = %e, "failed to send skill search response");
+                    }
+                }
+            }
+            P2PMessageBody::SkillSearchResponse {
+                request_id,
+                results,
+                ..
+            } => {
+                let pending = self.pending_skill_searches.lock().await;
+                if let Some(tx) = pending.get(&request_id) {
+                    let _ = tx.send(results).await;
+                }
+            }
+            P2PMessageBody::SkillVoteCast {
+                skill_hash,
+                voter,
+                score,
+            } => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let vote = SkillVote {
+                    skill_hash,
+                    voter,
+                    score,
+                    timestamp: now,
+                };
+                if let Err(e) = self.storage.vote_skill(&vote) {
+                    warn!(error = %e, "failed to store received skill vote");
                 }
             }
         }

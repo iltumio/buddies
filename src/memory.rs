@@ -60,10 +60,10 @@ impl MemoryEntry {
     }
 
     pub fn matches_filters(&self, filters: &SearchFilters) -> bool {
-        if let Some(ref room) = filters.room {
-            if &self.room != room {
-                return false;
-            }
+        if let Some(ref room) = filters.room
+            && &self.room != room
+        {
+            return false;
         }
         if let Some(ref kind) = filters.kind {
             let kind_str = kind.to_lowercase();

@@ -5,8 +5,11 @@ use redb::{Database, ReadableTable, TableDefinition};
 use uuid::Uuid;
 
 use crate::memory::{MemoryEntry, SearchFilters};
+use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult, SkillVote};
 
 const MEMORIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("memories");
+const SKILLS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("skills");
+const SKILL_VOTES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("skill_votes");
 
 pub struct Storage {
     db: Database,
@@ -18,6 +21,8 @@ impl Storage {
         let tx = db.begin_write()?;
         {
             let _ = tx.open_table(MEMORIES_TABLE)?;
+            let _ = tx.open_table(SKILLS_TABLE)?;
+            let _ = tx.open_table(SKILL_VOTES_TABLE)?;
         }
         tx.commit()?;
         Ok(Self { db })
@@ -28,6 +33,8 @@ impl Storage {
         let tx = db.begin_write()?;
         {
             let _ = tx.open_table(MEMORIES_TABLE)?;
+            let _ = tx.open_table(SKILLS_TABLE)?;
+            let _ = tx.open_table(SKILL_VOTES_TABLE)?;
         }
         tx.commit()?;
         Ok(Self { db })
@@ -99,6 +106,93 @@ impl Storage {
         };
         tx.commit()?;
         Ok(removed)
+    }
+
+    pub fn store_skill(&self, entry: &SkillEntry) -> Result<()> {
+        let value = postcard::to_allocvec(entry)?;
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(SKILLS_TABLE)?;
+            table.insert(entry.hash.as_str(), value.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_skill(&self, hash: &str) -> Result<Option<SkillEntry>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(SKILLS_TABLE)?;
+        match table.get(hash)? {
+            Some(value) => {
+                let entry: SkillEntry = postcard::from_bytes(value.value())?;
+                Ok(Some(entry))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn vote_skill(&self, vote: &SkillVote) -> Result<()> {
+        let key = format!("{}:{}", vote.skill_hash, vote.voter);
+        let value = postcard::to_allocvec(vote)?;
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(SKILL_VOTES_TABLE)?;
+            table.insert(key.as_str(), value.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_skill_rank(&self, skill_hash: &str) -> Result<i64> {
+        let prefix = format!("{skill_hash}:");
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(SKILL_VOTES_TABLE)?;
+        let mut rank: i64 = 0;
+        for item in table.iter()? {
+            let (key, value) = item?;
+            if key.value().starts_with(&prefix) {
+                let vote: SkillVote = postcard::from_bytes(value.value())?;
+                rank += vote.score as i64;
+            }
+        }
+        Ok(rank)
+    }
+
+    pub fn search_skills(
+        &self,
+        query: &str,
+        filters: &SkillSearchFilters,
+        limit: usize,
+    ) -> Result<Vec<SkillSearchResult>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(SKILLS_TABLE)?;
+        let mut candidates = Vec::new();
+
+        for item in table.iter()? {
+            let (_key, value) = item?;
+            let entry: SkillEntry = postcard::from_bytes(value.value())?;
+            if entry.matches_filters(filters) && (query.is_empty() || entry.matches_query(query)) {
+                candidates.push(entry);
+            }
+        }
+        drop(table);
+        drop(tx);
+
+        let mut results: Vec<SkillSearchResult> = candidates
+            .into_iter()
+            .map(|entry| {
+                let rank = self.get_skill_rank(&entry.hash).unwrap_or(0);
+                SkillSearchResult { entry, rank }
+            })
+            .collect();
+
+        results.sort_by(|a, b| {
+            b.rank
+                .cmp(&a.rank)
+                .then(b.entry.timestamp.cmp(&a.entry.timestamp))
+        });
+        results.truncate(limit);
+        Ok(results)
     }
 }
 

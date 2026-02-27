@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::memory::{MemoryEntry, MemoryKind, SearchFilters};
 use crate::node::SmemoNode;
 use crate::protocol::{P2PMessage, P2PMessageBody, SignerIdentity, TaskResult};
+use crate::skill::{SkillEntry, SkillSearchFilters, SkillVote, skill_content_hash};
 use crate::ticket::RoomTicket;
 
 #[derive(Clone)]
@@ -129,6 +130,41 @@ pub struct GetIdentityPolicyRequest {
     pub room: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PublishSkillRequest {
+    pub room: String,
+    pub title: String,
+    pub content: String,
+    pub tags: Option<Vec<String>>,
+    pub version: Option<u32>,
+    #[schemars(description = "Hash of the previous version of this skill, if updating")]
+    pub parent_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchSkillsRequest {
+    pub query: String,
+    pub room: Option<String>,
+    pub tags: Option<Vec<String>>,
+    #[schemars(description = "Seconds to wait for P2P responses (default 3)")]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VoteSkillRequest {
+    pub room: String,
+    #[schemars(description = "Content hash of the skill to vote on")]
+    pub hash: String,
+    #[schemars(description = "1 for upvote, -1 for downvote")]
+    pub score: i8,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetSkillRequest {
+    #[schemars(description = "Content hash of the skill to retrieve")]
+    pub hash: String,
+}
+
 #[derive(Debug, Serialize)]
 struct MemoryOutput {
     id: String,
@@ -139,6 +175,66 @@ struct MemoryOutput {
     content: String,
     tags: Vec<String>,
     timestamp: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillOutput {
+    hash: String,
+    author: String,
+    room: String,
+    title: String,
+    content: String,
+    tags: Vec<String>,
+    version: u32,
+    parent_hash: Option<String>,
+    timestamp: u64,
+}
+
+impl From<SkillEntry> for SkillOutput {
+    fn from(e: SkillEntry) -> Self {
+        Self {
+            hash: e.hash,
+            author: e.author,
+            room: e.room,
+            title: e.title,
+            content: e.content,
+            tags: e.tags,
+            version: e.version,
+            parent_hash: e.parent_hash,
+            timestamp: e.timestamp,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SkillSearchResultOutput {
+    hash: String,
+    author: String,
+    room: String,
+    title: String,
+    content: String,
+    tags: Vec<String>,
+    version: u32,
+    parent_hash: Option<String>,
+    timestamp: u64,
+    rank: i64,
+}
+
+impl From<crate::skill::SkillSearchResult> for SkillSearchResultOutput {
+    fn from(r: crate::skill::SkillSearchResult) -> Self {
+        Self {
+            hash: r.entry.hash,
+            author: r.entry.author,
+            room: r.entry.room,
+            title: r.entry.title,
+            content: r.entry.content,
+            tags: r.entry.tags,
+            version: r.entry.version,
+            parent_hash: r.entry.parent_hash,
+            timestamp: r.entry.timestamp,
+            rank: r.rank,
+        }
+    }
 }
 
 impl From<MemoryEntry> for MemoryOutput {
@@ -558,6 +654,157 @@ impl SmemoServer {
             "identities": identities,
             "local_identity": local_identity,
         }))
+    }
+
+    #[tool(
+        name = "publish_skill",
+        description = "Publish a content-addressable skill and broadcast it to all peers in the room. The skill is identified by a SHA-256 hash of its content, enabling automatic deduplication across peers. Returns the skill with its unique hash."
+    )]
+    async fn publish_skill(
+        &self,
+        Parameters(req): Parameters<PublishSkillRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let tags = req.tags.unwrap_or_default();
+        let hash = skill_content_hash(&req.title, &req.content, &tags);
+
+        let entry = SkillEntry {
+            hash: hash.clone(),
+            author: self.node.endpoint.id().to_string(),
+            timestamp: now_ts(),
+            room: req.room.clone(),
+            title: req.title,
+            content: req.content,
+            tags,
+            version: req.version.unwrap_or(1),
+            parent_hash: req.parent_hash,
+        };
+
+        self.node
+            .storage
+            .store_skill(&entry)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let broadcast_msg = P2PMessage::new(P2PMessageBody::SkillPublished {
+            entry: entry.clone(),
+        });
+        let _ = self
+            .node
+            .room_manager
+            .broadcast_to_room(&req.room, broadcast_msg)
+            .await;
+
+        let output: SkillOutput = entry.into();
+        ok_json(&output)
+    }
+
+    #[tool(
+        name = "search_skills",
+        description = "Search skills across your local store AND all peers in the room. Results are ranked by votes (highest first). Use this to find the best skill for a task."
+    )]
+    async fn search_skills(
+        &self,
+        Parameters(req): Parameters<SearchSkillsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let filters = SkillSearchFilters {
+            room: req.room.clone(),
+            tags: req.tags,
+        };
+
+        let timeout = req.timeout_secs.unwrap_or(3);
+
+        let results = if let Some(ref room) = req.room {
+            self.node
+                .room_manager
+                .search_skills_distributed(room, &req.query, &filters, timeout)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        } else {
+            self.node
+                .storage
+                .search_skills(&req.query, &filters, 50)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        };
+
+        let outputs: Vec<SkillSearchResultOutput> = results.into_iter().map(Into::into).collect();
+        ok_json(&outputs)
+    }
+
+    #[tool(
+        name = "vote_skill",
+        description = "Upvote (+1) or downvote (-1) a skill by its content hash. Votes are broadcast to all peers in the room and affect search ranking."
+    )]
+    async fn vote_skill(
+        &self,
+        Parameters(req): Parameters<VoteSkillRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if req.score != 1 && req.score != -1 {
+            return Err(err("score must be 1 (upvote) or -1 (downvote)"));
+        }
+
+        let voter = self.node.endpoint.id().to_string();
+
+        let vote = SkillVote {
+            skill_hash: req.hash.clone(),
+            voter: voter.clone(),
+            score: req.score,
+            timestamp: now_ts(),
+        };
+
+        self.node
+            .storage
+            .vote_skill(&vote)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let broadcast_msg = P2PMessage::new(P2PMessageBody::SkillVoteCast {
+            skill_hash: req.hash.clone(),
+            voter,
+            score: req.score,
+        });
+        let _ = self
+            .node
+            .room_manager
+            .broadcast_to_room(&req.room, broadcast_msg)
+            .await;
+
+        let rank = self
+            .node
+            .storage
+            .get_skill_rank(&req.hash)
+            .unwrap_or(0);
+
+        ok_json(&serde_json::json!({
+            "voted": true,
+            "hash": req.hash,
+            "your_score": req.score,
+            "new_rank": rank,
+        }))
+    }
+
+    #[tool(
+        name = "get_skill",
+        description = "Retrieve a specific skill by its content hash."
+    )]
+    async fn get_skill(
+        &self,
+        Parameters(req): Parameters<GetSkillRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let entry = self
+            .node
+            .storage
+            .get_skill(&req.hash)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        match entry {
+            Some(skill) => {
+                let rank = self.node.storage.get_skill_rank(&req.hash).unwrap_or(0);
+                let output = SkillSearchResultOutput::from(crate::skill::SkillSearchResult {
+                    entry: skill,
+                    rank,
+                });
+                ok_json(&output)
+            }
+            None => Err(err(format!("skill not found: {}", req.hash))),
+        }
     }
 }
 

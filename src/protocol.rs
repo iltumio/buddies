@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::memory::{MemoryEntry, SearchFilters};
+use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult};
 
 pub type TopicId = iroh_gossip::proto::TopicId;
 
@@ -90,6 +91,24 @@ pub enum P2PMessageBody {
         task_id: Uuid,
         result: TaskResult,
         completed_by: String,
+    },
+    SkillPublished {
+        entry: SkillEntry,
+    },
+    SkillSearchRequest {
+        request_id: Uuid,
+        query: String,
+        filters: SkillSearchFilters,
+    },
+    SkillSearchResponse {
+        request_id: Uuid,
+        results: Vec<SkillSearchResult>,
+        peer_name: String,
+    },
+    SkillVoteCast {
+        skill_hash: String,
+        voter: String,
+        score: i8,
     },
 }
 
