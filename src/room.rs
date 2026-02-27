@@ -15,7 +15,7 @@ use crate::memory::{MemoryEntry, SearchFilters};
 use crate::protocol::{
     P2PMessage, P2PMessageBody, SignerIdentity, TaskResult, TopicId, room_to_topic,
 };
-use crate::skill::{SkillSearchFilters, SkillSearchResult, SkillVote};
+use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult, SkillVote};
 use crate::storage::Storage;
 
 const MAX_PENDING_TASKS: usize = 100;
@@ -87,6 +87,48 @@ impl RoomManager {
 
     pub fn signer_identity_label(&self) -> Option<String> {
         self.signer.as_ref().map(|s| s.identity().to_label())
+    }
+
+    /// Sign a skill entry in place using the local signer (if configured).
+    pub fn try_sign_skill(&self, entry: &mut SkillEntry) {
+        let Some(signer) = self.signer.as_ref() else {
+            return;
+        };
+        let payload = entry.signing_payload();
+        match signer.sign(&payload) {
+            Ok(signature) => {
+                entry.signed_by = Some(signer.identity());
+                entry.signature = Some(signature);
+            }
+            Err(error) => {
+                warn!(%error, "failed to sign skill; publishing unsigned");
+            }
+        }
+    }
+
+    /// Verify the embedded signature on a skill entry.
+    /// Returns `true` if the signature is valid or absent (unsigned skills are
+    /// accepted unless room policy rejects them).
+    pub fn verify_skill_signature(&self, room_name: &str, entry: &SkillEntry) -> bool {
+        let Some(identity) = entry.signed_by.as_ref() else {
+            return true; // unsigned — room policy decides acceptance
+        };
+        let Some(signature) = entry.signature.as_ref() else {
+            warn!(room = %room_name, skill = %entry.hash, "skill has signer but no signature");
+            return false;
+        };
+        let payload = entry.signing_payload();
+        match verify_signature(identity, &payload, signature) {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!(room = %room_name, skill = %entry.hash, identity = %identity.to_label(), "skill signature verification failed");
+                false
+            }
+            Err(error) => {
+                warn!(room = %room_name, skill = %entry.hash, %error, "skill signature verification errored");
+                false
+            }
+        }
     }
 
     pub async fn set_identity_policy(
@@ -591,6 +633,10 @@ impl RoomManager {
                 }
             }
             P2PMessageBody::SkillPublished { entry } => {
+                if !self.verify_skill_signature(room_name, &entry) {
+                    warn!(room = %room_name, skill = %entry.hash, "dropped skill with invalid signature");
+                    return;
+                }
                 if let Err(e) = self.storage.store_skill(&entry) {
                     warn!(error = %e, "failed to store received skill");
                 }

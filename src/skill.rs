@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::protocol::SignerIdentity;
+
 /// A content-addressable skill entry.
 ///
 /// The `hash` field is the hex-encoded SHA-256 of the canonical content
@@ -17,6 +19,8 @@ pub struct SkillEntry {
     pub tags: Vec<String>,
     pub version: u32,
     pub parent_hash: Option<String>,
+    pub signed_by: Option<SignerIdentity>,
+    pub signature: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,8 +87,23 @@ impl SkillEntry {
         }
         true
     }
-}
 
+    /// Produce the canonical byte payload used for signing.
+    ///
+    /// Covers the content hash, author, room, version, parent_hash, and
+    /// timestamp — everything except `signed_by` and `signature` themselves.
+    pub fn signing_payload(&self) -> Vec<u8> {
+        postcard::to_allocvec(&(
+            &self.hash,
+            &self.author,
+            &self.room,
+            self.version,
+            &self.parent_hash,
+            self.timestamp,
+        ))
+        .expect("SkillEntry signing serialization is infallible")
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +141,8 @@ mod tests {
             tags: vec!["CI".into()],
             version: 1,
             parent_hash: None,
+            signed_by: None,
+            signature: None,
         };
         assert!(entry.matches_query("deploy"));
         assert!(entry.matches_query("ci"));
@@ -140,6 +161,8 @@ mod tests {
             tags: vec!["rust".into(), "deploy".into()],
             version: 1,
             parent_hash: None,
+            signed_by: None,
+            signature: None,
         };
 
         let room_mismatch = SkillSearchFilters {

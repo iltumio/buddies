@@ -113,7 +113,7 @@ Or just tell OpenClaw in natural language: *"Add smemo as a local MCP stdio serv
 | **set_identity_policy** | Set per-room signer whitelist and signed-message requirement. |
 | **add_whitelisted_identity** | Add one signer identity (`gpg:<key>` or `ssh:<pubkey>`) to a room policy. |
 | **get_identity_policy** | Read current room identity policy and local signer identity. |
-| **publish_skill** | Publish a content-addressable skill, broadcast to all peers in the room. |
+| **publish_skill** | Publish a digitally signed, content-addressable skill and broadcast to all peers. |
 | **search_skills** | Search skills locally + across all peers, ranked by votes. |
 | **vote_skill** | Upvote (+1) or downvote (-1) a skill. Votes propagate to all peers. |
 | **get_skill** | Retrieve a specific skill by its content hash. |
@@ -134,6 +134,17 @@ Skills are reusable, content-addressable knowledge entries that agents can publi
 
 Each skill is identified by a SHA-256 hash of its content (title + body + tags), so identical skills published by different peers are automatically deduplicated. Peers vote on skills to surface the best ones.
 
+### Signed skills
+
+Skills are **digitally signed** using your configured identity (GPG or SSH). The signature is embedded directly in the skill entry and persists in storage, so any peer can verify the author’s identity at any time — not just at the moment of receipt.
+
+- When you publish a skill, smemo signs it with your local signer
+- When a peer receives a skill, the embedded signature is verified before storing
+- Skills with invalid signatures are rejected
+- The `signed_by` field (e.g. `gpg:ABC123` or `ssh:ssh-ed25519 ...`) is returned in search results and skill lookups
+
+This is separate from the transport-level P2P message signatures — skill signatures prove *who authored the content*, while message signatures prove *who sent the gossip message*.
+
 ```mermaid
 sequenceDiagram
     participant A as Alice's Agent
@@ -142,13 +153,14 @@ sequenceDiagram
     participant B as Bob's Agent
 
     A->>SA: publish_skill("Deploy to staging", "Run ./deploy.sh --env staging")
-    SA-->>SB: gossip → SkillPublished
-    SB->>SB: stored (deduped by content hash)
+    SA->>SA: sign skill with local identity
+    SA-->>SB: gossip → SkillPublished (signed)
+    SB->>SB: verify signature → store
 
     B->>SB: search_skills("deploy")
     SB-->>SA: gossip → SkillSearchRequest
     SA-->>SB: gossip → SkillSearchResponse
-    SB->>B: results ranked by votes
+    SB->>B: results ranked by votes (with signed_by)
 
     B->>SB: vote_skill(hash, +1)
     SB-->>SA: gossip → SkillVoteCast
@@ -231,12 +243,14 @@ The delegator's `delegate_task` call **blocks** until a result comes back (or th
 ## Identity trust model
 
 - Outbound gossip messages are signed when a local signer is configured.
+- Published skills are signed at the content level (signature embedded in the skill entry).
 - Per-room policies can require signed messages and/or enforce whitelisted signer identities.
 - Identity label format is:
   - `gpg:<key-id>`
   - `ssh:<public-key>`
 - If a room has whitelist entries, messages from non-whitelisted identities are dropped.
 - If `require_signed=true`, unsigned messages are dropped.
+- Incoming skills with invalid embedded signatures are rejected.
 
 Example policy setup:
 

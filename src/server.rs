@@ -187,6 +187,7 @@ struct SkillOutput {
     tags: Vec<String>,
     version: u32,
     parent_hash: Option<String>,
+    signed_by: Option<String>,
     timestamp: u64,
 }
 
@@ -201,6 +202,7 @@ impl From<SkillEntry> for SkillOutput {
             tags: e.tags,
             version: e.version,
             parent_hash: e.parent_hash,
+            signed_by: e.signed_by.as_ref().map(|s| s.to_label()),
             timestamp: e.timestamp,
         }
     }
@@ -216,6 +218,7 @@ struct SkillSearchResultOutput {
     tags: Vec<String>,
     version: u32,
     parent_hash: Option<String>,
+    signed_by: Option<String>,
     timestamp: u64,
     rank: i64,
 }
@@ -231,6 +234,7 @@ impl From<crate::skill::SkillSearchResult> for SkillSearchResultOutput {
             tags: r.entry.tags,
             version: r.entry.version,
             parent_hash: r.entry.parent_hash,
+            signed_by: r.entry.signed_by.as_ref().map(|s| s.to_label()),
             timestamp: r.entry.timestamp,
             rank: r.rank,
         }
@@ -667,7 +671,7 @@ impl SmemoServer {
         let tags = req.tags.unwrap_or_default();
         let hash = skill_content_hash(&req.title, &req.content, &tags);
 
-        let entry = SkillEntry {
+        let mut entry = SkillEntry {
             hash: hash.clone(),
             author: self.node.endpoint.id().to_string(),
             timestamp: now_ts(),
@@ -677,7 +681,11 @@ impl SmemoServer {
             tags,
             version: req.version.unwrap_or(1),
             parent_hash: req.parent_hash,
+            signed_by: None,
+            signature: None,
         };
+
+        self.node.room_manager.try_sign_skill(&mut entry);
 
         self.node
             .storage
