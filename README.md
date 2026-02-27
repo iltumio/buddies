@@ -57,6 +57,10 @@ SMEMO_USER=alice smemo
 SMEMO_USER=bob smemo
 # Agent calls: join_room({ "room": "feature-a", "ticket": "<ticket>" })
 # → connected
+
+# Or run as a standalone HTTP server
+SMEMO_TRANSPORT=http SMEMO_USER=alice smemo
+# → smemo MCP server listening on http://127.0.0.1:8080/mcp
 ```
 
 Add to your MCP client config:
@@ -71,6 +75,35 @@ Add to your MCP client config:
       "env": {
         "SMEMO_USER": "your-name"
       }
+    }
+  }
+}
+```
+
+**OpenCode** (stdio — spawned by opencode):
+
+```json
+{
+  "mcp": {
+    "smemo": {
+      "type": "local",
+      "command": ["smemo"],
+      "environment": {
+        "SMEMO_USER": "your-name"
+      }
+    }
+  }
+}
+```
+
+**OpenCode** (remote — connect to running smemo instance):
+
+```json
+{
+  "mcp": {
+    "smemo": {
+      "type": "remote",
+      "url": "http://localhost:8080/mcp"
     }
   }
 }
@@ -222,6 +255,9 @@ The delegator's `delegate_task` call **blocks** until a result comes back (or th
 | `SMEMO_AGENT` | `unknown-agent` | Which agent you're using |
 | `SMEMO_DATA_DIR` | `~/.local/share/smemo` | Where local memories are stored |
 | `RUST_LOG` | `warn` | Log level (logs go to stderr, never pollutes MCP stdio) |
+| `SMEMO_TRANSPORT` | `stdio` | Transport mode: `stdio` (default, for MCP clients that spawn the process) or `http` (standalone HTTP server) |
+| `SMEMO_PORT` | `8080` | HTTP listen port (only used when `SMEMO_TRANSPORT=http`) |
+| `SMEMO_HOST` | `127.0.0.1` | HTTP bind address (only used when `SMEMO_TRANSPORT=http`) |
 | `SMEMO_SIGNER` | `git` | Signing identity source: `git`, `none`, `gpg`, `ssh`, `generated` |
 | `SMEMO_GPG_KEY_ID` | unset | GPG key ID when `SMEMO_SIGNER=gpg` (or use `SMEMO_SIGNING_KEY`) |
 | `SMEMO_SSH_PRIVATE_KEY` | unset | SSH private key path when `SMEMO_SIGNER=ssh` |
@@ -274,7 +310,7 @@ Example policy setup:
 graph TB
     subgraph "Each developer's machine"
         Agent[AI Agent]
-        MCP[MCP stdio]
+        MCP[MCP stdio / HTTP]
         Server[SmemoServer]
         Storage[(redb)]
 
@@ -299,7 +335,7 @@ graph TB
     style OtherPeers fill:#10b981,color:#000
 ```
 
-- **Transport**: MCP over stdio (works with any MCP client)
+- **Transport**: MCP over stdio (default) or streamable HTTP — stdio for clients that spawn the process, HTTP for standalone deployment
 - **Networking**: [Iroh](https://iroh.computer) — QUIC connections with NAT hole-punching and relay fallback
 - **Gossip**: [iroh-gossip](https://github.com/n0-computer/iroh-gossip) — epidemic broadcast trees (HyParView + PlumTree)
 - **Storage**: [redb](https://github.com/cberner/redb) — embedded key-value store, single file, zero config

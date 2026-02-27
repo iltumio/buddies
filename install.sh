@@ -21,6 +21,8 @@ CONFIGURE_CLAUDE=false
 CONFIGURE_OPENCODE=false
 CONFIGURE_OPENCLAW=false
 SKIP_BUILD=false
+SMEMO_TRANSPORT="stdio"
+SMEMO_PORT="8080"
 
 usage() {
     cat <<EOF
@@ -31,6 +33,8 @@ Usage: ./install.sh [options]
 Options:
   --user <name>         Set SMEMO_USER (default: OS username)
   --signer <mode>       Signing mode: git, none, gpg, ssh, generated (default: git)
+  --transport <mode>    Transport mode: stdio or http (default: stdio)
+  --port <port>         HTTP listen port when transport=http (default: 8080)
   --claude              Configure Claude Code
   --opencode            Configure OpenCode
   --openclaw            Configure OpenClaw
@@ -42,6 +46,7 @@ Examples:
   ./install.sh --all
   ./install.sh --claude --user alice --signer generated
   ./install.sh --opencode --skip-build
+  ./install.sh --opencode --transport http --port 9090
   ./install.sh --openclaw --user alice
 EOF
     exit 0
@@ -51,6 +56,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --user)       SMEMO_USER="$2"; shift 2 ;;
         --signer)     SMEMO_SIGNER="$2"; shift 2 ;;
+        --transport)  SMEMO_TRANSPORT="$2"; shift 2 ;;
+        --port)       SMEMO_PORT="$2"; shift 2 ;;
         --claude)     CONFIGURE_CLAUDE=true; shift ;;
         --opencode)   CONFIGURE_OPENCODE=true; shift ;;
         --openclaw)   CONFIGURE_OPENCLAW=true; shift ;;
@@ -213,7 +220,16 @@ configure_opencode() {
     fi
 
     local smemo_entry
-    smemo_entry=$(cat <<ENTRY
+    if [[ "$SMEMO_TRANSPORT" == "http" ]]; then
+        smemo_entry=$(cat <<ENTRY
+{
+  "type": "remote",
+  "url": "http://127.0.0.1:$SMEMO_PORT/mcp"
+}
+ENTRY
+)
+    else
+        smemo_entry=$(cat <<ENTRY
 {
   "type": "local",
   "command": ["$SMEMO_BIN"],
@@ -225,6 +241,7 @@ configure_opencode() {
 }
 ENTRY
 )
+    fi
 
     if command -v jq >/dev/null 2>&1; then
         echo "$existing" | jq --argjson entry "$smemo_entry" \
@@ -331,16 +348,25 @@ $CONFIGURE_OPENCODE && configure_opencode
 $CONFIGURE_OPENCLAW && configure_openclaw
 
 printf "\n${GREEN}${BOLD}Done!${NC}\n\n"
-printf "  user:   ${BOLD}%s${NC}\n" "$SMEMO_USER"
-printf "  signer: ${BOLD}%s${NC}\n" "$SMEMO_SIGNER"
-printf "  binary: ${BOLD}%s${NC}\n" "$SMEMO_BIN"
+printf "  user:      ${BOLD}%s${NC}\n" "$SMEMO_USER"
+printf "  signer:    ${BOLD}%s${NC}\n" "$SMEMO_SIGNER"
+printf "  transport: ${BOLD}%s${NC}\n" "$SMEMO_TRANSPORT"
+printf "  binary:    ${BOLD}%s${NC}\n" "$SMEMO_BIN"
+if [[ "$SMEMO_TRANSPORT" == "http" ]]; then
+    printf "  port:      ${BOLD}%s${NC}\n" "$SMEMO_PORT"
+fi
 printf "\n"
 
 if $CONFIGURE_CLAUDE; then
     printf "  ${DIM}Claude Code: restart claude to pick up changes${NC}\n"
 fi
 if $CONFIGURE_OPENCODE; then
-    printf "  ${DIM}OpenCode: restart opencode to pick up changes${NC}\n"
+    if [[ "$SMEMO_TRANSPORT" == "http" ]]; then
+        printf "  ${DIM}OpenCode: configured for remote connection to http://127.0.0.1:$SMEMO_PORT/mcp${NC}\n"
+        printf "  ${DIM}OpenCode: run 'SMEMO_TRANSPORT=http SMEMO_PORT=$SMEMO_PORT SMEMO_USER=$SMEMO_USER smemo' before starting opencode${NC}\n"
+    else
+        printf "  ${DIM}OpenCode: restart opencode to pick up changes${NC}\n"
+    fi
 fi
 if $CONFIGURE_OPENCLAW; then
     printf "  ${DIM}OpenClaw: restart openclaw gateway to pick up changes${NC}\n"

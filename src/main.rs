@@ -14,6 +14,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
 
 use crate::identity::discover_startup_identity;
 use crate::node::{SmemoNode, SmemoNodeConfig};
@@ -54,10 +57,43 @@ async fn main() -> Result<()> {
         .await?,
     );
 
-    let server = SmemoServer::new(Arc::clone(&node));
-    let service = server.serve(stdio()).await?;
-    service.waiting().await?;
+    let transport = std::env::var("SMEMO_TRANSPORT")
+        .unwrap_or_else(|_| "stdio".into());
 
-    node.shutdown().await?;
+    match transport.as_str() {
+        "http" => {
+            let port: u16 = std::env::var("SMEMO_PORT")
+                .unwrap_or_else(|_| "8080".into())
+                .parse()
+                .expect("SMEMO_PORT must be a valid port number");
+            let bind_addr = std::env::var("SMEMO_HOST")
+                .unwrap_or_else(|_| "127.0.0.1".into());
+            let addr = format!("{bind_addr}:{port}");
+
+            let ct = tokio_util::sync::CancellationToken::new();
+            let service = StreamableHttpService::new(
+                move || Ok(SmemoServer::new(Arc::clone(&node))),
+                LocalSessionManager::default().into(),
+                StreamableHttpServerConfig {
+                    stateful_mode: true,
+                    cancellation_token: ct.child_token(),
+                    ..Default::default()
+                },
+            );
+
+            let app = axum::Router::new().nest_service("/mcp", service);
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            tracing::info!("smemo HTTP server listening on {addr}");
+            eprintln!("smemo MCP server listening on http://{addr}/mcp");
+            axum::serve(listener, app).await?;
+        }
+        _ => {
+            let server = SmemoServer::new(Arc::clone(&node));
+            let service = server.serve(stdio()).await?;
+            service.waiting().await?;
+            node.shutdown().await?;
+        }
+    }
+
     Ok(())
 }
