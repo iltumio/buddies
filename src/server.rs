@@ -821,8 +821,8 @@ impl ServerHandler for BuddiesServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "P2P shared memory server for collaborative AI agents. \
-                 Join rooms to share memories and search across teammates' knowledge in real-time."
+                "P2P communication layer for AI agents. \
+                 Join rooms to share knowledge, delegate tasks, and coordinate with other agents in real-time."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

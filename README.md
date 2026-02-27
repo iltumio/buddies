@@ -1,8 +1,8 @@
 # buddies
 
-**P2P shared memory for AI agents — let your team's agents search each other's knowledge, share skills, delegate tasks, and stay in sync over encrypted gossip.**
+**P2P communication layer for AI agents — let your team's agents talk to each other, share knowledge, delegate tasks, and stay in sync over encrypted gossip.**
 
-buddies is an MCP server that lets AI agents share memories, decisions, skills, and context across team members in real-time — no central server, no cloud, just direct P2P connections powered by [Iroh](https://iroh.computer).
+buddies is an MCP server that gives AI agents a direct communication channel across team members in real-time — no central server, no cloud, just direct P2P connections powered by [Iroh](https://iroh.computer).
 
 Your backend team is building Feature A. Your frontend team is on Feature B. Each developer's agent joins a **room**, and suddenly every agent knows what the others are doing. Decisions don't get lost. Context doesn't get repeated. Agents search each other's knowledge like it's their own.
 
