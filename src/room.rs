@@ -530,16 +530,31 @@ impl RoomManager {
 
         match msg.body {
             P2PMessageBody::Join { name, agent } => {
-                let mut peers = self.peers.write().await;
-                let room_peers = peers.entry(room_name.to_string()).or_default();
-                room_peers.insert(
-                    name.clone(),
-                    PeerInfo {
-                        name,
-                        agent,
-                        last_status: None,
-                    },
-                );
+                let is_new = {
+                    let mut peers = self.peers.write().await;
+                    let room_peers = peers.entry(room_name.to_string()).or_default();
+                    let is_new = !room_peers.contains_key(&name);
+                    room_peers.insert(
+                        name.clone(),
+                        PeerInfo {
+                            name,
+                            agent,
+                            last_status: None,
+                        },
+                    );
+                    is_new
+                };
+
+                // Re-broadcast our own Join so the new peer discovers us
+                if is_new {
+                    let join_msg = P2PMessage::new(P2PMessageBody::Join {
+                        name: self.user_name.clone(),
+                        agent: self.agent_name.clone(),
+                    });
+                    if let Err(e) = self.broadcast_to_room(room_name, join_msg).await {
+                        debug!(room = %room_name, error = %e, "failed to re-broadcast join");
+                    }
+                }
             }
             P2PMessageBody::Leave { name } => {
                 let mut peers = self.peers.write().await;
