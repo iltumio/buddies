@@ -1,8 +1,8 @@
 # smemo
 
-**P2P shared memory for AI agents — let your team's agents search each other's knowledge, delegate tasks, and stay in sync over encrypted gossip.**
+**P2P shared memory for AI agents — let your team's agents search each other's knowledge, share skills, delegate tasks, and stay in sync over encrypted gossip.**
 
-smemo is an MCP server that lets AI agents share memories, decisions, and context across team members in real-time — no central server, no cloud, just direct P2P connections powered by [Iroh](https://iroh.computer).
+smemo is an MCP server that lets AI agents share memories, decisions, skills, and context across team members in real-time — no central server, no cloud, just direct P2P connections powered by [Iroh](https://iroh.computer).
 
 Your backend team is building Feature A. Your frontend team is on Feature B. Each developer's agent joins a **room**, and suddenly every agent knows what the others are doing. Decisions don't get lost. Context doesn't get repeated. Agents search each other's knowledge like it's their own.
 
@@ -31,6 +31,19 @@ sequenceDiagram
 Each smemo instance runs locally alongside your agent. Memories are stored on disk and shared over encrypted QUIC connections. When an agent searches, it queries both its local store and every peer in the room — results come back in seconds.
 
 ## Quick start
+```bash
+# One-line install + configure
+curl -sSf https://raw.githubusercontent.com/iltumio/smemo/main/install.sh | bash
+
+# Or clone and use the installer
+git clone https://github.com/iltumio/smemo
+cd smemo
+./install.sh --all
+```
+
+The installer builds from source, detects your signing identity, and configures Claude Code and/or OpenCode automatically. Run `./install.sh --help` for options.
+
+Manual setup:
 
 ```bash
 cargo install --path .
@@ -79,6 +92,10 @@ Add to your MCP client config (e.g. Claude Desktop):
 | **set_identity_policy** | Set per-room signer whitelist and signed-message requirement. |
 | **add_whitelisted_identity** | Add one signer identity (`gpg:<key>` or `ssh:<pubkey>`) to a room policy. |
 | **get_identity_policy** | Read current room identity policy and local signer identity. |
+| **publish_skill** | Publish a content-addressable skill, broadcast to all peers in the room. |
+| **search_skills** | Search skills locally + across all peers, ranked by votes. |
+| **vote_skill** | Upvote (+1) or downvote (-1) a skill. Votes propagate to all peers. |
+| **get_skill** | Retrieve a specific skill by its content hash. |
 
 ## Memory types
 
@@ -89,6 +106,34 @@ When storing a memory, tag it with a kind:
 - **context** — "The API contract requires a `user_id` field in all responses"
 - **skill** — "Run `cargo test -- --nocapture` to see test output"
 - **status** — "Auth module is 80% done, blocked on the DB migration"
+
+## Skill sharing
+
+Skills are reusable, content-addressable knowledge entries that agents can publish, discover, and vote on across the P2P network. Unlike memories (which capture what happened), skills capture how to do things — commands, procedures, workflows.
+
+Each skill is identified by a SHA-256 hash of its content (title + body + tags), so identical skills published by different peers are automatically deduplicated. Peers vote on skills to surface the best ones.
+
+```mermaid
+sequenceDiagram
+    participant A as Alice's Agent
+    participant SA as smemo (Alice)
+    participant SB as smemo (Bob)
+    participant B as Bob's Agent
+
+    A->>SA: publish_skill("Deploy to staging", "Run ./deploy.sh --env staging")
+    SA-->>SB: gossip → SkillPublished
+    SB->>SB: stored (deduped by content hash)
+
+    B->>SB: search_skills("deploy")
+    SB-->>SA: gossip → SkillSearchRequest
+    SA-->>SB: gossip → SkillSearchResponse
+    SB->>B: results ranked by votes
+
+    B->>SB: vote_skill(hash, +1)
+    SB-->>SA: gossip → SkillVoteCast
+```
+
+Skills support versioning via `parent_hash` — publish an updated skill referencing the previous version's hash to create a revision chain.
 
 ## The search flow
 
