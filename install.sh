@@ -19,6 +19,7 @@ SMEMO_USER=""
 SMEMO_SIGNER="git"
 CONFIGURE_CLAUDE=false
 CONFIGURE_OPENCODE=false
+CONFIGURE_OPENCLAW=false
 SKIP_BUILD=false
 
 usage() {
@@ -32,7 +33,8 @@ Options:
   --signer <mode>       Signing mode: git, none, gpg, ssh, generated (default: git)
   --claude              Configure Claude Code
   --opencode            Configure OpenCode
-  --all                 Configure both Claude Code and OpenCode
+  --openclaw            Configure OpenClaw
+  --all                 Configure Claude Code, OpenCode, and OpenClaw
   --skip-build          Skip cargo build (use existing binary)
   -h, --help            Show this help
 
@@ -40,6 +42,7 @@ Examples:
   ./install.sh --all
   ./install.sh --claude --user alice --signer generated
   ./install.sh --opencode --skip-build
+  ./install.sh --openclaw --user alice
 EOF
     exit 0
 }
@@ -50,25 +53,28 @@ while [[ $# -gt 0 ]]; do
         --signer)     SMEMO_SIGNER="$2"; shift 2 ;;
         --claude)     CONFIGURE_CLAUDE=true; shift ;;
         --opencode)   CONFIGURE_OPENCODE=true; shift ;;
-        --all)        CONFIGURE_CLAUDE=true; CONFIGURE_OPENCODE=true; shift ;;
+        --openclaw)   CONFIGURE_OPENCLAW=true; shift ;;
+        --all)        CONFIGURE_CLAUDE=true; CONFIGURE_OPENCODE=true; CONFIGURE_OPENCLAW=true; shift ;;
         --skip-build) SKIP_BUILD=true; shift ;;
         -h|--help)    usage ;;
         *)            fail "Unknown option: $1" ;;
     esac
 done
 
-if ! $CONFIGURE_CLAUDE && ! $CONFIGURE_OPENCODE; then
+if ! $CONFIGURE_CLAUDE && ! $CONFIGURE_OPENCODE && ! $CONFIGURE_OPENCLAW; then
     printf "\n${BOLD}Which tools do you want to configure?${NC}\n"
     printf "  1) Claude Code\n"
     printf "  2) OpenCode\n"
-    printf "  3) Both\n"
-    printf "\nChoice [3]: "
+    printf "  3) OpenClaw\n"
+    printf "  4) All\n"
+    printf "\nChoice [4]: "
     read -r choice
-    choice="${choice:-3}"
+    choice="${choice:-4}"
     case "$choice" in
         1) CONFIGURE_CLAUDE=true ;;
         2) CONFIGURE_OPENCODE=true ;;
-        3) CONFIGURE_CLAUDE=true; CONFIGURE_OPENCODE=true ;;
+        3) CONFIGURE_OPENCLAW=true ;;
+        4) CONFIGURE_CLAUDE=true; CONFIGURE_OPENCODE=true; CONFIGURE_OPENCLAW=true ;;
         *) fail "Invalid choice" ;;
     esac
 fi
@@ -247,6 +253,72 @@ MANUAL
     ok "OpenCode configured ($scope): $config_file"
 }
 
+configure_openclaw() {
+    info "Configuring OpenClaw..."
+
+    local config_dir="$HOME/.openclaw"
+    local config_file="$config_dir/config.json"
+
+    if command -v openclaw >/dev/null 2>&1; then
+        openclaw mcp remove smemo 2>/dev/null || true
+        openclaw mcp add --transport stdio \
+            -e "SMEMO_USER=$SMEMO_USER" \
+            -e "SMEMO_SIGNER=$SMEMO_SIGNER" \
+            smemo -- "$SMEMO_BIN"
+        ok "OpenClaw configured via CLI"
+    else
+        mkdir -p "$config_dir"
+
+        local tmp_file
+        tmp_file="$(mktemp)"
+
+        local existing="{}"
+        if [[ -f "$config_file" ]]; then
+            existing="$(cat "$config_file")"
+        fi
+
+        local smemo_entry
+        smemo_entry=$(cat <<ENTRY
+{
+  "command": "$SMEMO_BIN",
+  "args": [],
+  "env": {
+    "SMEMO_USER": "$SMEMO_USER",
+    "SMEMO_SIGNER": "$SMEMO_SIGNER"
+  }
+}
+ENTRY
+)
+
+        if command -v jq >/dev/null 2>&1; then
+            echo "$existing" | jq --argjson entry "$smemo_entry" \
+                '.mcpServers.smemo = $entry' > "$tmp_file"
+            mv "$tmp_file" "$config_file"
+            ok "Wrote $config_file"
+        elif command -v python3 >/dev/null 2>&1; then
+            python3 -c "
+import json
+cfg = json.loads('''$existing''')
+cfg.setdefault('mcpServers', {})
+cfg['mcpServers']['smemo'] = json.loads('''$smemo_entry''')
+json.dump(cfg, open('$tmp_file', 'w'), indent=2)
+"
+            mv "$tmp_file" "$config_file"
+            ok "Wrote $config_file"
+        else
+            warn "Neither jq nor python3 found. Writing config manually."
+            cat > "$config_file" <<MANUAL
+{
+  "mcpServers": {
+    "smemo": $smemo_entry
+  }
+}
+MANUAL
+            ok "Wrote $config_file (note: any previous config was overwritten)"
+        fi
+    fi
+}
+
 printf "\n${BOLD}smemo — install & configure${NC}\n\n"
 
 check_deps
@@ -256,6 +328,7 @@ printf "\n"
 
 $CONFIGURE_CLAUDE && configure_claude
 $CONFIGURE_OPENCODE && configure_opencode
+$CONFIGURE_OPENCLAW && configure_openclaw
 
 printf "\n${GREEN}${BOLD}Done!${NC}\n\n"
 printf "  user:   ${BOLD}%s${NC}\n" "$SMEMO_USER"
@@ -268,5 +341,8 @@ if $CONFIGURE_CLAUDE; then
 fi
 if $CONFIGURE_OPENCODE; then
     printf "  ${DIM}OpenCode: restart opencode to pick up changes${NC}\n"
+fi
+if $CONFIGURE_OPENCLAW; then
+    printf "  ${DIM}OpenClaw: restart openclaw gateway to pick up changes${NC}\n"
 fi
 printf "\n"

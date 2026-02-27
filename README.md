@@ -38,10 +38,10 @@ curl -sSf https://raw.githubusercontent.com/iltumio/smemo/main/install.sh | bash
 # Or clone and use the installer
 git clone https://github.com/iltumio/smemo
 cd smemo
-./install.sh --all
+./install.sh --all  # Claude Code + OpenCode + OpenClaw
 ```
 
-The installer builds from source, detects your signing identity, and configures Claude Code and/or OpenCode automatically. Run `./install.sh --help` for options.
+The installer builds from source, detects your signing identity, and configures Claude Code, OpenCode, and/or OpenClaw automatically. Run `./install.sh --help` for options.
 
 Manual setup:
 
@@ -59,7 +59,9 @@ SMEMO_USER=bob smemo
 # → connected
 ```
 
-Add to your MCP client config (e.g. Claude Desktop):
+Add to your MCP client config:
+
+**Claude Desktop / Claude Code:**
 
 ```json
 {
@@ -73,6 +75,25 @@ Add to your MCP client config (e.g. Claude Desktop):
   }
 }
 ```
+
+**OpenClaw** (in your workspace config or via `openclaw onboard`):
+
+```json
+{
+  "mcpServers": {
+    "smemo": {
+      "command": "smemo",
+      "args": [],
+      "env": {
+        "SMEMO_USER": "your-name",
+        "SMEMO_SIGNER": "git"
+      }
+    }
+  }
+}
+```
+
+Or just tell OpenClaw in natural language: *"Add smemo as a local MCP stdio server with SMEMO_USER=your-name"*
 
 ## Tools
 
