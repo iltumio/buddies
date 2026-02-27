@@ -2,10 +2,10 @@ name: Build
 
 on:
   push:
-    tags:
-      - "v*"
     branches:
       - main
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -23,6 +23,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -64,16 +66,29 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get tag on current commit
+        id: tag
+        run: |
+          TAG=$(git tag --points-at HEAD | grep '^v' | head -1)
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          if [[ -n "$TAG" ]]; then echo "has_tag=true" >> "$GITHUB_OUTPUT"; else echo "has_tag=false" >> "$GITHUB_OUTPUT"; fi
+
       - name: Download artifacts
+        if: steps.tag.outputs.has_tag == 'true'
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
       - name: Create release
+        if: steps.tag.outputs.has_tag == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.version }}
           files: artifacts/*/buddies-*
           generate_release_notes: true
