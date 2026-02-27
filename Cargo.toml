@@ -1,8 +1,8 @@
 [package]
-name = "smemo"
+name = "buddies"
 version = "0.1.0"
 edition = "2024"
-description = "Shared Memory & Skills MCP Server over P2P"
+description = "P2P shared memory & skills for AI agents"
 license = "AGPL-3.0-or-later"
 
 [dependencies]

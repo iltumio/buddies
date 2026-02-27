@@ -1,8 +1,8 @@
-# smemo
+# buddies
 
 **P2P shared memory for AI agents — let your team's agents search each other's knowledge, share skills, delegate tasks, and stay in sync over encrypted gossip.**
 
-smemo is an MCP server that lets AI agents share memories, decisions, skills, and context across team members in real-time — no central server, no cloud, just direct P2P connections powered by [Iroh](https://iroh.computer).
+buddies is an MCP server that lets AI agents share memories, decisions, skills, and context across team members in real-time — no central server, no cloud, just direct P2P connections powered by [Iroh](https://iroh.computer).
 
 Your backend team is building Feature A. Your frontend team is on Feature B. Each developer's agent joins a **room**, and suddenly every agent knows what the others are doing. Decisions don't get lost. Context doesn't get repeated. Agents search each other's knowledge like it's their own.
 
@@ -11,8 +11,8 @@ Your backend team is building Feature A. Your frontend team is on Feature B. Eac
 ```mermaid
 sequenceDiagram
     participant A as Alice's Agent (Claude)
-    participant SA as smemo (Alice)
-    participant SB as smemo (Bob)
+    participant SA as buddies (Alice)
+    participant SB as buddies (Bob)
     participant B as Bob's Agent (Cursor)
 
     Note over SA,SB: Both joined room "feature-A" via iroh gossip
@@ -28,16 +28,16 @@ sequenceDiagram
     SB->>B: "We're using PostgreSQL for the user table"
 ```
 
-Each smemo instance runs locally alongside your agent. Memories are stored on disk and shared over encrypted QUIC connections. When an agent searches, it queries both its local store and every peer in the room — results come back in seconds.
+Each buddies instance runs locally alongside your agent. Memories are stored on disk and shared over encrypted QUIC connections. When an agent searches, it queries both its local store and every peer in the room — results come back in seconds.
 
 ## Quick start
 ```bash
 # One-line install + configure
-curl -sSf https://raw.githubusercontent.com/iltumio/smemo/main/install.sh | bash
+curl -sSf https://raw.githubusercontent.com/iltumio/buddies/main/install.sh | bash
 
 # Or clone and use the installer
-git clone https://github.com/iltumio/smemo
-cd smemo
+git clone https://github.com/iltumio/buddies
+cd buddies
 ./install.sh --all  # Claude Code + OpenCode + OpenClaw
 ```
 
@@ -49,18 +49,18 @@ Manual setup:
 cargo install --path .
 
 # Alice opens a room
-SMEMO_USER=alice smemo
+BUDDIES_USER=alice buddies
 # Agent calls: join_room({ "room": "feature-a" })
 # → returns a ticket
 
 # Bob joins with Alice's ticket
-SMEMO_USER=bob smemo
+BUDDIES_USER=bob buddies
 # Agent calls: join_room({ "room": "feature-a", "ticket": "<ticket>" })
 # → connected
 
 # Or run as a standalone HTTP server
-SMEMO_TRANSPORT=http SMEMO_USER=alice smemo
-# → smemo MCP server listening on http://127.0.0.1:8080/mcp
+BUDDIES_TRANSPORT=http BUDDIES_USER=alice buddies
+# → buddies MCP server listening on http://127.0.0.1:8080/mcp
 ```
 
 Add to your MCP client config:
@@ -70,10 +70,10 @@ Add to your MCP client config:
 ```json
 {
   "mcpServers": {
-    "smemo": {
-      "command": "smemo",
+    "buddies": {
+      "command": "buddies",
       "env": {
-        "SMEMO_USER": "your-name"
+        "BUDDIES_USER": "your-name"
       }
     }
   }
@@ -85,23 +85,23 @@ Add to your MCP client config:
 ```json
 {
   "mcp": {
-    "smemo": {
+    "buddies": {
       "type": "local",
-      "command": ["smemo"],
+      "command": ["buddies"],
       "environment": {
-        "SMEMO_USER": "your-name"
+        "BUDDIES_USER": "your-name"
       }
     }
   }
 }
 ```
 
-**OpenCode** (remote — connect to running smemo instance):
+**OpenCode** (remote — connect to running buddies instance):
 
 ```json
 {
   "mcp": {
-    "smemo": {
+    "buddies": {
       "type": "remote",
       "url": "http://localhost:8080/mcp"
     }
@@ -114,19 +114,19 @@ Add to your MCP client config:
 ```json
 {
   "mcpServers": {
-    "smemo": {
-      "command": "smemo",
+    "buddies": {
+      "command": "buddies",
       "args": [],
       "env": {
-        "SMEMO_USER": "your-name",
-        "SMEMO_SIGNER": "git"
+        "BUDDIES_USER": "your-name",
+        "BUDDIES_SIGNER": "git"
       }
     }
   }
 }
 ```
 
-Or just tell OpenClaw in natural language: *"Add smemo as a local MCP stdio server with SMEMO_USER=your-name"*
+Or just tell OpenClaw in natural language: *"Add buddies as a local MCP stdio server with BUDDIES_USER=your-name"*
 
 ## Tools
 
@@ -171,7 +171,7 @@ Each skill is identified by a SHA-256 hash of its content (title + body + tags),
 
 Skills are **digitally signed** using your configured identity (GPG or SSH). The signature is embedded directly in the skill entry and persists in storage, so any peer can verify the author’s identity at any time — not just at the moment of receipt.
 
-- When you publish a skill, smemo signs it with your local signer
+- When you publish a skill, buddies signs it with your local signer
 - When a peer receives a skill, the embedded signature is verified before storing
 - Skills with invalid signatures are rejected
 - The `signed_by` field (e.g. `gpg:ABC123` or `ssh:ssh-ed25519 ...`) is returned in search results and skill lookups
@@ -181,8 +181,8 @@ This is separate from the transport-level P2P message signatures — skill signa
 ```mermaid
 sequenceDiagram
     participant A as Alice's Agent
-    participant SA as smemo (Alice)
-    participant SB as smemo (Bob)
+    participant SA as buddies (Alice)
+    participant SB as buddies (Bob)
     participant B as Bob's Agent
 
     A->>SA: publish_skill("Deploy to staging", "Run ./deploy.sh --env staging")
@@ -227,8 +227,8 @@ Agents can delegate work to each other across the P2P network. Alice's agent can
 ```mermaid
 sequenceDiagram
     participant A as Alice's Agent
-    participant SA as smemo (Alice)
-    participant SB as smemo (Bob)
+    participant SA as buddies (Alice)
+    participant SB as buddies (Bob)
     participant B as Bob's Agent
 
     A->>SA: delegate_task("Run the test suite and report failures")
@@ -251,30 +251,30 @@ The delegator's `delegate_task` call **blocks** until a result comes back (or th
 
 | Environment variable | Default | Description |
 |---------------------|---------|-------------|
-| `SMEMO_USER` | OS username | Your display name in rooms |
-| `SMEMO_AGENT` | `unknown-agent` | Which agent you're using |
-| `SMEMO_DATA_DIR` | `~/.local/share/smemo` | Where local memories are stored |
+| `BUDDIES_USER` | OS username | Your display name in rooms |
+| `BUDDIES_AGENT` | `unknown-agent` | Which agent you're using |
+| `BUDDIES_DATA_DIR` | `~/.local/share/buddies` | Where local memories are stored |
 | `RUST_LOG` | `warn` | Log level (logs go to stderr, never pollutes MCP stdio) |
-| `SMEMO_TRANSPORT` | `stdio` | Transport mode: `stdio` (default, for MCP clients that spawn the process) or `http` (standalone HTTP server) |
-| `SMEMO_PORT` | `8080` | HTTP listen port (only used when `SMEMO_TRANSPORT=http`) |
-| `SMEMO_HOST` | `127.0.0.1` | HTTP bind address (only used when `SMEMO_TRANSPORT=http`) |
-| `SMEMO_SIGNER` | `git` | Signing identity source: `git`, `none`, `gpg`, `ssh`, `generated` |
-| `SMEMO_GPG_KEY_ID` | unset | GPG key ID when `SMEMO_SIGNER=gpg` (or use `SMEMO_SIGNING_KEY`) |
-| `SMEMO_SSH_PRIVATE_KEY` | unset | SSH private key path when `SMEMO_SIGNER=ssh` |
-| `SMEMO_SSH_PUBLIC_KEY` | inferred | SSH public key value or path when `SMEMO_SIGNER=ssh` |
-| `SMEMO_SIGNING_KEY` | unset | Generic fallback for `SMEMO_GPG_KEY_ID` or `SMEMO_SSH_PRIVATE_KEY` |
+| `BUDDIES_TRANSPORT` | `stdio` | Transport mode: `stdio` (default, for MCP clients that spawn the process) or `http` (standalone HTTP server) |
+| `BUDDIES_PORT` | `8080` | HTTP listen port (only used when `BUDDIES_TRANSPORT=http`) |
+| `BUDDIES_HOST` | `127.0.0.1` | HTTP bind address (only used when `BUDDIES_TRANSPORT=http`) |
+| `BUDDIES_SIGNER` | `git` | Signing identity source: `git`, `none`, `gpg`, `ssh`, `generated` |
+| `BUDDIES_GPG_KEY_ID` | unset | GPG key ID when `BUDDIES_SIGNER=gpg` (or use `BUDDIES_SIGNING_KEY`) |
+| `BUDDIES_SSH_PRIVATE_KEY` | unset | SSH private key path when `BUDDIES_SIGNER=ssh` |
+| `BUDDIES_SSH_PUBLIC_KEY` | inferred | SSH public key value or path when `BUDDIES_SIGNER=ssh` |
+| `BUDDIES_SIGNING_KEY` | unset | Generic fallback for `BUDDIES_GPG_KEY_ID` or `BUDDIES_SSH_PRIVATE_KEY` |
 
 ### Startup identity options
 
 - Use existing git signing identity (default):
-  - `SMEMO_SIGNER=git`
+  - `BUDDIES_SIGNER=git`
   - Reads `git config user.signingkey` and `git config gpg.format`
 - Provide explicit key at startup:
-  - GPG: `SMEMO_SIGNER=gpg SMEMO_GPG_KEY_ID=<key-id> smemo`
-  - SSH: `SMEMO_SIGNER=ssh SMEMO_SSH_PRIVATE_KEY=~/.ssh/id_ed25519 smemo`
+  - GPG: `BUDDIES_SIGNER=gpg BUDDIES_GPG_KEY_ID=<key-id> buddies`
+  - SSH: `BUDDIES_SIGNER=ssh BUDDIES_SSH_PRIVATE_KEY=~/.ssh/id_ed25519 buddies`
 - Generate identity on first start and reuse it:
-  - `SMEMO_SIGNER=generated smemo`
-  - Generates `identity_ed25519` in `SMEMO_DATA_DIR` and uses it for signing
+  - `BUDDIES_SIGNER=generated buddies`
+  - Generates `identity_ed25519` in `BUDDIES_DATA_DIR` and uses it for signing
 
 ## Identity trust model
 
@@ -311,7 +311,7 @@ graph TB
     subgraph "Each developer's machine"
         Agent[AI Agent]
         MCP[MCP stdio / HTTP]
-        Server[SmemoServer]
+        Server[BuddiesServer]
         Storage[(redb)]
 
         Agent <-->|JSON-RPC| MCP
@@ -327,7 +327,7 @@ graph TB
     Server <--> Iroh
     Iroh <--> Gossip
 
-    Gossip <-.->|"Room: feature-A<br/>(TopicId = SHA256)"| OtherPeers[Other smemo peers]
+    Gossip <-.->|"Room: feature-A<br/>(TopicId = SHA256)"| OtherPeers[Other buddies peers]
 
     style Agent fill:#8b5cf6,color:#fff
     style Gossip fill:#f59e0b,color:#000
@@ -346,8 +346,8 @@ Rooms map to gossip topics via deterministic SHA-256 hashing. Same room name = s
 ## Building from source
 
 ```bash
-git clone https://github.com/iltumio/smemo
-cd smemo
+git clone https://github.com/iltumio/buddies
+cd buddies
 cargo build --release
 ```
 

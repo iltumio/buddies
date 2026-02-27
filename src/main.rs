@@ -19,13 +19,13 @@ use rmcp::transport::streamable_http_server::{
 };
 
 use crate::identity::discover_startup_identity;
-use crate::node::{SmemoNode, SmemoNodeConfig};
-use crate::server::SmemoServer;
+use crate::node::{BuddiesNode, BuddiesNodeConfig};
+use crate::server::BuddiesServer;
 
 fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
-        .map(|d| d.join("smemo"))
-        .unwrap_or_else(|| PathBuf::from(".smemo"))
+        .map(|d| d.join("buddies"))
+        .unwrap_or_else(|| PathBuf::from(".buddies"))
 }
 
 #[tokio::main]
@@ -38,17 +38,17 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let user_name = std::env::var("SMEMO_USER")
+    let user_name = std::env::var("BUDDIES_USER")
         .unwrap_or_else(|_| whoami::fallible::username().unwrap_or_else(|_| "anonymous".into()));
     let agent_name =
-        std::env::var("SMEMO_AGENT").unwrap_or_else(|_| "unknown-agent".into());
-    let data_path = std::env::var("SMEMO_DATA_DIR")
+        std::env::var("BUDDIES_AGENT").unwrap_or_else(|_| "unknown-agent".into());
+    let data_path = std::env::var("BUDDIES_DATA_DIR")
         .map(PathBuf::from)
         .ok()
         .or_else(|| Some(default_data_dir()));
 
     let node = Arc::new(
-        SmemoNode::new(SmemoNodeConfig {
+        BuddiesNode::new(BuddiesNodeConfig {
             user_name,
             agent_name,
             signer: discover_startup_identity(data_path.as_deref()).ok().flatten(),
@@ -57,22 +57,22 @@ async fn main() -> Result<()> {
         .await?,
     );
 
-    let transport = std::env::var("SMEMO_TRANSPORT")
+    let transport = std::env::var("BUDDIES_TRANSPORT")
         .unwrap_or_else(|_| "stdio".into());
 
     match transport.as_str() {
         "http" => {
-            let port: u16 = std::env::var("SMEMO_PORT")
+            let port: u16 = std::env::var("BUDDIES_PORT")
                 .unwrap_or_else(|_| "8080".into())
                 .parse()
-                .expect("SMEMO_PORT must be a valid port number");
-            let bind_addr = std::env::var("SMEMO_HOST")
+                .expect("BUDDIES_PORT must be a valid port number");
+            let bind_addr = std::env::var("BUDDIES_HOST")
                 .unwrap_or_else(|_| "127.0.0.1".into());
             let addr = format!("{bind_addr}:{port}");
 
             let ct = tokio_util::sync::CancellationToken::new();
             let service = StreamableHttpService::new(
-                move || Ok(SmemoServer::new(Arc::clone(&node))),
+                move || Ok(BuddiesServer::new(Arc::clone(&node))),
                 LocalSessionManager::default().into(),
                 StreamableHttpServerConfig {
                     stateful_mode: true,
@@ -83,12 +83,12 @@ async fn main() -> Result<()> {
 
             let app = axum::Router::new().nest_service("/mcp", service);
             let listener = tokio::net::TcpListener::bind(&addr).await?;
-            tracing::info!("smemo HTTP server listening on {addr}");
-            eprintln!("smemo MCP server listening on http://{addr}/mcp");
+            tracing::info!("buddies HTTP server listening on {addr}");
+            eprintln!("buddies MCP server listening on http://{addr}/mcp");
             axum::serve(listener, app).await?;
         }
         _ => {
-            let server = SmemoServer::new(Arc::clone(&node));
+            let server = BuddiesServer::new(Arc::clone(&node));
             let service = server.serve(stdio()).await?;
             service.waiting().await?;
             node.shutdown().await?;

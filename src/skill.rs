@@ -48,7 +48,7 @@ pub struct SkillSearchFilters {
 /// Tags are sorted before hashing so that tag ordering is irrelevant.
 pub fn skill_content_hash(title: &str, content: &str, tags: &[String]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"smemo:skill:");
+    hasher.update(b"buddies:skill:");
     hasher.update(title.as_bytes());
     hasher.update(b"\0");
     hasher.update(content.as_bytes());

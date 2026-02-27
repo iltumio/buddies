@@ -14,24 +14,24 @@ ok()    { printf "${GREEN}✓${NC} %s\n" "$*"; }
 warn()  { printf "${YELLOW}!${NC} %s\n" "$*"; }
 fail()  { printf "${RED}✗${NC} %s\n" "$*" >&2; exit 1; }
 
-SMEMO_BIN=""
-SMEMO_USER=""
-SMEMO_SIGNER="git"
+BUDDIES_BIN=""
+BUDDIES_USER=""
+BUDDIES_SIGNER="git"
 CONFIGURE_CLAUDE=false
 CONFIGURE_OPENCODE=false
 CONFIGURE_OPENCLAW=false
 SKIP_BUILD=false
-SMEMO_TRANSPORT="stdio"
-SMEMO_PORT="8080"
+BUDDIES_TRANSPORT="stdio"
+BUDDIES_PORT="8080"
 
 usage() {
     cat <<EOF
-${BOLD}smemo install & configure${NC}
+${BOLD}buddies install & configure${NC}
 
 Usage: ./install.sh [options]
 
 Options:
-  --user <name>         Set SMEMO_USER (default: OS username)
+  --user <name>         Set BUDDIES_USER (default: OS username)
   --signer <mode>       Signing mode: git, none, gpg, ssh, generated (default: git)
   --transport <mode>    Transport mode: stdio or http (default: stdio)
   --port <port>         HTTP listen port when transport=http (default: 8080)
@@ -54,10 +54,10 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --user)       SMEMO_USER="$2"; shift 2 ;;
-        --signer)     SMEMO_SIGNER="$2"; shift 2 ;;
-        --transport)  SMEMO_TRANSPORT="$2"; shift 2 ;;
-        --port)       SMEMO_PORT="$2"; shift 2 ;;
+        --user)       BUDDIES_USER="$2"; shift 2 ;;
+        --signer)     BUDDIES_SIGNER="$2"; shift 2 ;;
+        --transport)  BUDDIES_TRANSPORT="$2"; shift 2 ;;
+        --port)       BUDDIES_PORT="$2"; shift 2 ;;
         --claude)     CONFIGURE_CLAUDE=true; shift ;;
         --opencode)   CONFIGURE_OPENCODE=true; shift ;;
         --openclaw)   CONFIGURE_OPENCLAW=true; shift ;;
@@ -86,11 +86,11 @@ if ! $CONFIGURE_CLAUDE && ! $CONFIGURE_OPENCODE && ! $CONFIGURE_OPENCLAW; then
     esac
 fi
 
-if [[ -z "$SMEMO_USER" ]]; then
+if [[ -z "$BUDDIES_USER" ]]; then
     default_user="$(whoami 2>/dev/null || echo "anonymous")"
-    printf "\n${BOLD}SMEMO_USER${NC} [${DIM}%s${NC}]: " "$default_user"
-    read -r SMEMO_USER
-    SMEMO_USER="${SMEMO_USER:-$default_user}"
+    printf "\n${BOLD}BUDDIES_USER${NC} [${DIM}%s${NC}]: " "$default_user"
+    read -r BUDDIES_USER
+    BUDDIES_USER="${BUDDIES_USER:-$default_user}"
 fi
 
 check_deps() {
@@ -110,35 +110,35 @@ check_deps() {
     fi
 }
 
-build_smemo() {
+build_buddies() {
     if $SKIP_BUILD; then
-        SMEMO_BIN="$(command -v smemo 2>/dev/null || true)"
-        if [[ -z "$SMEMO_BIN" ]]; then
-            fail "smemo not found in PATH. Run without --skip-build to build it."
+        BUDDIES_BIN="$(command -v buddies 2>/dev/null || true)"
+        if [[ -z "$BUDDIES_BIN" ]]; then
+            fail "buddies not found in PATH. Run without --skip-build to build it."
         fi
-        ok "Using existing binary: $SMEMO_BIN"
+        ok "Using existing binary: $BUDDIES_BIN"
         return
     fi
 
-    info "Building smemo (release)..."
+    info "Building buddies (release)..."
     cargo install --path . --force 2>&1 | tail -1
-    SMEMO_BIN="$(command -v smemo 2>/dev/null || echo "$HOME/.cargo/bin/smemo")"
+    BUDDIES_BIN="$(command -v buddies 2>/dev/null || echo "$HOME/.cargo/bin/buddies")"
 
-    if [[ ! -x "$SMEMO_BIN" ]]; then
-        fail "Build succeeded but smemo binary not found in PATH. Add ~/.cargo/bin to your PATH."
+    if [[ ! -x "$BUDDIES_BIN" ]]; then
+        fail "Build succeeded but buddies binary not found in PATH. Add ~/.cargo/bin to your PATH."
     fi
-    ok "Installed: $SMEMO_BIN"
+    ok "Installed: $BUDDIES_BIN"
 }
 
 configure_claude() {
     info "Configuring Claude Code..."
 
     if command -v claude >/dev/null 2>&1; then
-        claude mcp remove smemo --scope user 2>/dev/null || true
+        claude mcp remove buddies --scope user 2>/dev/null || true
         claude mcp add --transport stdio --scope user \
-            -e "SMEMO_USER=$SMEMO_USER" \
-            -e "SMEMO_SIGNER=$SMEMO_SIGNER" \
-            smemo -- "$SMEMO_BIN"
+            -e "BUDDIES_USER=$BUDDIES_USER" \
+            -e "BUDDIES_SIGNER=$BUDDIES_SIGNER" \
+            buddies -- "$BUDDIES_BIN"
         ok "Claude Code configured (user scope)"
     else
         local config_file="$HOME/.claude.json"
@@ -150,23 +150,23 @@ configure_claude() {
             existing="$(cat "$config_file")"
         fi
 
-        local smemo_entry
-        smemo_entry=$(cat <<ENTRY
+        local buddies_entry
+        buddies_entry=$(cat <<ENTRY
 {
   "type": "stdio",
-  "command": "$SMEMO_BIN",
+  "command": "$BUDDIES_BIN",
   "args": [],
   "env": {
-    "SMEMO_USER": "$SMEMO_USER",
-    "SMEMO_SIGNER": "$SMEMO_SIGNER"
+    "BUDDIES_USER": "$BUDDIES_USER",
+    "BUDDIES_SIGNER": "$BUDDIES_SIGNER"
   }
 }
 ENTRY
 )
 
         if command -v jq >/dev/null 2>&1; then
-            echo "$existing" | jq --argjson entry "$smemo_entry" \
-                '.mcpServers.smemo = $entry' > "$tmp_file"
+            echo "$existing" | jq --argjson entry "$buddies_entry" \
+                '.mcpServers.buddies = $entry' > "$tmp_file"
             mv "$tmp_file" "$config_file"
             ok "Wrote $config_file"
         elif command -v python3 >/dev/null 2>&1; then
@@ -174,7 +174,7 @@ ENTRY
 import json, sys
 cfg = json.loads('''$existing''')
 cfg.setdefault('mcpServers', {})
-cfg['mcpServers']['smemo'] = json.loads('''$smemo_entry''')
+cfg['mcpServers']['buddies'] = json.loads('''$buddies_entry''')
 json.dump(cfg, open('$tmp_file', 'w'), indent=2)
 "
             mv "$tmp_file" "$config_file"
@@ -184,7 +184,7 @@ json.dump(cfg, open('$tmp_file', 'w'), indent=2)
             cat > "$config_file" <<MANUAL
 {
   "mcpServers": {
-    "smemo": $smemo_entry
+    "buddies": $buddies_entry
   }
 }
 MANUAL
@@ -219,24 +219,24 @@ configure_opencode() {
         existing="$(cat "$config_file")"
     fi
 
-    local smemo_entry
-    if [[ "$SMEMO_TRANSPORT" == "http" ]]; then
-        smemo_entry=$(cat <<ENTRY
+    local buddies_entry
+    if [[ "$BUDDIES_TRANSPORT" == "http" ]]; then
+        buddies_entry=$(cat <<ENTRY
 {
   "type": "remote",
-  "url": "http://127.0.0.1:$SMEMO_PORT/mcp"
+  "url": "http://127.0.0.1:$BUDDIES_PORT/mcp"
 }
 ENTRY
 )
     else
-        smemo_entry=$(cat <<ENTRY
+        buddies_entry=$(cat <<ENTRY
 {
   "type": "local",
-  "command": ["$SMEMO_BIN"],
+  "command": ["$BUDDIES_BIN"],
   "enabled": true,
   "environment": {
-    "SMEMO_USER": "$SMEMO_USER",
-    "SMEMO_SIGNER": "$SMEMO_SIGNER"
+    "BUDDIES_USER": "$BUDDIES_USER",
+    "BUDDIES_SIGNER": "$BUDDIES_SIGNER"
   }
 }
 ENTRY
@@ -244,15 +244,15 @@ ENTRY
     fi
 
     if command -v jq >/dev/null 2>&1; then
-        echo "$existing" | jq --argjson entry "$smemo_entry" \
-            '.mcp.smemo = $entry' > "$tmp_file"
+        echo "$existing" | jq --argjson entry "$buddies_entry" \
+            '.mcp.buddies = $entry' > "$tmp_file"
         mv "$tmp_file" "$config_file"
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c "
 import json
 cfg = json.loads('''$existing''')
 cfg.setdefault('mcp', {})
-cfg['mcp']['smemo'] = json.loads('''$smemo_entry''')
+cfg['mcp']['buddies'] = json.loads('''$buddies_entry''')
 json.dump(cfg, open('$tmp_file', 'w'), indent=2)
 "
         mv "$tmp_file" "$config_file"
@@ -261,7 +261,7 @@ json.dump(cfg, open('$tmp_file', 'w'), indent=2)
         cat > "$config_file" <<MANUAL
 {
   "mcp": {
-    "smemo": $smemo_entry
+    "buddies": $buddies_entry
   }
 }
 MANUAL
@@ -277,11 +277,11 @@ configure_openclaw() {
     local config_file="$config_dir/config.json"
 
     if command -v openclaw >/dev/null 2>&1; then
-        openclaw mcp remove smemo 2>/dev/null || true
+        openclaw mcp remove buddies 2>/dev/null || true
         openclaw mcp add --transport stdio \
-            -e "SMEMO_USER=$SMEMO_USER" \
-            -e "SMEMO_SIGNER=$SMEMO_SIGNER" \
-            smemo -- "$SMEMO_BIN"
+            -e "BUDDIES_USER=$BUDDIES_USER" \
+            -e "BUDDIES_SIGNER=$BUDDIES_SIGNER" \
+            buddies -- "$BUDDIES_BIN"
         ok "OpenClaw configured via CLI"
     else
         mkdir -p "$config_dir"
@@ -294,22 +294,22 @@ configure_openclaw() {
             existing="$(cat "$config_file")"
         fi
 
-        local smemo_entry
-        smemo_entry=$(cat <<ENTRY
+        local buddies_entry
+        buddies_entry=$(cat <<ENTRY
 {
-  "command": "$SMEMO_BIN",
+  "command": "$BUDDIES_BIN",
   "args": [],
   "env": {
-    "SMEMO_USER": "$SMEMO_USER",
-    "SMEMO_SIGNER": "$SMEMO_SIGNER"
+    "BUDDIES_USER": "$BUDDIES_USER",
+    "BUDDIES_SIGNER": "$BUDDIES_SIGNER"
   }
 }
 ENTRY
 )
 
         if command -v jq >/dev/null 2>&1; then
-            echo "$existing" | jq --argjson entry "$smemo_entry" \
-                '.mcpServers.smemo = $entry' > "$tmp_file"
+            echo "$existing" | jq --argjson entry "$buddies_entry" \
+                '.mcpServers.buddies = $entry' > "$tmp_file"
             mv "$tmp_file" "$config_file"
             ok "Wrote $config_file"
         elif command -v python3 >/dev/null 2>&1; then
@@ -317,7 +317,7 @@ ENTRY
 import json
 cfg = json.loads('''$existing''')
 cfg.setdefault('mcpServers', {})
-cfg['mcpServers']['smemo'] = json.loads('''$smemo_entry''')
+cfg['mcpServers']['buddies'] = json.loads('''$buddies_entry''')
 json.dump(cfg, open('$tmp_file', 'w'), indent=2)
 "
             mv "$tmp_file" "$config_file"
@@ -327,7 +327,7 @@ json.dump(cfg, open('$tmp_file', 'w'), indent=2)
             cat > "$config_file" <<MANUAL
 {
   "mcpServers": {
-    "smemo": $smemo_entry
+    "buddies": $buddies_entry
   }
 }
 MANUAL
@@ -336,10 +336,10 @@ MANUAL
     fi
 }
 
-printf "\n${BOLD}smemo — install & configure${NC}\n\n"
+printf "\n${BOLD}buddies — install & configure${NC}\n\n"
 
 check_deps
-build_smemo
+build_buddies
 
 printf "\n"
 
@@ -348,12 +348,12 @@ $CONFIGURE_OPENCODE && configure_opencode
 $CONFIGURE_OPENCLAW && configure_openclaw
 
 printf "\n${GREEN}${BOLD}Done!${NC}\n\n"
-printf "  user:      ${BOLD}%s${NC}\n" "$SMEMO_USER"
-printf "  signer:    ${BOLD}%s${NC}\n" "$SMEMO_SIGNER"
-printf "  transport: ${BOLD}%s${NC}\n" "$SMEMO_TRANSPORT"
-printf "  binary:    ${BOLD}%s${NC}\n" "$SMEMO_BIN"
-if [[ "$SMEMO_TRANSPORT" == "http" ]]; then
-    printf "  port:      ${BOLD}%s${NC}\n" "$SMEMO_PORT"
+printf "  user:      ${BOLD}%s${NC}\n" "$BUDDIES_USER"
+printf "  signer:    ${BOLD}%s${NC}\n" "$BUDDIES_SIGNER"
+printf "  transport: ${BOLD}%s${NC}\n" "$BUDDIES_TRANSPORT"
+printf "  binary:    ${BOLD}%s${NC}\n" "$BUDDIES_BIN"
+if [[ "$BUDDIES_TRANSPORT" == "http" ]]; then
+    printf "  port:      ${BOLD}%s${NC}\n" "$BUDDIES_PORT"
 fi
 printf "\n"
 
@@ -361,9 +361,9 @@ if $CONFIGURE_CLAUDE; then
     printf "  ${DIM}Claude Code: restart claude to pick up changes${NC}\n"
 fi
 if $CONFIGURE_OPENCODE; then
-    if [[ "$SMEMO_TRANSPORT" == "http" ]]; then
-        printf "  ${DIM}OpenCode: configured for remote connection to http://127.0.0.1:$SMEMO_PORT/mcp${NC}\n"
-        printf "  ${DIM}OpenCode: run 'SMEMO_TRANSPORT=http SMEMO_PORT=$SMEMO_PORT SMEMO_USER=$SMEMO_USER smemo' before starting opencode${NC}\n"
+    if [[ "$BUDDIES_TRANSPORT" == "http" ]]; then
+        printf "  ${DIM}OpenCode: configured for remote connection to http://127.0.0.1:$BUDDIES_PORT/mcp${NC}\n"
+        printf "  ${DIM}OpenCode: run 'BUDDIES_TRANSPORT=http BUDDIES_PORT=$BUDDIES_PORT BUDDIES_USER=$BUDDIES_USER buddies' before starting opencode${NC}\n"
     else
         printf "  ${DIM}OpenCode: restart opencode to pick up changes${NC}\n"
     fi

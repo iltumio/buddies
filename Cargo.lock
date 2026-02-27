@@ -241,6 +241,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "buddies"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "data-encoding",
+ "dirs",
+ "iroh",
+ "iroh-gossip",
+ "n0-future",
+ "postcard",
+ "rand",
+ "redb",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "whoami",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3084,34 +3112,6 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-
-[[package]]
-name = "smemo"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "data-encoding",
- "dirs",
- "iroh",
- "iroh-gossip",
- "n0-future",
- "postcard",
- "rand",
- "redb",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "whoami",
-]
 
 [[package]]
 name = "socket2"

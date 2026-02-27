@@ -10,19 +10,19 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::memory::{MemoryEntry, MemoryKind, SearchFilters};
-use crate::node::SmemoNode;
+use crate::node::BuddiesNode;
 use crate::protocol::{P2PMessage, P2PMessageBody, SignerIdentity, TaskResult};
 use crate::skill::{SkillEntry, SkillSearchFilters, SkillVote, skill_content_hash};
 use crate::ticket::RoomTicket;
 
 #[derive(Clone)]
-pub struct SmemoServer {
-    node: Arc<SmemoNode>,
+pub struct BuddiesServer {
+    node: Arc<BuddiesNode>,
     tool_router: ToolRouter<Self>,
 }
 
-impl SmemoServer {
-    pub fn new(node: Arc<SmemoNode>) -> Self {
+impl BuddiesServer {
+    pub fn new(node: Arc<BuddiesNode>) -> Self {
         Self {
             node,
             tool_router: Self::tool_router(),
@@ -273,7 +273,7 @@ fn err(msg: impl std::fmt::Display) -> McpError {
 }
 
 #[tool_router]
-impl SmemoServer {
+impl BuddiesServer {
     #[tool(
         name = "join_room",
         description = "Join a named collaboration room. Optionally provide a ticket from another peer to bootstrap P2P connection. Returns a ticket that others can use to join."
@@ -817,7 +817,7 @@ impl SmemoServer {
 }
 
 #[tool_handler]
-impl ServerHandler for SmemoServer {
+impl ServerHandler for BuddiesServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(

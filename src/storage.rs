@@ -226,9 +226,9 @@ mod tests {
     }
 
     fn test_storage() -> Storage {
-        let dir = std::env::temp_dir().join(format!("smemo-storage-test-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("buddies-storage-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("create test dir");
-        Storage::open(&dir.join("smemo.redb")).expect("storage init")
+        Storage::open(&dir.join("buddies.redb")).expect("storage init")
     }
 
     #[test]

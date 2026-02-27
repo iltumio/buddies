@@ -147,7 +147,7 @@ impl P2PMessage {
 
 pub fn room_to_topic(room_name: &str) -> TopicId {
     let mut hasher = Sha256::new();
-    hasher.update(b"smemo:room:");
+    hasher.update(b"buddies:room:");
     hasher.update(room_name.as_bytes());
     let hash: [u8; 32] = hasher.finalize().into();
     TopicId::from_bytes(hash)

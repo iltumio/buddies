@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::protocol::SignerIdentity;
 
-const SSH_NAMESPACE: &str = "smemo";
+const SSH_NAMESPACE: &str = "buddies";
 
 #[derive(Debug, Clone)]
 pub enum LocalSigner {
@@ -65,7 +65,7 @@ pub fn discover_git_identity() -> Result<Option<LocalSigner>> {
 }
 
 pub fn discover_startup_identity(data_dir: Option<&Path>) -> Result<Option<LocalSigner>> {
-    let mode = std::env::var("SMEMO_SIGNER")
+    let mode = std::env::var("BUDDIES_SIGNER")
         .ok()
         .map(|v| v.trim().to_ascii_lowercase());
 
@@ -79,7 +79,7 @@ pub fn discover_startup_identity(data_dir: Option<&Path>) -> Result<Option<Local
             Ok(Some(signer))
         }
         Some(other) => anyhow::bail!(
-            "unsupported SMEMO_SIGNER value '{other}', expected git|none|gpg|ssh|generated"
+            "unsupported BUDDIES_SIGNER value '{other}', expected git|none|gpg|ssh|generated"
         ),
     }
 }
@@ -114,25 +114,25 @@ fn git_config(key: &str) -> Result<Option<String>> {
 }
 
 fn discover_gpg_from_env() -> Result<LocalSigner> {
-    let key_id = std::env::var("SMEMO_GPG_KEY_ID")
+    let key_id = std::env::var("BUDDIES_GPG_KEY_ID")
         .ok()
-        .or_else(|| std::env::var("SMEMO_SIGNING_KEY").ok())
+        .or_else(|| std::env::var("BUDDIES_SIGNING_KEY").ok())
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!("SMEMO_SIGNER=gpg requires SMEMO_GPG_KEY_ID or SMEMO_SIGNING_KEY")
+            anyhow::anyhow!("BUDDIES_SIGNER=gpg requires BUDDIES_GPG_KEY_ID or BUDDIES_SIGNING_KEY")
         })?;
 
     Ok(LocalSigner::Gpg { key_id })
 }
 
 fn discover_ssh_from_env() -> Result<LocalSigner> {
-    let private_key_path = std::env::var("SMEMO_SSH_PRIVATE_KEY")
+    let private_key_path = std::env::var("BUDDIES_SSH_PRIVATE_KEY")
         .ok()
-        .or_else(|| std::env::var("SMEMO_SIGNING_KEY").ok())
+        .or_else(|| std::env::var("BUDDIES_SIGNING_KEY").ok())
         .map(PathBuf::from)
         .ok_or_else(|| {
-            anyhow::anyhow!("SMEMO_SIGNER=ssh requires SMEMO_SSH_PRIVATE_KEY or SMEMO_SIGNING_KEY")
+            anyhow::anyhow!("BUDDIES_SIGNER=ssh requires BUDDIES_SSH_PRIVATE_KEY or BUDDIES_SIGNING_KEY")
         })?;
 
     if !private_key_path.exists() {
@@ -142,13 +142,13 @@ fn discover_ssh_from_env() -> Result<LocalSigner> {
         );
     }
 
-    let public_key = match std::env::var("SMEMO_SSH_PUBLIC_KEY") {
+    let public_key = match std::env::var("BUDDIES_SSH_PUBLIC_KEY") {
         Ok(value) => resolve_public_key_value(&value)?,
         Err(_) => {
             let default_pub = PathBuf::from(format!("{}.pub", private_key_path.display()));
             if !default_pub.exists() {
                 anyhow::bail!(
-                    "SMEMO_SSH_PUBLIC_KEY not set and inferred pubkey missing: {}",
+                    "BUDDIES_SSH_PUBLIC_KEY not set and inferred pubkey missing: {}",
                     default_pub.display()
                 );
             }
@@ -168,7 +168,7 @@ fn discover_ssh_from_env() -> Result<LocalSigner> {
 fn generated_ssh_identity(data_dir: Option<&Path>) -> Result<LocalSigner> {
     let base_dir = data_dir
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| std::env::temp_dir().join("smemo"));
+        .unwrap_or_else(|| std::env::temp_dir().join("buddies"));
     fs::create_dir_all(&base_dir)
         .with_context(|| format!("failed to create identity directory {}", base_dir.display()))?;
 
@@ -183,7 +183,7 @@ fn generated_ssh_identity(data_dir: Option<&Path>) -> Result<LocalSigner> {
                 "-N",
                 "",
                 "-C",
-                "smemo-generated",
+                "buddies-generated",
                 "-f",
                 path_str(&private_key_path)?,
             ])
@@ -221,10 +221,10 @@ fn resolve_public_key_value(value: &str) -> Result<String> {
     }
     let path = PathBuf::from(trimmed);
     if !path.exists() {
-        anyhow::bail!("SMEMO_SSH_PUBLIC_KEY must be an inline ssh key or an existing file path");
+        anyhow::bail!("BUDDIES_SSH_PUBLIC_KEY must be an inline ssh key or an existing file path");
     }
     Ok(fs::read_to_string(path)
-        .context("failed to read SMEMO_SSH_PUBLIC_KEY file")?
+        .context("failed to read BUDDIES_SSH_PUBLIC_KEY file")?
         .trim()
         .to_string())
 }
@@ -232,7 +232,7 @@ fn resolve_public_key_value(value: &str) -> Result<String> {
 fn resolve_ssh_keys(signing_key: &str) -> Result<(String, PathBuf)> {
     if signing_key.starts_with("ssh-") {
         anyhow::bail!(
-            "git user.signingkey contains an inline SSH public key; smemo needs a private key path"
+            "git user.signingkey contains an inline SSH public key; buddies needs a private key path"
         );
     }
 
@@ -270,8 +270,8 @@ fn resolve_ssh_keys(signing_key: &str) -> Result<(String, PathBuf)> {
 }
 
 fn sign_with_gpg(payload: &[u8], key_id: &str) -> Result<Vec<u8>> {
-    let temp = unique_temp_path("smemo-gpg-sign");
-    let sig = unique_temp_path("smemo-gpg-sign.sig");
+    let temp = unique_temp_path("buddies-gpg-sign");
+    let sig = unique_temp_path("buddies-gpg-sign.sig");
 
     fs::write(&temp, payload).context("failed to write temporary gpg payload")?;
 
@@ -305,8 +305,8 @@ fn sign_with_gpg(payload: &[u8], key_id: &str) -> Result<Vec<u8>> {
 }
 
 fn verify_with_gpg(payload: &[u8], signature: &[u8]) -> Result<bool> {
-    let temp = unique_temp_path("smemo-gpg-verify");
-    let sig = unique_temp_path("smemo-gpg-verify.sig");
+    let temp = unique_temp_path("buddies-gpg-verify");
+    let sig = unique_temp_path("buddies-gpg-verify.sig");
     fs::write(&temp, payload).context("failed to write temporary gpg payload")?;
     fs::write(&sig, signature).context("failed to write temporary gpg signature")?;
 
@@ -321,7 +321,7 @@ fn verify_with_gpg(payload: &[u8], signature: &[u8]) -> Result<bool> {
 }
 
 fn sign_with_ssh(payload: &[u8], private_key_path: &Path) -> Result<Vec<u8>> {
-    let temp = unique_temp_path("smemo-ssh-sign");
+    let temp = unique_temp_path("buddies-ssh-sign");
     fs::write(&temp, payload).context("failed to write temporary ssh payload")?;
 
     let output = Command::new("ssh-keygen")
@@ -354,10 +354,10 @@ fn sign_with_ssh(payload: &[u8], private_key_path: &Path) -> Result<Vec<u8>> {
 }
 
 fn verify_with_ssh(payload: &[u8], signature: &[u8], public_key: &str) -> Result<bool> {
-    let sig = unique_temp_path("smemo-ssh-verify.sig");
-    let allowed = unique_temp_path("smemo-ssh-allowed");
+    let sig = unique_temp_path("buddies-ssh-verify.sig");
+    let allowed = unique_temp_path("buddies-ssh-allowed");
     fs::write(&sig, signature).context("failed to write temporary ssh signature")?;
-    fs::write(&allowed, format!("smemo {public_key}\n"))
+    fs::write(&allowed, format!("buddies {public_key}\n"))
         .context("failed to write temporary allowed signers")?;
 
     let mut child = Command::new("ssh-keygen")
@@ -367,7 +367,7 @@ fn verify_with_ssh(payload: &[u8], signature: &[u8], public_key: &str) -> Result
             "-f",
             path_str(&allowed)?,
             "-I",
-            "smemo",
+            "buddies",
             "-n",
             SSH_NAMESPACE,
             "-s",
