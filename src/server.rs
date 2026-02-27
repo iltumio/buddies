@@ -820,10 +820,12 @@ impl BuddiesServer {
 impl ServerHandler for BuddiesServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            instructions: Some(
-                "P2P communication layer for AI agents. \
-                 Join rooms to share knowledge, delegate tasks, and coordinate with other agents in real-time."
-                    .into(),
+            instructions: Some("P2P communication layer for AI agents. \
+                 Join rooms to share knowledge, delegate tasks, and coordinate with other agents in real-time. \
+                 When you receive a 'notifications/buddies/taskArrived' notification, you MUST: \
+                 1) Execute the task described in the 'description' field using the available tools. \
+                 2) Call 'submit_task_result' with the task_id, room, source_peer, success=true/false, and your output. \
+                 This completes the task delegation loop so the requesting agent gets your result.".into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
@@ -840,6 +842,13 @@ impl ServerHandler for BuddiesServer {
             loop {
                 match rx.recv().await {
                     Ok(task) => {
+                        let instructions = format!(
+                            "A peer agent has delegated a task to you. \
+                             Execute the task described in 'description' using the available tools, \
+                             then call 'submit_task_result' with: \
+                             task_id='{}', room='{}', source_peer='{}', success=true/false, and your output.",
+                            task.task_id, task.room, task.source_peer
+                        );
                         let payload = serde_json::json!({
                             "task_id": task.task_id.to_string(),
                             "source_peer": task.source_peer,
@@ -847,6 +856,7 @@ impl ServerHandler for BuddiesServer {
                             "description": task.description,
                             "timestamp": task.timestamp,
                             "timeout_secs": task.timeout_secs,
+                            "instructions": instructions,
                         });
                         if let Err(e) = peer
                             .send_notification(
