@@ -829,4 +829,49 @@ impl ServerHandler for BuddiesServer {
             ..Default::default()
         }
     }
+
+    async fn on_initialized(
+        &self,
+        context: rmcp::service::NotificationContext<rmcp::RoleServer>,
+    ) {
+        let peer = context.peer.clone();
+        let mut rx = self.node.subscribe_task_events();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(task) => {
+                        let payload = serde_json::json!({
+                            "task_id": task.task_id.to_string(),
+                            "source_peer": task.source_peer,
+                            "room": task.room,
+                            "description": task.description,
+                            "timestamp": task.timestamp,
+                            "timeout_secs": task.timeout_secs,
+                        });
+                        if let Err(e) = peer
+                            .send_notification(
+                                ServerNotification::CustomNotification(
+                                    CustomNotification::new(
+                                        "notifications/buddies/taskArrived",
+                                        Some(payload),
+                                    ),
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "failed to send task notification");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "task notification listener lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::debug!("task broadcast channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 }

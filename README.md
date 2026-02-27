@@ -247,6 +247,15 @@ sequenceDiagram
 
 The delegator's `delegate_task` call **blocks** until a result comes back (or the timeout expires), so from the agent's perspective it feels like a local tool call. On the other side, the receiving agent uses `poll_pending_tasks` (with long-polling support) to pick up work, does whatever it needs to do, and calls `submit_task_result` to send the answer back.
 
+### Push notifications (HTTP transport)
+
+When running with `BUDDIES_TRANSPORT=http`, buddies automatically pushes real-time notifications to the connected MCP client whenever a task arrives via P2P gossip. The notification is sent as an MCP `CustomNotification` over the SSE stream:
+
+- **Method**: `notifications/buddies/taskArrived`
+- **Params**: `{ task_id, source_peer, room, description, timestamp, timeout_secs }`
+
+This means the receiving agent learns about new tasks instantly — no polling required. The existing `poll_pending_tasks` tool still works as a fallback for stdio transport or clients that don't handle custom notifications.
+
 ## Configuration
 
 | Environment variable | Default | Description |

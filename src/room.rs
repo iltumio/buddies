@@ -27,7 +27,7 @@ pub struct PeerInfo {
     pub last_status: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PendingTask {
     pub task_id: Uuid,
     pub source_peer: String,
@@ -54,6 +54,7 @@ pub struct RoomManager {
     incoming_tasks: Arc<Mutex<Vec<PendingTask>>>,
     task_waiters: Arc<Mutex<HashMap<Uuid, oneshot::Sender<TaskResult>>>>,
     task_notify: Arc<tokio::sync::Notify>,
+    task_broadcast: tokio::sync::broadcast::Sender<PendingTask>,
     signer: Option<LocalSigner>,
     room_whitelists: Arc<RwLock<HashMap<String, HashSet<SignerIdentity>>>>,
     require_signed: Arc<RwLock<HashMap<String, bool>>>,
@@ -79,10 +80,17 @@ impl RoomManager {
             incoming_tasks: Arc::new(Mutex::new(Vec::new())),
             task_waiters: Arc::new(Mutex::new(HashMap::new())),
             task_notify: Arc::new(tokio::sync::Notify::new()),
+            task_broadcast: tokio::sync::broadcast::channel(64).0,
             signer,
             room_whitelists: Arc::new(RwLock::new(HashMap::new())),
             require_signed: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Subscribe to task arrival events. Each new `PendingTask` received via
+    /// gossip will be sent on the returned channel.
+    pub fn subscribe_task_events(&self) -> tokio::sync::broadcast::Receiver<PendingTask> {
+        self.task_broadcast.subscribe()
     }
 
     pub fn signer_identity_label(&self) -> Option<String> {
@@ -619,16 +627,19 @@ impl RoomManager {
                     warn!("incoming task queue full, dropping task {task_id}");
                     return;
                 }
-                tasks.push(PendingTask {
+                let task = PendingTask {
                     task_id,
                     source_peer,
                     room,
                     description,
                     timestamp,
                     timeout_secs,
-                });
+                };
+                let task_clone = task.clone();
+                tasks.push(task);
                 drop(tasks);
                 self.task_notify.notify_waiters();
+                let _ = self.task_broadcast.send(task_clone);
             }
             P2PMessageBody::TaskClaimed {
                 task_id,

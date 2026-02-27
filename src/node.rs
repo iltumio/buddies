@@ -57,6 +57,10 @@ impl BuddiesNode {
         })
     }
 
+    pub fn subscribe_task_events(&self) -> tokio::sync::broadcast::Receiver<crate::room::PendingTask> {
+        self.room_manager.subscribe_task_events()
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         self.router.shutdown().await?;
         Ok(())
