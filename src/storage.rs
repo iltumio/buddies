@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use uuid::Uuid;
 
 use crate::memory::{MemoryEntry, SearchFilters};

@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
         .init();
 
     let user_name = std::env::var("BUDDIES_USER")
-        .unwrap_or_else(|_| whoami::fallible::username().unwrap_or_else(|_| "anonymous".into()));
+        .unwrap_or_else(|_| whoami::username().unwrap_or_else(|_| "anonymous".into()));
     let agent_name =
         std::env::var("BUDDIES_AGENT").unwrap_or_else(|_| "unknown-agent".into());
     let data_path = std::env::var("BUDDIES_DATA_DIR")

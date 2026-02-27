@@ -31,23 +31,48 @@ sequenceDiagram
 Each buddies instance runs locally alongside your agent. Memories are stored on disk and shared over encrypted QUIC connections. When an agent searches, it queries both its local store and every peer in the room — results come back in seconds.
 
 ## Quick start
+
+### Using the installer
+
 ```bash
-# One-line install + configure
+# One-line install + configure (builds from source, requires Rust)
 curl -sSf https://raw.githubusercontent.com/iltumio/buddies/main/install.sh | bash
 
-# Or clone and use the installer
-git clone https://github.com/iltumio/buddies
-cd buddies
-./install.sh --all  # Claude Code + OpenCode + OpenClaw
+# Or use precompiled binaries (no Rust needed)
+curl -sSf https://raw.githubusercontent.com/iltumio/buddies/main/install.sh | bash -s -- --prebuilt --all
 ```
 
-The installer builds from source, detects your signing identity, and configures Claude Code, OpenCode, and/or OpenClaw automatically. Run `./install.sh --help` for options.
+The installer detects your platform, downloads the right binary (or builds from source), and configures Claude Code, OpenCode, and/or OpenClaw automatically. Run `./install.sh --help` for options.
 
-Manual setup:
+### Precompiled binaries
+
+Download the latest release for your platform from [GitHub Releases](https://github.com/iltumio/buddies/releases):
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86_64 | `buddies-x86_64-unknown-linux-gnu` |
+| Linux aarch64 | `buddies-aarch64-unknown-linux-gnu` |
 
 ```bash
-cargo install --path .
+# Example: download and install manually
+curl -fSL -o ~/.local/bin/buddies \
+  https://github.com/iltumio/buddies/releases/latest/download/buddies-x86_64-unknown-linux-gnu
+chmod +x ~/.local/bin/buddies
+```
 
+### Building from source
+
+```bash
+git clone https://github.com/iltumio/buddies
+cd buddies
+cargo install --path .
+```
+
+Requires Rust 2024 edition (1.85+).
+
+### Usage
+
+```bash
 # Alice opens a room
 BUDDIES_USER=alice buddies
 # Agent calls: join_room({ "room": "feature-a" })
@@ -351,16 +376,6 @@ graph TB
 - **Wire format**: [postcard](https://github.com/jamesmunns/postcard) — compact binary serialization for gossip messages
 
 Rooms map to gossip topics via deterministic SHA-256 hashing. Same room name = same topic = same swarm. Peers discover each other through Iroh's relay infrastructure and direct QUIC hole-punching.
-
-## Building from source
-
-```bash
-git clone https://github.com/iltumio/buddies
-cd buddies
-cargo build --release
-```
-
-Requires Rust 2024 edition (1.85+).
 
 ## License
 

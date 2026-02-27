@@ -7,7 +7,7 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 # MCP protocol
-rmcp = { version = "0.14", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "0.17", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 
 # P2P networking
 iroh = "0.96"
@@ -27,7 +27,7 @@ postcard = { version = "1", features = ["alloc"] }
 schemars = "1"
 
 # Local storage
-redb = "2"
+redb = "3"
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -37,7 +37,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 data-encoding = "2"
-rand = "0.9"
+rand = "0.10"
 dirs = "6"
-whoami = "1"
+whoami = "2"
 axum = "0.8"

@@ -14,6 +14,8 @@ ok()    { printf "${GREEN}✓${NC} %s\n" "$*"; }
 warn()  { printf "${YELLOW}!${NC} %s\n" "$*"; }
 fail()  { printf "${RED}✗${NC} %s\n" "$*" >&2; exit 1; }
 
+GITHUB_REPO="iltumio/buddies"
+
 BUDDIES_BIN=""
 BUDDIES_USER=""
 BUDDIES_SIGNER="git"
@@ -21,6 +23,7 @@ CONFIGURE_CLAUDE=false
 CONFIGURE_OPENCODE=false
 CONFIGURE_OPENCLAW=false
 SKIP_BUILD=false
+USE_PREBUILT=false
 BUDDIES_TRANSPORT="stdio"
 BUDDIES_PORT="8080"
 
@@ -39,11 +42,13 @@ Options:
   --opencode            Configure OpenCode
   --openclaw            Configure OpenClaw
   --all                 Configure Claude Code, OpenCode, and OpenClaw
-  --skip-build          Skip cargo build (use existing binary)
+  --prebuilt            Download precompiled binary from GitHub releases
+  --skip-build          Skip cargo build (use existing binary in PATH)
   -h, --help            Show this help
 
 Examples:
   ./install.sh --all
+  ./install.sh --all --prebuilt
   ./install.sh --claude --user alice --signer generated
   ./install.sh --opencode --skip-build
   ./install.sh --opencode --transport http --port 9090
@@ -63,6 +68,7 @@ while [[ $# -gt 0 ]]; do
         --openclaw)   CONFIGURE_OPENCLAW=true; shift ;;
         --all)        CONFIGURE_CLAUDE=true; CONFIGURE_OPENCODE=true; CONFIGURE_OPENCLAW=true; shift ;;
         --skip-build) SKIP_BUILD=true; shift ;;
+        --prebuilt)   USE_PREBUILT=true; SKIP_BUILD=true; shift ;;
         -h|--help)    usage ;;
         *)            fail "Unknown option: $1" ;;
     esac
@@ -95,7 +101,12 @@ fi
 
 check_deps() {
     local missing=()
-    command -v cargo >/dev/null 2>&1 || missing+=("cargo (Rust toolchain)")
+    if ! $USE_PREBUILT; then
+        command -v cargo >/dev/null 2>&1 || missing+=("cargo (Rust toolchain)")
+    fi
+    if $USE_PREBUILT; then
+        command -v curl >/dev/null 2>&1 || missing+=("curl")
+    fi
     if $CONFIGURE_CLAUDE; then
         command -v claude >/dev/null 2>&1 || missing+=("claude (Claude Code CLI)")
     fi
@@ -105,12 +116,63 @@ check_deps() {
             printf "  - %s\n" "$dep"
         done
         if [[ " ${missing[*]} " == *"cargo"* ]] && ! $SKIP_BUILD; then
-            fail "Rust toolchain required. Install from https://rustup.rs"
+            fail "Rust toolchain required. Install from https://rustup.rs or use --prebuilt"
+        fi
+        if [[ " ${missing[*]} " == *"curl"* ]]; then
+            fail "curl is required for --prebuilt"
         fi
     fi
 }
 
+detect_target() {
+    local arch
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64)  echo "x86_64-unknown-linux-gnu" ;;
+        aarch64) echo "aarch64-unknown-linux-gnu" ;;
+        *)       fail "Unsupported architecture: $arch. Build from source instead." ;;
+    esac
+}
+
+download_buddies() {
+    local target
+    target="$(detect_target)"
+    local bin_name="buddies-${target}"
+    local install_dir="$HOME/.local/bin"
+
+    info "Detecting latest release..."
+    local latest_tag
+    latest_tag=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
+        | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+
+    if [[ -z "$latest_tag" ]]; then
+        fail "Could not detect latest release. Check https://github.com/${GITHUB_REPO}/releases"
+    fi
+
+    local url="https://github.com/${GITHUB_REPO}/releases/download/${latest_tag}/${bin_name}"
+    info "Downloading buddies ${latest_tag} for ${target}..."
+
+    mkdir -p "$install_dir"
+    if ! curl -fSL --progress-bar -o "${install_dir}/buddies" "$url"; then
+        fail "Download failed. Check that a release exists for ${target} at:\n  ${url}"
+    fi
+
+    chmod +x "${install_dir}/buddies"
+    BUDDIES_BIN="${install_dir}/buddies"
+    ok "Installed: $BUDDIES_BIN (${latest_tag})"
+
+    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$install_dir"; then
+        warn "$install_dir is not in your PATH. Add it with:"
+        printf "  export PATH=\"%s:\$PATH\"\n" "$install_dir"
+    fi
+}
+
 build_buddies() {
+    if $USE_PREBUILT; then
+        download_buddies
+        return
+    fi
+
     if $SKIP_BUILD; then
         BUDDIES_BIN="$(command -v buddies 2>/dev/null || true)"
         if [[ -z "$BUDDIES_BIN" ]]; then
