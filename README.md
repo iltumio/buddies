@@ -379,4 +379,4 @@ Rooms map to gossip topics via deterministic SHA-256 hashing. Same room name = s
 
 ## License
 
-AGPL-3.0 — see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE)
