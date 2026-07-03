@@ -171,7 +171,6 @@ impl WatcherManager {
 
     /// Start watching a git repo, broadcasting file activity to `room`.
     /// Idempotent: watching an already-watched path returns its repo name.
-    #[allow(dead_code)] // consumed by MCP tools in Task 7
     pub async fn watch(
         &self,
         repo_path: &Path,
@@ -259,7 +258,6 @@ impl WatcherManager {
         Ok(repo_name)
     }
 
-    #[allow(dead_code)] // consumed by MCP tools in Task 7
     pub async fn unwatch(&self, repo_path: &Path) -> Result<bool> {
         let repo_path = repo_path
             .canonicalize()

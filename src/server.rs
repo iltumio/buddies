@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +10,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::activity::diff_summary;
 use crate::memory::{MemoryEntry, MemoryKind, SearchFilters};
 use crate::node::BuddiesNode;
 use crate::protocol::{P2PMessage, P2PMessageBody, SignerIdentity, TaskResult};
@@ -165,6 +167,38 @@ pub struct VoteSkillRequest {
 pub struct GetSkillRequest {
     #[schemars(description = "Content hash of the skill to retrieve")]
     pub hash: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WatchRepoRequest {
+    #[schemars(description = "Absolute path to a local git repository to watch")]
+    pub repo_path: String,
+    #[schemars(description = "Room to broadcast file activity to")]
+    pub room: String,
+    #[schemars(description = "Repo name agreed with teammates (default: directory name)")]
+    pub repo_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UnwatchRepoRequest {
+    pub repo_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CheckFileActivityRequest {
+    #[schemars(description = "Repo name as agreed in watch_repo")]
+    pub repo: String,
+    #[schemars(description = "Repo-relative paths to check (default: all recent activity)")]
+    pub paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetPeerDiffRequest {
+    pub repo: String,
+    #[schemars(description = "Repo-relative file path")]
+    pub path: String,
+    #[schemars(description = "Peer (author) name whose diff to fetch")]
+    pub peer: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -827,6 +861,102 @@ impl BuddiesServer {
             None => Err(err(format!("skill not found: {}", req.hash))),
         }
     }
+
+    #[tool(
+        name = "watch_repo",
+        description = "Watch a local git repository and broadcast every uncommitted file change (with diff) to peers in the room. Enables check_file_activity, get_peer_diff, and proactive conflict notifications. WARNING: this shares source-code diffs with everyone in the room."
+    )]
+    async fn watch_repo(
+        &self,
+        Parameters(req): Parameters<WatchRepoRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let repo = self
+            .node
+            .watcher_manager
+            .watch(Path::new(&req.repo_path), &req.room, req.repo_name)
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        ok_json(&serde_json::json!({
+            "watching": true,
+            "repo": repo,
+            "room": req.room,
+        }))
+    }
+
+    #[tool(name = "unwatch_repo", description = "Stop watching a repository.")]
+    async fn unwatch_repo(
+        &self,
+        Parameters(req): Parameters<UnwatchRepoRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let stopped = self
+            .node
+            .watcher_manager
+            .unwatch(Path::new(&req.repo_path))
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        ok_json(&serde_json::json!({ "stopped": stopped }))
+    }
+
+    #[tool(
+        name = "check_file_activity",
+        description = "Check which peers recently changed files in a watched repo. Call this BEFORE editing files in a shared repo to avoid conflicts. Returns per-file: peer, branch, change kind, timestamp, and diff line counts."
+    )]
+    async fn check_file_activity(
+        &self,
+        Parameters(req): Parameters<CheckFileActivityRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let entries = self
+            .node
+            .storage
+            .get_file_activity(&req.repo, req.paths.as_deref(), now_ts())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let activity: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                let (added, removed) = diff_summary(&e.diff);
+                serde_json::json!({
+                    "path": e.path,
+                    "peer": e.author,
+                    "kind": e.kind.to_string(),
+                    "branch": e.branch,
+                    "timestamp": e.timestamp,
+                    "lines_added": added,
+                    "lines_removed": removed,
+                })
+            })
+            .collect();
+        ok_json(&serde_json::json!({ "repo": req.repo, "activity": activity }))
+    }
+
+    #[tool(
+        name = "get_peer_diff",
+        description = "Get the full diff of a peer's latest change to a file in a watched repo."
+    )]
+    async fn get_peer_diff(
+        &self,
+        Parameters(req): Parameters<GetPeerDiffRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let entry = self
+            .node
+            .storage
+            .get_peer_file_activity(&req.repo, &req.path, &req.peer, now_ts())
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        match entry {
+            Some(e) => ok_json(&serde_json::json!({
+                "repo": e.repo,
+                "path": e.path,
+                "peer": e.author,
+                "branch": e.branch,
+                "kind": e.kind.to_string(),
+                "timestamp": e.timestamp,
+                "diff": e.diff,
+            })),
+            None => Err(err(format!(
+                "no recent activity from '{}' on '{}' in repo '{}'",
+                req.peer, req.path, req.repo
+            ))),
+        }
+    }
 }
 
 #[tool_handler]
@@ -838,7 +968,12 @@ impl ServerHandler for BuddiesServer {
                  When you receive a 'notifications/buddies/taskArrived' notification, you MUST: \
                  1) Execute the task described in the 'description' field using the available tools. \
                  2) Call 'submit_task_result' with the task_id, room, source_peer, success=true/false, and your output. \
-                 This completes the task delegation loop so the requesting agent gets your result.".into(),
+                 This completes the task delegation loop so the requesting agent gets your result. \
+                 To collaborate on a shared git repo, call 'watch_repo' with the repo path and room; \
+                 then call 'check_file_activity' before editing files to see what peers changed, and \
+                 'get_peer_diff' to read a peer's change. When you receive a \
+                 'notifications/buddies/fileConflict' notification, inspect the peer's diff and \
+                 reconcile with your local changes before continuing to edit that file.".into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
@@ -847,6 +982,7 @@ impl ServerHandler for BuddiesServer {
 
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
         let peer = context.peer.clone();
+        let conflict_peer = context.peer.clone();
         let mut rx = self.node.subscribe_task_events();
         tokio::spawn(async move {
             loop {
@@ -888,6 +1024,49 @@ impl ServerHandler for BuddiesServer {
                         tracing::debug!("task broadcast channel closed");
                         break;
                     }
+                }
+            }
+        });
+
+        let peer = conflict_peer;
+        let mut conflict_rx = self.node.subscribe_conflict_events();
+        tokio::spawn(async move {
+            loop {
+                match conflict_rx.recv().await {
+                    Ok(entry) => {
+                        let (added, removed) = crate::activity::diff_summary(&entry.diff);
+                        let payload = serde_json::json!({
+                            "repo": entry.repo,
+                            "path": entry.path,
+                            "peer": entry.author,
+                            "branch": entry.branch,
+                            "kind": entry.kind.to_string(),
+                            "timestamp": entry.timestamp,
+                            "lines_added": added,
+                            "lines_removed": removed,
+                            "instructions": format!(
+                                "Peer '{}' changed '{}' (branch '{}'), which you have also modified locally. \
+                                 Call get_peer_diff to inspect their change and reconcile before continuing.",
+                                entry.author, entry.path, entry.branch
+                            ),
+                        });
+                        if let Err(e) = peer
+                            .send_notification(ServerNotification::CustomNotification(
+                                CustomNotification::new(
+                                    "notifications/buddies/fileConflict",
+                                    Some(payload),
+                                ),
+                            ))
+                            .await
+                        {
+                            tracing::warn!(error = %e, "failed to send conflict notification");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "conflict notification listener lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });

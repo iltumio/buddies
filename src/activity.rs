@@ -41,7 +41,6 @@ pub struct FileActivityEntry {
 }
 
 /// (added, removed) line counts of a unified diff.
-#[allow(dead_code)] // consumed by repo scanning in a later task
 pub fn diff_summary(diff: &str) -> (u64, u64) {
     let mut added = 0;
     let mut removed = 0;

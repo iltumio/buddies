@@ -157,7 +157,6 @@ impl RoomManager {
 
     /// Subscribe to conflict events: fired when a peer's file activity
     /// arrives for a path that is also locally modified in a watched repo.
-    #[allow(dead_code)] // consumed by MCP tools in Task 7
     pub fn subscribe_conflict_events(&self) -> tokio::sync::broadcast::Receiver<FileActivityEntry> {
         self.conflict_broadcast.subscribe()
     }

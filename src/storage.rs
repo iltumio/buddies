@@ -236,7 +236,6 @@ impl Storage {
         Ok(())
     }
 
-    #[allow(dead_code)] // consumed by MCP tools in a later task
     pub fn get_file_activity(
         &self,
         repo: &str,
@@ -267,7 +266,6 @@ impl Storage {
         Ok(results)
     }
 
-    #[allow(dead_code)] // consumed by watcher conflict detection in a later task
     pub fn get_peer_file_activity(
         &self,
         repo: &str,

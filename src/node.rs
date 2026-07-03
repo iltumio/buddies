@@ -17,7 +17,6 @@ pub struct BuddiesNode {
     pub router: Router,
     pub room_manager: Arc<RoomManager>,
     pub storage: Arc<Storage>,
-    #[allow(dead_code)] // consumed by MCP tools in Task 7
     pub watcher_manager: Arc<WatcherManager>,
 }
 
@@ -74,7 +73,6 @@ impl BuddiesNode {
         self.room_manager.subscribe_task_events()
     }
 
-    #[allow(dead_code)] // consumed by MCP tools in Task 7
     pub fn subscribe_conflict_events(
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::activity::FileActivityEntry> {
