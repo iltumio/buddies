@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use iroh::protocol::Router;
 use iroh::Endpoint;
+use iroh::protocol::Router;
 use iroh_gossip::net::Gossip;
 
 use crate::identity::LocalSigner;
@@ -57,7 +57,9 @@ impl BuddiesNode {
         })
     }
 
-    pub fn subscribe_task_events(&self) -> tokio::sync::broadcast::Receiver<crate::room::PendingTask> {
+    pub fn subscribe_task_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::room::PendingTask> {
         self.room_manager.subscribe_task_events()
     }
 

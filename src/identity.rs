@@ -132,7 +132,9 @@ fn discover_ssh_from_env() -> Result<LocalSigner> {
         .or_else(|| std::env::var("BUDDIES_SIGNING_KEY").ok())
         .map(PathBuf::from)
         .ok_or_else(|| {
-            anyhow::anyhow!("BUDDIES_SIGNER=ssh requires BUDDIES_SSH_PRIVATE_KEY or BUDDIES_SIGNING_KEY")
+            anyhow::anyhow!(
+                "BUDDIES_SIGNER=ssh requires BUDDIES_SSH_PRIVATE_KEY or BUDDIES_SIGNING_KEY"
+            )
         })?;
 
     if !private_key_path.exists() {

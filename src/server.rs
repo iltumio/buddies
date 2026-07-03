@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use rmcp::schemars::JsonSchema;
+use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -94,7 +94,9 @@ pub struct DelegateTaskRequest {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PollTasksRequest {
     pub room: Option<String>,
-    #[schemars(description = "Seconds to wait for tasks to arrive if none are pending (default 30, 0 = return immediately)")]
+    #[schemars(
+        description = "Seconds to wait for tasks to arrive if none are pending (default 30, 0 = return immediately)"
+    )]
     pub wait_secs: Option<u64>,
 }
 
@@ -264,7 +266,8 @@ fn now_ts() -> u64 {
 }
 
 fn ok_json<T: Serialize>(v: &T) -> Result<CallToolResult, McpError> {
-    let text = serde_json::to_string_pretty(v).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+    let text = serde_json::to_string_pretty(v)
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![Content::text(text)]))
 }
 
@@ -278,7 +281,10 @@ impl BuddiesServer {
         name = "join_room",
         description = "Join a named collaboration room. Optionally provide a ticket from another peer to bootstrap P2P connection. Returns a ticket that others can use to join."
     )]
-    async fn join_room(&self, Parameters(req): Parameters<JoinRoomRequest>) -> Result<CallToolResult, McpError> {
+    async fn join_room(
+        &self,
+        Parameters(req): Parameters<JoinRoomRequest>,
+    ) -> Result<CallToolResult, McpError> {
         let mut bootstrap_peers = vec![];
 
         if let Some(ref ticket_str) = req.ticket {
@@ -308,7 +314,10 @@ impl BuddiesServer {
     }
 
     #[tool(name = "leave_room", description = "Leave a collaboration room.")]
-    async fn leave_room(&self, Parameters(req): Parameters<LeaveRoomRequest>) -> Result<CallToolResult, McpError> {
+    async fn leave_room(
+        &self,
+        Parameters(req): Parameters<LeaveRoomRequest>,
+    ) -> Result<CallToolResult, McpError> {
         self.node
             .room_manager
             .leave_room(&req.room)
@@ -322,8 +331,14 @@ impl BuddiesServer {
         name = "store_memory",
         description = "Store a memory entry and broadcast it to all peers in the room. Use this to share decisions, implementation details, context, skills, or status updates."
     )]
-    async fn store_memory(&self, Parameters(req): Parameters<StoreMemoryRequest>) -> Result<CallToolResult, McpError> {
-        let kind: MemoryKind = req.kind.parse().map_err(|e: anyhow::Error| err(e.to_string()))?;
+    async fn store_memory(
+        &self,
+        Parameters(req): Parameters<StoreMemoryRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind: MemoryKind = req
+            .kind
+            .parse()
+            .map_err(|e: anyhow::Error| err(e.to_string()))?;
 
         let refs: Vec<Uuid> = req
             .references
@@ -472,7 +487,10 @@ impl BuddiesServer {
         }))
     }
 
-    #[tool(name = "list_rooms", description = "List all rooms you are currently in.")]
+    #[tool(
+        name = "list_rooms",
+        description = "List all rooms you are currently in."
+    )]
     async fn list_rooms(&self) -> Result<CallToolResult, McpError> {
         let rooms = self.node.room_manager.list_rooms().await;
         ok_json(&serde_json::json!({ "rooms": rooms }))
@@ -496,18 +514,14 @@ impl BuddiesServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         match result {
-            TaskResult::Success { output } => {
-                ok_json(&serde_json::json!({
-                    "status": "completed",
-                    "output": output,
-                }))
-            }
-            TaskResult::Error { message } => {
-                ok_json(&serde_json::json!({
-                    "status": "error",
-                    "error": message,
-                }))
-            }
+            TaskResult::Success { output } => ok_json(&serde_json::json!({
+                "status": "completed",
+                "output": output,
+            })),
+            TaskResult::Error { message } => ok_json(&serde_json::json!({
+                "status": "error",
+                "error": message,
+            })),
         }
     }
 
@@ -575,7 +589,9 @@ impl BuddiesServer {
         let result = if req.success {
             TaskResult::Success { output: req.output }
         } else {
-            TaskResult::Error { message: req.output }
+            TaskResult::Error {
+                message: req.output,
+            }
         };
 
         self.node
@@ -650,7 +666,8 @@ impl BuddiesServer {
         &self,
         Parameters(req): Parameters<GetIdentityPolicyRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let (identities, require_signed) = self.node.room_manager.get_identity_policy(&req.room).await;
+        let (identities, require_signed) =
+            self.node.room_manager.get_identity_policy(&req.room).await;
         let local_identity = self.node.room_manager.signer_identity_label();
         ok_json(&serde_json::json!({
             "room": req.room,
@@ -774,11 +791,7 @@ impl BuddiesServer {
             .broadcast_to_room(&req.room, broadcast_msg)
             .await;
 
-        let rank = self
-            .node
-            .storage
-            .get_skill_rank(&req.hash)
-            .unwrap_or(0);
+        let rank = self.node.storage.get_skill_rank(&req.hash).unwrap_or(0);
 
         ok_json(&serde_json::json!({
             "voted": true,
@@ -832,10 +845,7 @@ impl ServerHandler for BuddiesServer {
         }
     }
 
-    async fn on_initialized(
-        &self,
-        context: rmcp::service::NotificationContext<rmcp::RoleServer>,
-    ) {
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
         let peer = context.peer.clone();
         let mut rx = self.node.subscribe_task_events();
         tokio::spawn(async move {
@@ -859,14 +869,12 @@ impl ServerHandler for BuddiesServer {
                             "instructions": instructions,
                         });
                         if let Err(e) = peer
-                            .send_notification(
-                                ServerNotification::CustomNotification(
-                                    CustomNotification::new(
-                                        "notifications/buddies/taskArrived",
-                                        Some(payload),
-                                    ),
+                            .send_notification(ServerNotification::CustomNotification(
+                                CustomNotification::new(
+                                    "notifications/buddies/taskArrived",
+                                    Some(payload),
                                 ),
-                            )
+                            ))
                             .await
                         {
                             tracing::warn!(error = %e, "failed to send task notification");
