@@ -1,10 +1,10 @@
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
+#[allow(dead_code)] // consumed by repo scanning in a later task
 pub const MAX_DIFF_BYTES: usize = 64 * 1024;
+#[allow(dead_code)] // consumed by repo scanning in a later task
 pub const DIFF_TRUNCATION_MARKER: &str = "\n[... diff truncated by buddies ...]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +41,7 @@ pub struct FileActivityEntry {
 }
 
 /// (added, removed) line counts of a unified diff.
+#[allow(dead_code)] // consumed by repo scanning in a later task
 pub fn diff_summary(diff: &str) -> (u64, u64) {
     let mut added = 0;
     let mut removed = 0;
@@ -57,6 +58,7 @@ pub fn diff_summary(diff: &str) -> (u64, u64) {
     (added, removed)
 }
 
+#[allow(dead_code)] // consumed by repo scanning in a later task
 pub fn truncate_diff(mut diff: String) -> String {
     if diff.len() <= MAX_DIFF_BYTES {
         return diff;
@@ -72,11 +74,13 @@ pub fn truncate_diff(mut diff: String) -> String {
 
 /// Locally-modified paths per watched repo, shared between the watcher
 /// (writer) and the gossip handler (reader, for conflict detection).
+#[allow(dead_code)] // consumed by WatcherManager wiring in a later task
 #[derive(Default)]
 pub struct DirtySet {
     inner: RwLock<HashMap<String, HashSet<String>>>,
 }
 
+#[allow(dead_code)] // consumed by WatcherManager wiring in a later task
 impl DirtySet {
     pub fn new() -> Self {
         Self::default()

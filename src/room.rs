@@ -758,6 +758,9 @@ impl RoomManager {
                     warn!(error = %e, "failed to store received skill vote");
                 }
             }
+            P2PMessageBody::FileActivity { entry } => {
+                debug!(repo = %entry.repo, path = %entry.path, "file activity received (handler wired in a later task)");
+            }
         }
     }
 

@@ -4,12 +4,24 @@ use anyhow::Result;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use uuid::Uuid;
 
+use crate::activity::FileActivityEntry;
 use crate::memory::{MemoryEntry, SearchFilters};
 use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult, SkillVote};
 
 const MEMORIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("memories");
 const SKILLS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("skills");
 const SKILL_VOTES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("skill_votes");
+const FILE_ACTIVITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("file_activity");
+
+/// Peer file activity older than this is pruned/ignored.
+#[allow(dead_code)] // consumed by watcher/MCP wiring in later tasks
+pub const FILE_ACTIVITY_TTL_SECS: u64 = 86_400;
+
+#[allow(dead_code)] // consumed by watcher/MCP wiring in later tasks
+fn activity_key(repo: &str, path: &str, peer: &str) -> String {
+    // NUL separators: valid in Rust strings, cannot appear in the fields.
+    format!("{repo}\u{0}{path}\u{0}{peer}")
+}
 
 pub struct Storage {
     db: Database,
@@ -23,6 +35,7 @@ impl Storage {
             let _ = tx.open_table(MEMORIES_TABLE)?;
             let _ = tx.open_table(SKILLS_TABLE)?;
             let _ = tx.open_table(SKILL_VOTES_TABLE)?;
+            let _ = tx.open_table(FILE_ACTIVITY_TABLE)?;
         }
         tx.commit()?;
         Ok(Self { db })
@@ -35,6 +48,7 @@ impl Storage {
             let _ = tx.open_table(MEMORIES_TABLE)?;
             let _ = tx.open_table(SKILLS_TABLE)?;
             let _ = tx.open_table(SKILL_VOTES_TABLE)?;
+            let _ = tx.open_table(FILE_ACTIVITY_TABLE)?;
         }
         tx.commit()?;
         Ok(Self { db })
@@ -195,13 +209,95 @@ impl Storage {
         results.truncate(limit);
         Ok(results)
     }
+
+    #[allow(dead_code)] // consumed by watcher/MCP wiring in later tasks
+    pub fn store_file_activity(&self, entry: &FileActivityEntry, now: u64) -> Result<()> {
+        let key = activity_key(&entry.repo, &entry.path, &entry.author);
+        let value = postcard::to_allocvec(entry)?;
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(FILE_ACTIVITY_TABLE)?;
+            table.insert(key.as_str(), value.as_slice())?;
+
+            // lazy TTL prune: collect stale keys, then remove
+            let mut stale = Vec::new();
+            for item in table.iter()? {
+                let (k, v) = item?;
+                let e: FileActivityEntry = postcard::from_bytes(v.value())?;
+                if e.timestamp + FILE_ACTIVITY_TTL_SECS < now {
+                    stale.push(k.value().to_string());
+                }
+            }
+            for k in stale {
+                table.remove(k.as_str())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // consumed by MCP tools in a later task
+    pub fn get_file_activity(
+        &self,
+        repo: &str,
+        paths: Option<&[String]>,
+        now: u64,
+    ) -> Result<Vec<FileActivityEntry>> {
+        let prefix = format!("{repo}\u{0}");
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(FILE_ACTIVITY_TABLE)?;
+        let mut results = Vec::new();
+        for item in table.iter()? {
+            let (k, v) = item?;
+            if !k.value().starts_with(&prefix) {
+                continue;
+            }
+            let entry: FileActivityEntry = postcard::from_bytes(v.value())?;
+            if entry.timestamp + FILE_ACTIVITY_TTL_SECS < now {
+                continue;
+            }
+            if let Some(paths) = paths
+                && !paths.contains(&entry.path)
+            {
+                continue;
+            }
+            results.push(entry);
+        }
+        results.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
+        Ok(results)
+    }
+
+    #[allow(dead_code)] // consumed by watcher conflict detection in a later task
+    pub fn get_peer_file_activity(
+        &self,
+        repo: &str,
+        path: &str,
+        peer: &str,
+        now: u64,
+    ) -> Result<Option<FileActivityEntry>> {
+        let key = activity_key(repo, path, peer);
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(FILE_ACTIVITY_TABLE)?;
+        match table.get(key.as_str())? {
+            Some(value) => {
+                let entry: FileActivityEntry = postcard::from_bytes(value.value())?;
+                if entry.timestamp + FILE_ACTIVITY_TTL_SECS < now {
+                    return Ok(None);
+                }
+                Ok(Some(entry))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
 
+    use super::FILE_ACTIVITY_TTL_SECS;
     use super::Storage;
+    use crate::activity::{FileActivityEntry, FileChangeKind};
     use crate::memory::{MemoryEntry, MemoryKind, SearchFilters};
     use crate::skill::SkillVote;
     use uuid::Uuid;
@@ -231,6 +327,82 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("buddies-storage-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("create test dir");
         Storage::open(&dir.join("buddies.redb")).expect("storage init")
+    }
+
+    fn activity(repo: &str, path: &str, peer: &str, timestamp: u64) -> FileActivityEntry {
+        FileActivityEntry {
+            repo: repo.to_string(),
+            branch: "main".to_string(),
+            path: path.to_string(),
+            kind: FileChangeKind::Changed,
+            diff: "+line\n".to_string(),
+            content_hash: "abc".to_string(),
+            author: peer.to_string(),
+            timestamp,
+        }
+    }
+
+    #[test]
+    fn file_activity_stores_latest_per_peer_and_prunes_stale() {
+        let storage = test_storage();
+        let now = 1_000_000;
+
+        storage
+            .store_file_activity(&activity("repo-a", "src/a.rs", "alice", now - 10), now)
+            .expect("store alice v1");
+        // same key overwrites (last writer wins)
+        storage
+            .store_file_activity(&activity("repo-a", "src/a.rs", "alice", now - 5), now)
+            .expect("store alice v2");
+        storage
+            .store_file_activity(&activity("repo-a", "src/a.rs", "bob", now - 3), now)
+            .expect("store bob");
+        storage
+            .store_file_activity(&activity("repo-a", "src/b.rs", "bob", now - 2), now)
+            .expect("store bob other file");
+        storage
+            .store_file_activity(&activity("repo-b", "src/a.rs", "carol", now - 1), now)
+            .expect("store other repo");
+
+        let all = storage
+            .get_file_activity("repo-a", None, now)
+            .expect("query repo-a");
+        assert_eq!(all.len(), 3);
+
+        let filtered = storage
+            .get_file_activity("repo-a", Some(&["src/a.rs".to_string()]), now)
+            .expect("query one path");
+        assert_eq!(filtered.len(), 2);
+
+        let alice = storage
+            .get_peer_file_activity("repo-a", "src/a.rs", "alice", now)
+            .expect("query alice")
+            .expect("alice entry exists");
+        assert_eq!(alice.timestamp, now - 5); // overwritten, not duplicated
+
+        assert!(
+            storage
+                .get_peer_file_activity("repo-a", "src/a.rs", "nobody", now)
+                .expect("query missing")
+                .is_none()
+        );
+
+        // stale entries are filtered on read and pruned on the next write
+        let later = now + FILE_ACTIVITY_TTL_SECS + 100;
+        assert!(
+            storage
+                .get_file_activity("repo-a", None, later)
+                .expect("query later")
+                .is_empty()
+        );
+        storage
+            .store_file_activity(&activity("repo-a", "src/c.rs", "dave", later), later)
+            .expect("store triggers prune");
+        let remaining = storage
+            .get_file_activity("repo-a", None, later)
+            .expect("query after prune");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].path, "src/c.rs");
     }
 
     #[test]

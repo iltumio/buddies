@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::activity::FileActivityEntry;
 use crate::memory::{MemoryEntry, SearchFilters};
 use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult};
 
@@ -114,6 +115,9 @@ pub enum P2PMessageBody {
         skill_hash: String,
         voter: String,
         score: i8,
+    },
+    FileActivity {
+        entry: FileActivityEntry,
     },
 }
 
