@@ -651,6 +651,10 @@ impl RoomManager {
                 }
             }
             P2PMessageBody::SkillPublished { entry } => {
+                if !entry.verify_content_hash() {
+                    warn!(room = %room_name, skill = %entry.hash, "dropped skill whose hash does not match its content");
+                    return;
+                }
                 if !self.verify_skill_signature(room_name, &entry) {
                     warn!(room = %room_name, skill = %entry.hash, "dropped skill with invalid signature");
                     return;

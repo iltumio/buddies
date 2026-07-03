@@ -130,6 +130,9 @@ impl Storage {
     }
 
     pub fn vote_skill(&self, vote: &SkillVote) -> Result<()> {
+        if vote.score != 1 && vote.score != -1 {
+            anyhow::bail!("invalid vote score {}: must be 1 or -1", vote.score);
+        }
         let key = format!("{}:{}", vote.skill_hash, vote.voter);
         let value = postcard::to_allocvec(vote)?;
         let tx = self.db.begin_write()?;
@@ -200,6 +203,7 @@ mod tests {
 
     use super::Storage;
     use crate::memory::{MemoryEntry, MemoryKind, SearchFilters};
+    use crate::skill::SkillVote;
     use uuid::Uuid;
 
     fn entry(
@@ -263,6 +267,26 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].title, "newer");
         assert_eq!(results[1].title, "older");
+    }
+
+    #[test]
+    fn vote_skill_rejects_scores_other_than_plus_or_minus_one() {
+        let storage = test_storage();
+
+        let vote = |score: i8| SkillVote {
+            skill_hash: "abc".to_string(),
+            voter: "mallory".to_string(),
+            score,
+            timestamp: 1,
+        };
+
+        assert!(storage.vote_skill(&vote(1)).is_ok());
+        assert!(storage.vote_skill(&vote(-1)).is_ok());
+        assert!(storage.vote_skill(&vote(127)).is_err());
+        assert!(storage.vote_skill(&vote(0)).is_err());
+
+        // The invalid votes must not have affected the rank.
+        assert_eq!(storage.get_skill_rank("abc").expect("rank"), -1);
     }
 
     #[test]
