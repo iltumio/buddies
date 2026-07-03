@@ -41,25 +41,42 @@ fn is_message_fresh(sent_at: u64, now: u64) -> bool {
     sent_at.abs_diff(now) <= MAX_MESSAGE_AGE_SECS
 }
 
-/// Upper bound on the repo/path/author fields of peer-supplied file
+/// Upper bound on the repo/path/author/branch fields of peer-supplied file
 /// activity. Generous for real values, small enough to bound storage keys.
 const MAX_ACTIVITY_FIELD_BYTES: usize = 1024;
+
+/// Upper bound on the content_hash field of peer-supplied file activity.
+/// A SHA-256 hex digest is 64 bytes; this leaves generous headroom for
+/// other hash formats without allowing unbounded storage.
+const MAX_CONTENT_HASH_BYTES: usize = 128;
 
 /// Validate a peer-supplied file activity entry before it reaches storage.
 /// Timestamps outside the freshness window would overflow or outlive the
 /// TTL arithmetic; NUL bytes in repo/path/author would alias the redb keys
-/// built as `repo\0path\0peer`.
+/// built as `repo\0path\0peer`. The gossip frame limit is 256 KiB
+/// (`GOSSIP_MAX_MESSAGE_SIZE` in node.rs), so diff/branch/content_hash must
+/// also be capped or a malicious peer could store near that much verbatim.
 fn validate_file_activity(entry: &FileActivityEntry, now: u64) -> Result<(), &'static str> {
     if entry.timestamp.abs_diff(now) > MAX_MESSAGE_AGE_SECS {
         return Err("timestamp outside freshness window");
     }
-    for field in [&entry.repo, &entry.path, &entry.author] {
+    for field in [&entry.repo, &entry.path, &entry.author, &entry.branch] {
         if field.as_bytes().contains(&0) {
             return Err("field contains NUL byte");
         }
         if field.len() > MAX_ACTIVITY_FIELD_BYTES {
             return Err("field exceeds length cap");
         }
+    }
+    // Honest senders always truncate diffs to at most MAX_DIFF_BYTES plus
+    // the truncation marker (see truncate_diff in activity.rs).
+    if entry.diff.len()
+        > crate::activity::MAX_DIFF_BYTES + crate::activity::DIFF_TRUNCATION_MARKER.len()
+    {
+        return Err("diff exceeds length cap");
+    }
+    if entry.content_hash.len() > MAX_CONTENT_HASH_BYTES {
+        return Err("content_hash exceeds length cap");
     }
     Ok(())
 }
@@ -1076,6 +1093,56 @@ mod tests {
             validate_file_activity(&activity(&max, &max, &max, now), now),
             Ok(())
         );
+    }
+
+    #[test]
+    fn validate_file_activity_rejects_oversized_branch() {
+        let now = 1_000_000;
+        let mut entry = activity("repo", "src/a.rs", "alice", now);
+        entry.branch = "x".repeat(MAX_ACTIVITY_FIELD_BYTES + 1);
+        assert_eq!(
+            validate_file_activity(&entry, now),
+            Err("field exceeds length cap")
+        );
+
+        // exactly at the cap passes
+        entry.branch = "x".repeat(MAX_ACTIVITY_FIELD_BYTES);
+        assert_eq!(validate_file_activity(&entry, now), Ok(()));
+    }
+
+    #[test]
+    fn validate_file_activity_rejects_oversized_diff() {
+        let now = 1_000_000;
+        let max_diff_len =
+            crate::activity::MAX_DIFF_BYTES + crate::activity::DIFF_TRUNCATION_MARKER.len();
+        let mut entry = activity("repo", "src/a.rs", "alice", now);
+
+        entry.diff = "x".repeat(max_diff_len + 1);
+        assert_eq!(
+            validate_file_activity(&entry, now),
+            Err("diff exceeds length cap")
+        );
+
+        // honest senders always truncate to at most this length; exactly at
+        // the cap must be accepted
+        entry.diff = "x".repeat(max_diff_len);
+        assert_eq!(validate_file_activity(&entry, now), Ok(()));
+    }
+
+    #[test]
+    fn validate_file_activity_rejects_oversized_content_hash() {
+        let now = 1_000_000;
+        let mut entry = activity("repo", "src/a.rs", "alice", now);
+
+        entry.content_hash = "x".repeat(MAX_CONTENT_HASH_BYTES + 1);
+        assert_eq!(
+            validate_file_activity(&entry, now),
+            Err("content_hash exceeds length cap")
+        );
+
+        // exactly at the cap passes (SHA-256 hex is 64 bytes, well under this)
+        entry.content_hash = "x".repeat(MAX_CONTENT_HASH_BYTES);
+        assert_eq!(validate_file_activity(&entry, now), Ok(()));
     }
 
     #[test]
