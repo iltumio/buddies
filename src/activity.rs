@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 
 pub const MAX_DIFF_BYTES: usize = 64 * 1024;
 pub const DIFF_TRUNCATION_MARKER: &str = "\n[... diff truncated by buddies ...]";
@@ -68,6 +70,41 @@ pub fn truncate_diff(mut diff: String) -> String {
     diff
 }
 
+/// Locally-modified paths per watched repo, shared between the watcher
+/// (writer) and the gossip handler (reader, for conflict detection).
+#[derive(Default)]
+pub struct DirtySet {
+    inner: RwLock<HashMap<String, HashSet<String>>>,
+}
+
+impl DirtySet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_repo_dirty(&self, repo: &str, paths: HashSet<String>) {
+        self.inner
+            .write()
+            .expect("dirty set lock poisoned")
+            .insert(repo.to_string(), paths);
+    }
+
+    pub fn clear_repo(&self, repo: &str) {
+        self.inner
+            .write()
+            .expect("dirty set lock poisoned")
+            .remove(repo);
+    }
+
+    pub fn is_dirty(&self, repo: &str, path: &str) -> bool {
+        self.inner
+            .read()
+            .expect("dirty set lock poisoned")
+            .get(repo)
+            .is_some_and(|paths| paths.contains(path))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +133,24 @@ mod tests {
         assert_eq!(FileChangeKind::Changed.to_string(), "changed");
         assert_eq!(FileChangeKind::Created.to_string(), "created");
         assert_eq!(FileChangeKind::Deleted.to_string(), "deleted");
+    }
+
+    #[test]
+    fn dirty_set_tracks_paths_per_repo() {
+        let dirty = DirtySet::new();
+        assert!(!dirty.is_dirty("repo-a", "src/a.rs"));
+
+        dirty.set_repo_dirty("repo-a", ["src/a.rs".to_string()].into());
+        assert!(dirty.is_dirty("repo-a", "src/a.rs"));
+        assert!(!dirty.is_dirty("repo-a", "src/b.rs"));
+        assert!(!dirty.is_dirty("repo-b", "src/a.rs"));
+
+        // replace semantics: a new scan result overwrites the old set
+        dirty.set_repo_dirty("repo-a", ["src/b.rs".to_string()].into());
+        assert!(!dirty.is_dirty("repo-a", "src/a.rs"));
+        assert!(dirty.is_dirty("repo-a", "src/b.rs"));
+
+        dirty.clear_repo("repo-a");
+        assert!(!dirty.is_dirty("repo-a", "src/b.rs"));
     }
 }
