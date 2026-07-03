@@ -2,9 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
-#[allow(dead_code)] // consumed by repo scanning in a later task
 pub const MAX_DIFF_BYTES: usize = 64 * 1024;
-#[allow(dead_code)] // consumed by repo scanning in a later task
 pub const DIFF_TRUNCATION_MARKER: &str = "\n[... diff truncated by buddies ...]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

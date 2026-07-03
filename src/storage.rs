@@ -14,10 +14,8 @@ const SKILL_VOTES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sk
 const FILE_ACTIVITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("file_activity");
 
 /// Peer file activity older than this is pruned/ignored.
-#[allow(dead_code)] // consumed by watcher/MCP wiring in later tasks
 pub const FILE_ACTIVITY_TTL_SECS: u64 = 86_400;
 
-#[allow(dead_code)] // consumed by watcher/MCP wiring in later tasks
 fn activity_key(repo: &str, path: &str, peer: &str) -> String {
     // NUL separators: valid in Rust strings, cannot appear in the fields.
     format!("{repo}\u{0}{path}\u{0}{peer}")
@@ -210,7 +208,6 @@ impl Storage {
         Ok(results)
     }
 
-    #[allow(dead_code)] // consumed by watcher/MCP wiring in later tasks
     pub fn store_file_activity(&self, entry: &FileActivityEntry, now: u64) -> Result<()> {
         let key = activity_key(&entry.repo, &entry.path, &entry.author);
         let value = postcard::to_allocvec(entry)?;

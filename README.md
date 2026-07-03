@@ -175,6 +175,10 @@ Or just tell OpenClaw in natural language: *"Add buddies as a local MCP stdio se
 | **search_skills** | Search skills locally + across all peers, ranked by votes. |
 | **vote_skill** | Upvote (+1) or downvote (-1) a skill. Votes propagate to all peers. |
 | **get_skill** | Retrieve a specific skill by its content hash. |
+| **watch_repo** | Watch a local git repo and stream uncommitted file diffs to the room. |
+| **unwatch_repo** | Stop watching a repository. |
+| **check_file_activity** | See which peers recently changed which files in a watched repo. |
+| **get_peer_diff** | Read a peer's latest diff for a specific file. |
 
 ## Memory types
 
@@ -280,6 +284,18 @@ When running with `BUDDIES_TRANSPORT=http`, buddies automatically pushes real-ti
 - **Params**: `{ task_id, source_peer, room, description, timestamp, timeout_secs }`
 
 This means the receiving agent learns about new tasks instantly — no polling required. The existing `poll_pending_tasks` tool still works as a fallback for stdio transport or clients that don't handle custom notifications.
+
+## Repo awareness
+
+`watch_repo({repo_path, room, repo_name?})` starts a filesystem watcher on a local git repository. File-change events are debounced by roughly 1 second and then buddies shells out to `git` to figure out what actually changed — so `.gitignore`'d files and build artifacts never get broadcast, git does the filtering for you.
+
+Each changed file is broadcast to the room as a signed `FileActivity` message carrying a unified diff against `HEAD`, capped at 64 KiB. Receivers keep only the latest diff per `(repo, file, peer)` triple, and entries expire after 24 hours.
+
+- **check_file_activity** should be called before editing a file in a shared repo, to see which peers have touched it recently.
+- **get_peer_diff** returns a peer's full diff for a specific file so you can review exactly what changed.
+- When a peer changes a file you've also modified locally, buddies proactively pushes a `notifications/buddies/fileConflict` `CustomNotification` with instructions to reconcile before you continue editing.
+
+**Privacy warning**: watching a repo shares source-code diffs with everyone in the room. Only watch repos in rooms with `require_signed=true` and an identity whitelist configured (see [Identity trust model](#identity-trust-model)).
 
 ## Configuration
 
