@@ -29,7 +29,7 @@ const MAX_MESSAGE_AGE_SECS: u64 = 600;
 /// without an accepted signing key cannot evict entries by flooding.
 const REPLAY_CACHE_SIZE: usize = 4096;
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

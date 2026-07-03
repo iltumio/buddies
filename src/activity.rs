@@ -58,7 +58,6 @@ pub fn diff_summary(diff: &str) -> (u64, u64) {
     (added, removed)
 }
 
-#[allow(dead_code)] // consumed by repo scanning in a later task
 pub fn truncate_diff(mut diff: String) -> String {
     if diff.len() <= MAX_DIFF_BYTES {
         return diff;
