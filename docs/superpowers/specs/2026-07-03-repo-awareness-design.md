@@ -60,7 +60,8 @@ FileActivity {
     path: String,        // repo-relative, forward slashes
     kind: FileChangeKind // Changed | Created | Deleted
     diff: String,        // unified diff vs HEAD; capped at 64 KiB with a
-                         // truncation marker; empty for binary files
+                         // truncation marker; for binary files git emits a
+                         // "Binary files ... differ" stub instead of a diff
     content_hash: String,// SHA-256 of current file content ("" for Deleted)
     author: String,      // sender display name (BUDDIES_USER)
     timestamp: u64,

@@ -17,7 +17,9 @@ const FILE_ACTIVITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("
 pub const FILE_ACTIVITY_TTL_SECS: u64 = 86_400;
 
 fn activity_key(repo: &str, path: &str, peer: &str) -> String {
-    // NUL separators: valid in Rust strings, cannot appear in the fields.
+    // NUL separators: valid in Rust strings. Peer-supplied fields CAN carry
+    // NUL bytes, so the FileActivity handler rejects them before storage
+    // (see validate_file_activity in room.rs) to prevent key aliasing.
     format!("{repo}\u{0}{path}\u{0}{peer}")
 }
 
@@ -221,7 +223,7 @@ impl Storage {
             for item in table.iter()? {
                 let (k, v) = item?;
                 let e: FileActivityEntry = postcard::from_bytes(v.value())?;
-                if e.timestamp + FILE_ACTIVITY_TTL_SECS < now {
+                if e.timestamp.saturating_add(FILE_ACTIVITY_TTL_SECS) < now {
                     stale.push(k.value().to_string());
                 }
             }
@@ -249,7 +251,7 @@ impl Storage {
                 continue;
             }
             let entry: FileActivityEntry = postcard::from_bytes(v.value())?;
-            if entry.timestamp + FILE_ACTIVITY_TTL_SECS < now {
+            if entry.timestamp.saturating_add(FILE_ACTIVITY_TTL_SECS) < now {
                 continue;
             }
             if let Some(paths) = paths
@@ -276,7 +278,7 @@ impl Storage {
         match table.get(key.as_str())? {
             Some(value) => {
                 let entry: FileActivityEntry = postcard::from_bytes(value.value())?;
-                if entry.timestamp + FILE_ACTIVITY_TTL_SECS < now {
+                if entry.timestamp.saturating_add(FILE_ACTIVITY_TTL_SECS) < now {
                     return Ok(None);
                 }
                 Ok(Some(entry))
@@ -398,6 +400,32 @@ mod tests {
             .expect("query after prune");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].path, "src/c.rs");
+    }
+
+    #[test]
+    fn file_activity_ttl_arithmetic_survives_extreme_timestamps() {
+        // Defense in depth: the room layer rejects far-future timestamps,
+        // but the TTL math itself must never overflow (panics in debug).
+        let storage = test_storage();
+        let now = 1_000_000;
+
+        storage
+            .store_file_activity(&activity("repo-a", "src/a.rs", "mallory", u64::MAX), now)
+            .expect("store extreme timestamp");
+        storage
+            .store_file_activity(&activity("repo-a", "src/b.rs", "alice", now), now)
+            .expect("store triggers prune scan over extreme entry");
+
+        let all = storage
+            .get_file_activity("repo-a", None, now)
+            .expect("query with extreme entry present");
+        assert_eq!(all.len(), 2);
+        assert!(
+            storage
+                .get_peer_file_activity("repo-a", "src/a.rs", "mallory", now)
+                .expect("query extreme entry")
+                .is_some()
+        );
     }
 
     #[test]

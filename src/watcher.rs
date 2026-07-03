@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use notify::Watcher;
 use sha2::{Digest, Sha256};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::activity::{DirtySet, FileActivityEntry, FileChangeKind, truncate_diff};
 use crate::protocol::{P2PMessage, P2PMessageBody};
@@ -97,7 +97,14 @@ pub(crate) async fn collect_activity(
     author: &str,
     last: &mut HashMap<String, String>,
 ) -> (Vec<FileActivityEntry>, HashSet<String>) {
-    let status = match git(repo_path, &["status", "--porcelain", "-z"]).await {
+    // --untracked-files=all: without it a new directory shows up as a single
+    // `?? newdir/` entry and the files inside are never reported.
+    let status = match git(
+        repo_path,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )
+    .await
+    {
         Ok(out) if out.status.success() => out.stdout,
         Ok(out) => {
             warn!(repo = %repo_name, stderr = %String::from_utf8_lossy(&out.stderr), "git status failed");
@@ -177,6 +184,9 @@ impl WatcherManager {
         room: &str,
         repo_name: Option<String>,
     ) -> Result<String> {
+        if !self.room_manager.is_joined(room).await {
+            anyhow::bail!("join_room '{room}' before watching a repo into it");
+        }
         let repo_path = repo_path
             .canonicalize()
             .with_context(|| format!("cannot resolve repo path {}", repo_path.display()))?;
@@ -289,7 +299,7 @@ async fn scan_and_broadcast(
     for entry in entries {
         let msg = P2PMessage::new(P2PMessageBody::FileActivity { entry });
         if let Err(e) = room_manager.broadcast_to_room(room, msg).await {
-            debug!(error = %e, "failed to broadcast file activity");
+            warn!(room = %room, error = %e, "failed to broadcast file activity");
         }
     }
 }
@@ -375,6 +385,31 @@ mod tests {
         let (entries, dirty) = collect_activity(&repo, "fixture", "alice", &mut last).await;
         assert!(entries.is_empty());
         assert_eq!(dirty.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_activity_reports_files_inside_untracked_directories() {
+        let repo = fixture_repo().await;
+        let mut last = HashMap::new();
+
+        // a brand-new directory: plain `git status` reports it as one
+        // `?? newdir/` entry; the file inside must still be broadcast
+        std::fs::create_dir_all(repo.join("newdir")).expect("create dir");
+        std::fs::write(repo.join("newdir/inner.txt"), "inner content\n").expect("create inner");
+
+        let (entries, dirty) = collect_activity(&repo, "fixture", "alice", &mut last).await;
+        assert_eq!(entries.len(), 1);
+        assert!(dirty.contains("newdir/inner.txt"));
+
+        let created = &entries[0];
+        assert_eq!(created.path, "newdir/inner.txt");
+        assert_eq!(created.kind, FileChangeKind::Created);
+        assert!(
+            created.diff.contains("+inner content"),
+            "diff was: {}",
+            created.diff
+        );
+        assert!(!created.content_hash.is_empty());
     }
 
     #[test]

@@ -287,7 +287,7 @@ This means the receiving agent learns about new tasks instantly — no polling r
 
 ## Repo awareness
 
-`watch_repo({repo_path, room, repo_name?})` starts a filesystem watcher on a local git repository. File-change events are debounced by roughly 1 second and then buddies shells out to `git` to figure out what actually changed — so `.gitignore`'d files and build artifacts never get broadcast, git does the filtering for you.
+`watch_repo({repo_path, room, repo_name?})` starts a filesystem watcher on a local git repository. File-change events are debounced by roughly 1 second and then buddies shells out to `git` to figure out what actually changed, so `.gitignore`'d files and build artifacts never get broadcast. Git does the filtering for you.
 
 Each changed file is broadcast to the room as a signed `FileActivity` message carrying a unified diff against `HEAD`, capped at 64 KiB. Receivers keep only the latest diff per `(repo, file, peer)` triple, and entries expire after 24 hours.
 

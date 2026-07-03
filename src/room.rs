@@ -41,6 +41,29 @@ fn is_message_fresh(sent_at: u64, now: u64) -> bool {
     sent_at.abs_diff(now) <= MAX_MESSAGE_AGE_SECS
 }
 
+/// Upper bound on the repo/path/author fields of peer-supplied file
+/// activity. Generous for real values, small enough to bound storage keys.
+const MAX_ACTIVITY_FIELD_BYTES: usize = 1024;
+
+/// Validate a peer-supplied file activity entry before it reaches storage.
+/// Timestamps outside the freshness window would overflow or outlive the
+/// TTL arithmetic; NUL bytes in repo/path/author would alias the redb keys
+/// built as `repo\0path\0peer`.
+fn validate_file_activity(entry: &FileActivityEntry, now: u64) -> Result<(), &'static str> {
+    if entry.timestamp.abs_diff(now) > MAX_MESSAGE_AGE_SECS {
+        return Err("timestamp outside freshness window");
+    }
+    for field in [&entry.repo, &entry.path, &entry.author] {
+        if field.as_bytes().contains(&0) {
+            return Err("field contains NUL byte");
+        }
+        if field.len() > MAX_ACTIVITY_FIELD_BYTES {
+            return Err("field exceeds length cap");
+        }
+    }
+    Ok(())
+}
+
 /// Bounded FIFO set of recently seen message nonces.
 struct ReplayGuard {
     seen: HashSet<[u8; 16]>,
@@ -329,6 +352,11 @@ impl RoomManager {
         }
 
         Ok(())
+    }
+
+    pub async fn is_joined(&self, room_name: &str) -> bool {
+        let rooms = self.rooms.read().await;
+        rooms.contains_key(room_name)
     }
 
     pub async fn list_rooms(&self) -> Vec<String> {
@@ -771,6 +799,10 @@ impl RoomManager {
                 }
             }
             P2PMessageBody::FileActivity { entry } => {
+                if let Err(reason) = validate_file_activity(&entry, now_unix()) {
+                    warn!(room = %room_name, author = %entry.author, reason, "dropped invalid file activity");
+                    return;
+                }
                 if let Err(e) = self.storage.store_file_activity(&entry, now_unix()) {
                     warn!(error = %e, "failed to store received file activity");
                 }
@@ -953,6 +985,97 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, b.id);
         assert_eq!(results[1].id, a.id);
+    }
+
+    fn activity(repo: &str, path: &str, author: &str, timestamp: u64) -> FileActivityEntry {
+        FileActivityEntry {
+            repo: repo.into(),
+            branch: "main".into(),
+            path: path.into(),
+            kind: crate::activity::FileChangeKind::Changed,
+            diff: "+line\n".into(),
+            content_hash: "abc".into(),
+            author: author.into(),
+            timestamp,
+        }
+    }
+
+    #[test]
+    fn validate_file_activity_accepts_fresh_entry() {
+        let now = 1_000_000;
+        assert_eq!(
+            validate_file_activity(&activity("repo", "src/a.rs", "alice", now), now),
+            Ok(())
+        );
+        // skew inside the freshness window is fine in both directions
+        assert_eq!(
+            validate_file_activity(
+                &activity("repo", "src/a.rs", "alice", now - MAX_MESSAGE_AGE_SECS),
+                now
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_file_activity(
+                &activity("repo", "src/a.rs", "alice", now + MAX_MESSAGE_AGE_SECS),
+                now
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_file_activity_rejects_stale_and_far_future_timestamps() {
+        let now = 1_000_000;
+        for bad in [
+            now - MAX_MESSAGE_AGE_SECS - 1,
+            now + MAX_MESSAGE_AGE_SECS + 1,
+            0,
+            u64::MAX, // would overflow TTL arithmetic if stored
+        ] {
+            assert!(
+                validate_file_activity(&activity("repo", "src/a.rs", "alice", bad), now).is_err(),
+                "timestamp {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_file_activity_rejects_nul_bytes_in_key_fields() {
+        let now = 1_000_000;
+        // NUL in repo/path/author would alias the redb key `repo\0path\0peer`
+        for entry in [
+            activity("re\u{0}po", "src/a.rs", "alice", now),
+            activity("repo", "src/\u{0}a.rs", "alice", now),
+            activity("repo", "src/a.rs", "al\u{0}ice", now),
+        ] {
+            assert_eq!(
+                validate_file_activity(&entry, now),
+                Err("field contains NUL byte")
+            );
+        }
+    }
+
+    #[test]
+    fn validate_file_activity_rejects_oversized_fields() {
+        let now = 1_000_000;
+        let big = "x".repeat(MAX_ACTIVITY_FIELD_BYTES + 1);
+        for entry in [
+            activity(&big, "src/a.rs", "alice", now),
+            activity("repo", &big, "alice", now),
+            activity("repo", "src/a.rs", &big, now),
+        ] {
+            assert_eq!(
+                validate_file_activity(&entry, now),
+                Err("field exceeds length cap")
+            );
+        }
+        // exactly at the cap passes
+        let max = "x".repeat(MAX_ACTIVITY_FIELD_BYTES);
+        assert_eq!(
+            validate_file_activity(&activity(&max, &max, &max, now), now),
+            Ok(())
+        );
     }
 
     #[test]
