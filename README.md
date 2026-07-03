@@ -321,6 +321,8 @@ This means the receiving agent learns about new tasks instantly — no polling r
 - If a room has whitelist entries, messages from non-whitelisted identities are dropped.
 - If `require_signed=true`, unsigned messages are dropped.
 - Incoming skills with invalid embedded signatures are rejected.
+- Signed messages carry a nonce and a `sent_at` timestamp: receivers drop signed messages older than 10 minutes (clock-skew tolerant) and messages whose nonce was already seen, so captured messages cannot be replayed.
+- GPG identities should be whitelisted by full fingerprint — short key ids are collision-prone.
 
 Example policy setup:
 

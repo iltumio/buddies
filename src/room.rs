@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +19,58 @@ use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult, SkillVote}
 use crate::storage::Storage;
 
 const MAX_PENDING_TASKS: usize = 100;
+
+/// How far a signed message's `sent_at` may deviate from local time (in
+/// either direction, to tolerate clock skew) before it is dropped as stale.
+const MAX_MESSAGE_AGE_SECS: u64 = 600;
+
+/// How many recently seen nonces to remember for replay detection. Only
+/// nonces of successfully verified signed messages are tracked, so peers
+/// without an accepted signing key cannot evict entries by flooding.
+const REPLAY_CACHE_SIZE: usize = 4096;
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn is_message_fresh(sent_at: u64, now: u64) -> bool {
+    sent_at.abs_diff(now) <= MAX_MESSAGE_AGE_SECS
+}
+
+/// Bounded FIFO set of recently seen message nonces.
+struct ReplayGuard {
+    seen: HashSet<[u8; 16]>,
+    order: VecDeque<[u8; 16]>,
+    capacity: usize,
+}
+
+impl ReplayGuard {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Returns `true` if the nonce was not seen before (and records it),
+    /// `false` if it is a replay.
+    fn check_and_insert(&mut self, nonce: [u8; 16]) -> bool {
+        if !self.seen.insert(nonce) {
+            return false;
+        }
+        self.order.push_back(nonce);
+        if self.order.len() > self.capacity
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.seen.remove(&evicted);
+        }
+        true
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -59,6 +111,8 @@ pub struct RoomManager {
     signer: Option<LocalSigner>,
     room_whitelists: Arc<RwLock<HashMap<String, HashSet<SignerIdentity>>>>,
     require_signed: Arc<RwLock<HashMap<String, bool>>>,
+    // std Mutex: critical sections are short and never hold across .await
+    replay_guard: std::sync::Mutex<ReplayGuard>,
 }
 
 impl RoomManager {
@@ -85,6 +139,7 @@ impl RoomManager {
             signer,
             room_whitelists: Arc::new(RwLock::new(HashMap::new())),
             require_signed: Arc::new(RwLock::new(HashMap::new())),
+            replay_guard: std::sync::Mutex::new(ReplayGuard::new(REPLAY_CACHE_SIZE)),
         })
     }
 
@@ -421,10 +476,7 @@ impl RoomManager {
             waiters.insert(task_id, tx);
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = now_unix();
 
         let msg = P2PMessage::new(P2PMessageBody::TaskRequest {
             task_id,
@@ -458,10 +510,7 @@ impl RoomManager {
 
     pub async fn poll_tasks(&self, room_filter: Option<&str>) -> Vec<PendingTask> {
         let mut tasks = self.incoming_tasks.lock().await;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = now_unix();
 
         tasks.retain(|t| now < t.timestamp + t.timeout_secs as u64);
 
@@ -698,10 +747,7 @@ impl RoomManager {
                 voter,
                 score,
             } => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
+                let now = now_unix();
                 let vote = SkillVote {
                     skill_hash,
                     voter,
@@ -769,16 +815,34 @@ impl RoomManager {
 
         let payload = msg.signing_payload();
         match verify_signature(identity, &payload, signature) {
-            Ok(true) => true,
+            Ok(true) => {}
             Ok(false) => {
                 warn!(room = %room_name, identity = %identity.to_label(), "signature verification failed");
-                false
+                return false;
             }
             Err(error) => {
                 warn!(room = %room_name, identity = %identity.to_label(), %error, "signature verification errored");
-                false
+                return false;
             }
         }
+
+        // Replay protection, only after the signature checks out so that
+        // unverified traffic cannot poison the nonce cache.
+        if !is_message_fresh(msg.sent_at, now_unix()) {
+            warn!(room = %room_name, identity = %identity.to_label(), sent_at = msg.sent_at, "dropped signed message outside freshness window");
+            return false;
+        }
+        if !self
+            .replay_guard
+            .lock()
+            .expect("replay guard lock poisoned")
+            .check_and_insert(msg.nonce)
+        {
+            warn!(room = %room_name, identity = %identity.to_label(), "dropped replayed signed message");
+            return false;
+        }
+
+        true
     }
 }
 
@@ -786,6 +850,41 @@ impl RoomManager {
 mod tests {
     use super::*;
     use crate::memory::MemoryKind;
+
+    fn nonce(n: u8) -> [u8; 16] {
+        [n; 16]
+    }
+
+    #[test]
+    fn replay_guard_rejects_previously_seen_nonces() {
+        let mut guard = ReplayGuard::new(8);
+        assert!(guard.check_and_insert(nonce(1)));
+        assert!(guard.check_and_insert(nonce(2)));
+        assert!(!guard.check_and_insert(nonce(1)));
+        assert!(!guard.check_and_insert(nonce(2)));
+    }
+
+    #[test]
+    fn replay_guard_evicts_oldest_nonce_beyond_capacity() {
+        let mut guard = ReplayGuard::new(2);
+        assert!(guard.check_and_insert(nonce(1)));
+        assert!(guard.check_and_insert(nonce(2)));
+        assert!(guard.check_and_insert(nonce(3))); // evicts nonce 1
+        assert!(guard.check_and_insert(nonce(1))); // forgotten, accepted again
+        assert!(!guard.check_and_insert(nonce(3))); // still tracked
+    }
+
+    #[test]
+    fn message_freshness_window_covers_skew_in_both_directions() {
+        let now = 1_000_000;
+        assert!(is_message_fresh(now, now));
+        assert!(is_message_fresh(now - MAX_MESSAGE_AGE_SECS, now));
+        assert!(is_message_fresh(now + MAX_MESSAGE_AGE_SECS, now));
+        assert!(!is_message_fresh(now - MAX_MESSAGE_AGE_SECS - 1, now));
+        assert!(!is_message_fresh(now + MAX_MESSAGE_AGE_SECS + 1, now));
+        // near-epoch sent_at must not underflow
+        assert!(!is_message_fresh(0, now));
+    }
 
     fn memory(id: &str, timestamp: u64) -> MemoryEntry {
         MemoryEntry {

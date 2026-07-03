@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,6 +13,9 @@ pub type TopicId = iroh_gossip::proto::TopicId;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct P2PMessage {
     pub nonce: [u8; 16],
+    /// Unix timestamp set by the sender; signed messages outside the
+    /// freshness window are dropped by receivers (replay protection).
+    pub sent_at: u64,
     pub body: P2PMessageBody,
     pub signed_by: Option<SignerIdentity>,
     pub signature: Option<Vec<u8>>,
@@ -122,6 +127,10 @@ impl P2PMessage {
     pub fn new(body: P2PMessageBody) -> Self {
         Self {
             nonce: rand::random(),
+            sent_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             body,
             signed_by: None,
             signature: None,
@@ -129,7 +138,7 @@ impl P2PMessage {
     }
 
     pub fn signing_payload(&self) -> Bytes {
-        postcard::to_allocvec(&(self.nonce, &self.body))
+        postcard::to_allocvec(&(self.nonce, self.sent_at, &self.body))
             .expect("P2PMessage signing serialization is infallible")
             .into()
     }
