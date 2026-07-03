@@ -1,3 +1,4 @@
+mod activity;
 mod identity;
 mod memory;
 mod node;
