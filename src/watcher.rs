@@ -1,11 +1,16 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::{Context, Result};
+use notify::Watcher;
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{debug, warn};
 
-use crate::activity::{FileActivityEntry, FileChangeKind, truncate_diff};
-use crate::room::now_unix;
+use crate::activity::{DirtySet, FileActivityEntry, FileChangeKind, truncate_diff};
+use crate::protocol::{P2PMessage, P2PMessageBody};
+use crate::room::{RoomManager, now_unix};
 
 /// Parse `git status --porcelain -z` output into change kinds and
 /// repo-relative paths. In -z format entries are NUL-terminated
@@ -86,7 +91,6 @@ async fn diff_for(repo: &Path, kind: FileChangeKind, path: &str) -> String {
 /// Scan a repo for uncommitted changes. Returns the entries that changed
 /// since the previous scan (tracked via `last`: path -> "kind:hash") and
 /// the full set of currently dirty paths.
-#[allow(dead_code)] // consumed by WatcherManager in Task 6
 pub(crate) async fn collect_activity(
     repo_path: &Path,
     repo_name: &str,
@@ -140,6 +144,156 @@ pub(crate) async fn collect_activity(
         });
     }
     (entries, dirty)
+}
+
+pub struct WatcherManager {
+    room_manager: Arc<RoomManager>,
+    dirty: Arc<DirtySet>,
+    author: String,
+    watchers: tokio::sync::Mutex<HashMap<PathBuf, WatchedRepo>>,
+}
+
+struct WatchedRepo {
+    repo_name: String,
+    _watcher: notify::RecommendedWatcher,
+    scan_task: tokio::task::JoinHandle<()>,
+}
+
+impl WatcherManager {
+    pub fn new(room_manager: Arc<RoomManager>, dirty: Arc<DirtySet>, author: String) -> Arc<Self> {
+        Arc::new(Self {
+            room_manager,
+            dirty,
+            author,
+            watchers: tokio::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Start watching a git repo, broadcasting file activity to `room`.
+    /// Idempotent: watching an already-watched path returns its repo name.
+    #[allow(dead_code)] // consumed by MCP tools in Task 7
+    pub async fn watch(
+        &self,
+        repo_path: &Path,
+        room: &str,
+        repo_name: Option<String>,
+    ) -> Result<String> {
+        let repo_path = repo_path
+            .canonicalize()
+            .with_context(|| format!("cannot resolve repo path {}", repo_path.display()))?;
+        if !repo_path.join(".git").exists() {
+            anyhow::bail!("not a git repository: {}", repo_path.display());
+        }
+
+        let mut watchers = self.watchers.lock().await;
+        if let Some(existing) = watchers.get(&repo_path) {
+            return Ok(existing.repo_name.clone());
+        }
+
+        let repo_name = repo_name.unwrap_or_else(|| {
+            repo_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "repo".to_string())
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    // .git churn (index, lockfiles) must not trigger scans
+                    let outside_git = event
+                        .paths
+                        .iter()
+                        .any(|p| !p.components().any(|c| c.as_os_str() == ".git"));
+                    if outside_git {
+                        let _ = tx.send(());
+                    }
+                }
+            })?;
+        watcher.watch(&repo_path, notify::RecursiveMode::Recursive)?;
+
+        let room_manager = Arc::clone(&self.room_manager);
+        let dirty = Arc::clone(&self.dirty);
+        let author = self.author.clone();
+        let scan_repo_path = repo_path.clone();
+        let scan_repo_name = repo_name.clone();
+        let scan_room = room.to_string();
+        let scan_task = tokio::spawn(async move {
+            let mut last: HashMap<String, String> = HashMap::new();
+            // initial scan announces current WIP and seeds the dirty set
+            scan_and_broadcast(
+                &scan_repo_path,
+                &scan_repo_name,
+                &author,
+                &scan_room,
+                &room_manager,
+                &dirty,
+                &mut last,
+            )
+            .await;
+            while rx.recv().await.is_some() {
+                tokio::time::sleep(Duration::from_secs(1)).await; // debounce
+                while rx.try_recv().is_ok() {}
+                scan_and_broadcast(
+                    &scan_repo_path,
+                    &scan_repo_name,
+                    &author,
+                    &scan_room,
+                    &room_manager,
+                    &dirty,
+                    &mut last,
+                )
+                .await;
+            }
+        });
+
+        watchers.insert(
+            repo_path,
+            WatchedRepo {
+                repo_name: repo_name.clone(),
+                _watcher: watcher,
+                scan_task,
+            },
+        );
+        Ok(repo_name)
+    }
+
+    #[allow(dead_code)] // consumed by MCP tools in Task 7
+    pub async fn unwatch(&self, repo_path: &Path) -> Result<bool> {
+        let repo_path = repo_path
+            .canonicalize()
+            .with_context(|| format!("cannot resolve repo path {}", repo_path.display()))?;
+        let mut watchers = self.watchers.lock().await;
+        match watchers.remove(&repo_path) {
+            Some(watched) => {
+                watched.scan_task.abort();
+                self.dirty.clear_repo(&watched.repo_name);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_and_broadcast(
+    repo_path: &Path,
+    repo_name: &str,
+    author: &str,
+    room: &str,
+    room_manager: &Arc<RoomManager>,
+    dirty: &Arc<DirtySet>,
+    last: &mut HashMap<String, String>,
+) {
+    let (entries, dirty_paths) = collect_activity(repo_path, repo_name, author, last).await;
+    dirty.set_repo_dirty(repo_name, dirty_paths);
+    for entry in entries {
+        let msg = P2PMessage::new(P2PMessageBody::FileActivity { entry });
+        if let Err(e) = room_manager.broadcast_to_room(room, msg).await {
+            debug!(error = %e, "failed to broadcast file activity");
+        }
+    }
 }
 
 #[cfg(test)]

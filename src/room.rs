@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::activity::{DirtySet, FileActivityEntry};
 use crate::identity::{LocalSigner, verify_signature};
 use crate::memory::{MemoryEntry, SearchFilters};
 use crate::protocol::{
@@ -113,6 +114,8 @@ pub struct RoomManager {
     require_signed: Arc<RwLock<HashMap<String, bool>>>,
     // std Mutex: critical sections are short and never hold across .await
     replay_guard: std::sync::Mutex<ReplayGuard>,
+    dirty: Arc<DirtySet>,
+    conflict_broadcast: tokio::sync::broadcast::Sender<FileActivityEntry>,
 }
 
 impl RoomManager {
@@ -122,6 +125,7 @@ impl RoomManager {
         agent_name: String,
         storage: Arc<Storage>,
         signer: Option<LocalSigner>,
+        dirty: Arc<DirtySet>,
     ) -> Arc<Self> {
         Arc::new(Self {
             gossip,
@@ -140,6 +144,8 @@ impl RoomManager {
             room_whitelists: Arc::new(RwLock::new(HashMap::new())),
             require_signed: Arc::new(RwLock::new(HashMap::new())),
             replay_guard: std::sync::Mutex::new(ReplayGuard::new(REPLAY_CACHE_SIZE)),
+            dirty,
+            conflict_broadcast: tokio::sync::broadcast::channel(64).0,
         })
     }
 
@@ -147,6 +153,13 @@ impl RoomManager {
     /// gossip will be sent on the returned channel.
     pub fn subscribe_task_events(&self) -> tokio::sync::broadcast::Receiver<PendingTask> {
         self.task_broadcast.subscribe()
+    }
+
+    /// Subscribe to conflict events: fired when a peer's file activity
+    /// arrives for a path that is also locally modified in a watched repo.
+    #[allow(dead_code)] // consumed by MCP tools in Task 7
+    pub fn subscribe_conflict_events(&self) -> tokio::sync::broadcast::Receiver<FileActivityEntry> {
+        self.conflict_broadcast.subscribe()
     }
 
     pub fn signer_identity_label(&self) -> Option<String> {
@@ -759,7 +772,13 @@ impl RoomManager {
                 }
             }
             P2PMessageBody::FileActivity { entry } => {
-                debug!(repo = %entry.repo, path = %entry.path, "file activity received (handler wired in a later task)");
+                if let Err(e) = self.storage.store_file_activity(&entry, now_unix()) {
+                    warn!(error = %e, "failed to store received file activity");
+                }
+                if self.dirty.is_dirty(&entry.repo, &entry.path) {
+                    info!(repo = %entry.repo, path = %entry.path, peer = %entry.author, "conflicting file activity from peer");
+                    let _ = self.conflict_broadcast.send(entry);
+                }
             }
         }
     }

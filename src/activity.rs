@@ -73,13 +73,11 @@ pub fn truncate_diff(mut diff: String) -> String {
 
 /// Locally-modified paths per watched repo, shared between the watcher
 /// (writer) and the gossip handler (reader, for conflict detection).
-#[allow(dead_code)] // consumed by WatcherManager wiring in a later task
 #[derive(Default)]
 pub struct DirtySet {
     inner: RwLock<HashMap<String, HashSet<String>>>,
 }
 
-#[allow(dead_code)] // consumed by WatcherManager wiring in a later task
 impl DirtySet {
     pub fn new() -> Self {
         Self::default()
