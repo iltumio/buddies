@@ -8,6 +8,7 @@ mod server;
 mod skill;
 mod storage;
 mod ticket;
+mod watcher;
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -13,6 +13,7 @@ rmcp = { version = "0.17", features = ["server", "transport-io", "transport-stre
 iroh = "0.96"
 iroh-gossip = "0.96"
 n0-future = "0.3"
+notify = "8"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
