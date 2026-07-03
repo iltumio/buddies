@@ -83,12 +83,10 @@ impl Storage {
             if entry.matches_filters(filters) && (query.is_empty() || entry.matches_query(query)) {
                 results.push(entry);
             }
-            if results.len() >= limit {
-                break;
-            }
         }
 
-        results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        results.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
+        results.truncate(limit);
         Ok(results)
     }
 
@@ -265,6 +263,30 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].title, "newer");
         assert_eq!(results[1].title, "older");
+    }
+
+    #[test]
+    fn search_keeps_newest_entries_when_matches_exceed_limit() {
+        let storage = test_storage();
+
+        // Key order (UUID string) is the inverse of timestamp order, so
+        // truncating during the scan would drop the newest entry.
+        let ids_and_timestamps = [
+            ("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1, "oldest"),
+            ("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 2, "middle"),
+            ("cccccccc-cccc-4ccc-8ccc-cccccccccccc", 3, "newest"),
+        ];
+        for (id, ts, title) in ids_and_timestamps {
+            let mut e = entry("room-a", title, "content", MemoryKind::Context, vec![], ts);
+            e.id = Uuid::parse_str(id).expect("valid uuid");
+            storage.store(&e).expect("store entry");
+        }
+
+        let filters = SearchFilters::default();
+        let results = storage.search("", &filters, 2).expect("search");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "newest");
+        assert_eq!(results[1].title, "middle");
     }
 
     #[test]

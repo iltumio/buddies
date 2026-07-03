@@ -50,7 +50,8 @@ pub struct RoomManager {
     peers: Arc<RwLock<HashMap<String, HashMap<String, PeerInfo>>>>,
     storage: Arc<Storage>,
     pending_searches: Arc<Mutex<HashMap<Uuid, tokio::sync::mpsc::Sender<Vec<MemoryEntry>>>>>,
-    pending_skill_searches: Arc<Mutex<HashMap<Uuid, tokio::sync::mpsc::Sender<Vec<SkillSearchResult>>>>>,
+    pending_skill_searches:
+        Arc<Mutex<HashMap<Uuid, tokio::sync::mpsc::Sender<Vec<SkillSearchResult>>>>>,
     incoming_tasks: Arc<Mutex<Vec<PendingTask>>>,
     task_waiters: Arc<Mutex<HashMap<Uuid, oneshot::Sender<TaskResult>>>>,
     task_notify: Arc<tokio::sync::Notify>,
@@ -347,10 +348,7 @@ impl RoomManager {
             pending.remove(&request_id);
         }
 
-        local_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        local_results.truncate(50);
-
-        Ok(local_results)
+        Ok(Self::finalize_memory_results(local_results, 50))
     }
 
     pub async fn search_skills_distributed(
@@ -386,13 +384,7 @@ impl RoomManager {
         loop {
             tokio::select! {
                 Some(results) = rx.recv() => {
-                    for result in results {
-                        if let Some(existing) = local_results.iter_mut().find(|r| r.entry.hash == result.entry.hash) {
-                            existing.rank += result.rank;
-                        } else {
-                            local_results.push(result);
-                        }
-                    }
+                    Self::merge_skill_results(&mut local_results, results);
                 }
                 () = &mut deadline => {
                     break;
@@ -405,7 +397,11 @@ impl RoomManager {
             pending.remove(&request_id);
         }
 
-        local_results.sort_by(|a, b| b.rank.cmp(&a.rank).then(b.entry.timestamp.cmp(&a.entry.timestamp)));
+        local_results.sort_by(|a, b| {
+            b.rank
+                .cmp(&a.rank)
+                .then(b.entry.timestamp.cmp(&a.entry.timestamp))
+        });
         local_results.truncate(50);
 
         Ok(local_results)
@@ -441,11 +437,8 @@ impl RoomManager {
 
         self.broadcast_to_room(room_name, msg).await?;
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs as u64),
-            rx,
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs as u64), rx).await;
 
         {
             let mut waiters = self.task_waiters.lock().await;
@@ -472,9 +465,9 @@ impl RoomManager {
 
         tasks.retain(|t| now < t.timestamp + t.timeout_secs as u64);
 
-        let (matching, remaining): (Vec<_>, Vec<_>) = tasks.drain(..).partition(|t| {
-            room_filter.is_none() || room_filter == Some(t.room.as_str())
-        });
+        let (matching, remaining): (Vec<_>, Vec<_>) = tasks
+            .drain(..)
+            .partition(|t| room_filter.is_none() || room_filter == Some(t.room.as_str()));
 
         *tasks = remaining;
         matching
@@ -499,11 +492,7 @@ impl RoomManager {
         self.poll_tasks(room_filter).await
     }
 
-    pub async fn submit_task_result(
-        &self,
-        task: &PendingTask,
-        result: TaskResult,
-    ) -> Result<()> {
+    pub async fn submit_task_result(&self, task: &PendingTask, result: TaskResult) -> Result<()> {
         let msg = P2PMessage::new(P2PMessageBody::TaskResponse {
             task_id: task.task_id,
             result,
@@ -588,7 +577,10 @@ impl RoomManager {
                 query,
                 filters,
             } => {
-                let results = self.storage.search(&query, &filters, 20).unwrap_or_default();
+                let results = self
+                    .storage
+                    .search(&query, &filters, 20)
+                    .unwrap_or_default();
                 if !results.is_empty() {
                     let response = P2PMessage::new(P2PMessageBody::SearchResponse {
                         request_id,
@@ -719,6 +711,30 @@ impl RoomManager {
         }
     }
 
+    /// Dedupe merged local + peer memory results by id (memories replicate to
+    /// every peer, so the same entry comes back from multiple sources), then
+    /// sort newest-first and truncate.
+    fn finalize_memory_results(mut results: Vec<MemoryEntry>, limit: usize) -> Vec<MemoryEntry> {
+        let mut seen = HashSet::new();
+        results.retain(|e| seen.insert(e.id));
+        results.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
+        results.truncate(limit);
+        results
+    }
+
+    /// Merge peer skill results into the accumulated list. Votes replicate to
+    /// every peer via gossip, so each peer's rank already reflects the full
+    /// vote set — take the max instead of summing to avoid double-counting.
+    fn merge_skill_results(local: &mut Vec<SkillSearchResult>, incoming: Vec<SkillSearchResult>) {
+        for result in incoming {
+            if let Some(existing) = local.iter_mut().find(|r| r.entry.hash == result.entry.hash) {
+                existing.rank = existing.rank.max(result.rank);
+            } else {
+                local.push(result);
+            }
+        }
+    }
+
     async fn verify_incoming_message(&self, room_name: &str, msg: &P2PMessage) -> bool {
         let whitelist = {
             let whitelists = self.room_whitelists.read().await;
@@ -759,5 +775,77 @@ impl RoomManager {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryKind;
+
+    fn memory(id: &str, timestamp: u64) -> MemoryEntry {
+        MemoryEntry {
+            id: Uuid::parse_str(id).expect("valid uuid"),
+            author: "tester".into(),
+            timestamp,
+            room: "room-a".into(),
+            kind: MemoryKind::Context,
+            title: format!("entry-{timestamp}"),
+            content: "content".into(),
+            tags: vec![],
+            references: vec![],
+        }
+    }
+
+    fn skill_result(hash: &str, rank: i64) -> SkillSearchResult {
+        SkillSearchResult {
+            entry: SkillEntry {
+                hash: hash.into(),
+                author: "tester".into(),
+                timestamp: 0,
+                room: "room-a".into(),
+                title: hash.into(),
+                content: "content".into(),
+                tags: vec![],
+                version: 1,
+                parent_hash: None,
+                signed_by: None,
+                signature: None,
+            },
+            rank,
+        }
+    }
+
+    #[test]
+    fn finalize_memory_results_dedupes_by_id_and_sorts_newest_first() {
+        let a = memory("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1);
+        let b = memory("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 2);
+
+        // Memories replicate to every peer, so a room search typically gets
+        // the same entry back from the local store and from each peer.
+        let merged = vec![a.clone(), b.clone(), a.clone(), b.clone()];
+        let results = RoomManager::finalize_memory_results(merged, 50);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, b.id);
+        assert_eq!(results[1].id, a.id);
+    }
+
+    #[test]
+    fn merge_skill_results_takes_max_rank_instead_of_summing() {
+        let mut local = vec![skill_result("hash-a", 3)];
+
+        // Peer's rank reflects the same replicated votes, plus one vote we
+        // have not seen yet.
+        RoomManager::merge_skill_results(
+            &mut local,
+            vec![skill_result("hash-a", 4), skill_result("hash-b", 1)],
+        );
+
+        assert_eq!(local.len(), 2);
+        assert_eq!(local[0].entry.hash, "hash-a");
+        assert_eq!(local[0].rank, 4);
+        assert_eq!(local[1].entry.hash, "hash-b");
+        assert_eq!(local[1].rank, 1);
     }
 }
