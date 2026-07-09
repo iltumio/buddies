@@ -295,6 +295,30 @@ Each changed file is broadcast to the room as a signed `FileActivity` message ca
 - **get_peer_diff** returns a peer's full diff for a specific file so you can review exactly what changed.
 - When a peer changes a file you've also modified locally, buddies proactively pushes a `notifications/buddies/fileConflict` `CustomNotification` with instructions to reconcile before you continue editing.
 
+```mermaid
+sequenceDiagram
+    participant A as Alice's Agent
+    participant SA as buddies (Alice)
+    participant SB as buddies (Bob)
+    participant B as Bob's Agent
+
+    A->>SA: watch_repo({repo_path, room: "feature-a"})
+    B->>SB: watch_repo({repo_path, room: "feature-a"})
+
+    Note over A: Alice edits src/auth.rs
+    SA->>SA: debounce ~1s → git status + git diff HEAD
+    SA-->>SB: gossip → FileActivity (signed)
+    SB->>SB: verify + store (24h TTL)
+
+    Note over SB: Bob also has src/auth.rs dirty
+    SB->>B: notifications/buddies/fileConflict
+
+    B->>SB: get_peer_diff("src/auth.rs", "alice")
+    SB->>B: Alice's full diff
+```
+
+Git remains the source of truth — buddies never writes to your working tree. Only uncommitted changes are broadcast, watchers stop when the process exits, and late joiners see activity from the moment they join, not before.
+
 **Privacy warning**: watching a repo shares source-code diffs with everyone in the room. Only watch repos in rooms with `require_signed=true` and an identity whitelist configured (see [Identity trust model](#identity-trust-model)).
 
 ## Configuration
@@ -394,6 +418,23 @@ graph TB
 - **Wire format**: [postcard](https://github.com/jamesmunns/postcard) — compact binary serialization for gossip messages
 
 Rooms map to gossip topics via deterministic SHA-256 hashing. Same room name = same topic = same swarm. Peers discover each other through Iroh's relay infrastructure and direct QUIC hole-punching.
+
+## Development
+
+```bash
+cargo test                                  # unit tests
+cargo fmt --check                           # formatting
+cargo clippy --all-targets -- -D warnings   # lints
+```
+
+CI runs all three on every pull request and on pushes to `main`. Warnings are errors, so run `cargo clippy` locally before opening a PR.
+
+Two things to know before changing the wire format in `src/protocol.rs`:
+
+- `P2PMessageBody` is serialized with postcard, which encodes enum variants **by index**. Adding a variant anywhere but the end silently breaks compatibility with peers running an older build. Always append.
+- Gossip frames are capped at 256 KiB (`GOSSIP_MAX_MESSAGE_SIZE` in `src/node.rs`). Exceeding the limit is fatal to the connection on both send and receive, so any new payload field needs an explicit size cap — see `validate_file_activity` in `src/room.rs` for the pattern.
+
+Fields that arrive from peers are attacker-controlled. Validate them at receipt (length, timestamps, NUL bytes) rather than trusting the sender, and do it *after* signature verification so unverified traffic can't reach the validation path.
 
 ## License
 
