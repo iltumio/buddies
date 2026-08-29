@@ -68,7 +68,7 @@ cd buddies
 cargo install --path .
 ```
 
-Requires Rust 2024 edition (1.85+).
+Requires Rust 2024 edition and Rust 1.91 or newer. The minimum version is set by the current Iroh dependency line.
 
 ### Usage
 
@@ -287,13 +287,16 @@ This means the receiving agent learns about new tasks instantly — no polling r
 
 ## Repo awareness
 
-`watch_repo({repo_path, room, repo_name?})` starts a filesystem watcher on a local git repository. File-change events are debounced by roughly 1 second and then buddies shells out to `git` to figure out what actually changed, so `.gitignore`'d files and build artifacts never get broadcast. Git does the filtering for you.
+`watch_repo({repo_path, room, repo_name?})` starts a filesystem watcher on a local git repository. Join the room first. File-change events are debounced by roughly 1 second and then buddies shells out to `git` to determine what actually changed, so `.gitignore`'d files and build artifacts never get broadcast. Git does the filtering for you.
 
-Each changed file is broadcast to the room as a signed `FileActivity` message carrying a unified diff against `HEAD`, capped at 64 KiB. Receivers keep only the latest diff per `(repo, file, peer)` triple, and entries expire after 24 hours.
+The watcher ignores read-only access events and `.git` metadata churn. It also reconciles against Git every 2 seconds, which clears stale dirty state after a commit even if the filesystem notification was missed. If a Git command or file read fails, that scan is skipped and the last known state is retained rather than broadcasting an empty or misleading update.
+
+Each changed file is broadcast to the room as a `FileActivity` message carrying a unified diff against `HEAD`, capped at 64 KiB. The message is signed when a local signer is configured. Receivers bind the activity's `author` to the identity that joined under that peer name; a different signer cannot publish activity, status updates, or leave messages as that peer. Receivers keep only the latest diff per `(repo, file, peer)` triple, and entries expire after 24 hours.
 
 - **check_file_activity** should be called before editing a file in a shared repo, to see which peers have touched it recently.
 - **get_peer_diff** returns a peer's full diff for a specific file so you can review exactly what changed.
-- When a peer changes a file you've also modified locally, buddies proactively pushes a `notifications/buddies/fileConflict` `CustomNotification` with instructions to reconcile before you continue editing.
+- When a peer changes a file you've also modified locally, buddies proactively pushes a `notifications/buddies/fileConflict` `CustomNotification` with instructions to reconcile before you continue editing. Its payload includes the repo/path plus branch, change kind, timestamp, and added/removed line counts for both the peer change and the nested `local` change.
+- Watching the same canonical repo path twice is idempotent. The response reports the repo name and room of the watcher that is actually active; call `unwatch_repo` before moving that path to another room.
 
 ```mermaid
 sequenceDiagram
@@ -360,6 +363,7 @@ Git remains the source of truth — buddies never writes to your working tree. O
   - `ssh:<public-key>`
 - If a room has whitelist entries, messages from non-whitelisted identities are dropped.
 - If `require_signed=true`, unsigned messages are dropped.
+- Peer-scoped actions must come from the identity that joined under that display name. A different signer cannot impersonate that peer in file activity, status, or leave messages.
 - Incoming skills with invalid embedded signatures are rejected.
 - Signed messages carry a nonce and a `sent_at` timestamp: receivers drop signed messages older than 10 minutes (clock-skew tolerant) and messages whose nonce was already seen, so captured messages cannot be replayed.
 - GPG identities should be whitelisted by full fingerprint — short key ids are collision-prone.
@@ -412,9 +416,11 @@ graph TB
 ```
 
 - **Transport**: MCP over stdio (default) or streamable HTTP — stdio for clients that spawn the process, HTTP for standalone deployment
-- **Networking**: [Iroh](https://iroh.computer) — QUIC connections with NAT hole-punching and relay fallback
-- **Gossip**: [iroh-gossip](https://github.com/n0-computer/iroh-gossip) — epidemic broadcast trees (HyParView + PlumTree)
-- **Storage**: [redb](https://github.com/cberner/redb) — embedded key-value store, single file, zero config
+- **MCP**: [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 3.x — server tools over stdio or streamable HTTP
+- **Networking**: [Iroh](https://iroh.computer) 1.x — QUIC connections with NAT hole-punching and relay fallback
+- **Gossip**: [iroh-gossip](https://github.com/n0-computer/iroh-gossip) 0.101.x — epidemic broadcast trees (HyParView + PlumTree)
+- **Storage**: [redb](https://github.com/cberner/redb) 4.x — embedded key-value store, single file, zero config
+- **Hashing**: [sha2](https://github.com/RustCrypto/hashes) 0.11.x — room topics and content fingerprints
 - **Wire format**: [postcard](https://github.com/jamesmunns/postcard) — compact binary serialization for gossip messages
 
 Rooms map to gossip topics via deterministic SHA-256 hashing. Same room name = same topic = same swarm. Peers discover each other through Iroh's relay infrastructure and direct QUIC hole-punching.
@@ -422,7 +428,7 @@ Rooms map to gossip topics via deterministic SHA-256 hashing. Same room name = s
 ## Development
 
 ```bash
-cargo test                                  # unit tests
+cargo test --all-targets                    # unit and integration-style tests
 cargo fmt --check                           # formatting
 cargo clippy --all-targets -- -D warnings   # lints
 ```
@@ -432,7 +438,7 @@ CI runs all three on every pull request and on pushes to `main`. Warnings are er
 Two things to know before changing the wire format in `src/protocol.rs`:
 
 - `P2PMessageBody` is serialized with postcard, which encodes enum variants **by index**. Adding a variant anywhere but the end silently breaks compatibility with peers running an older build. Always append.
-- Gossip frames are capped at 256 KiB (`GOSSIP_MAX_MESSAGE_SIZE` in `src/node.rs`). Exceeding the limit is fatal to the connection on both send and receive, so any new payload field needs an explicit size cap — see `validate_file_activity` in `src/room.rs` for the pattern.
+- Gossip frames are capped at 256 KiB (`GOSSIP_MAX_MESSAGE_SIZE` in `src/node.rs`). Exceeding the limit is fatal to the connection on both send and receive, so any new payload field needs an explicit size cap — see `FileActivityEntry::validate_received` in `src/activity.rs` for the pattern.
 
 Fields that arrive from peers are attacker-controlled. Validate them at receipt (length, timestamps, NUL bytes) rather than trusting the sender, and do it *after* signature verification so unverified traffic can't reach the validation path.
 

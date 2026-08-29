@@ -7,11 +7,11 @@ license = "MIT"
 
 [dependencies]
 # MCP protocol
-rmcp = { version = "0.17", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "3.1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 
 # P2P networking
-iroh = "0.96"
-iroh-gossip = "0.96"
+iroh = "1"
+iroh-gossip = "0.101"
 n0-future = "0.3"
 notify = "8"
 
@@ -28,11 +28,11 @@ postcard = { version = "1", features = ["alloc"] }
 schemars = "1"
 
 # Local storage
-redb = "3"
+redb = "4"
 
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
-sha2 = "0.10"
+sha2 = "0.11"
 bytes = "1"
 anyhow = "1"
 tracing = "0.1"

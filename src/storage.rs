@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use redb::backends::InMemoryBackend;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use uuid::Uuid;
 
@@ -19,7 +20,7 @@ pub const FILE_ACTIVITY_TTL_SECS: u64 = 86_400;
 fn activity_key(repo: &str, path: &str, peer: &str) -> String {
     // NUL separators: valid in Rust strings. Peer-supplied fields CAN carry
     // NUL bytes, so the FileActivity handler rejects them before storage
-    // (see validate_file_activity in room.rs) to prevent key aliasing.
+    // (see FileActivityEntry::validate_received) to prevent key aliasing.
     format!("{repo}\u{0}{path}\u{0}{peer}")
 }
 
@@ -42,7 +43,7 @@ impl Storage {
     }
 
     pub fn in_memory() -> Result<Self> {
-        let db = Database::create("")?;
+        let db = Database::builder().create_with_backend(InMemoryBackend::new())?;
         let tx = db.begin_write()?;
         {
             let _ = tx.open_table(MEMORIES_TABLE)?;
@@ -223,7 +224,7 @@ impl Storage {
             for item in table.iter()? {
                 let (k, v) = item?;
                 let e: FileActivityEntry = postcard::from_bytes(v.value())?;
-                if e.timestamp.saturating_add(FILE_ACTIVITY_TTL_SECS) < now {
+                if e.is_expired(now, FILE_ACTIVITY_TTL_SECS) {
                     stale.push(k.value().to_string());
                 }
             }
@@ -251,7 +252,7 @@ impl Storage {
                 continue;
             }
             let entry: FileActivityEntry = postcard::from_bytes(v.value())?;
-            if entry.timestamp.saturating_add(FILE_ACTIVITY_TTL_SECS) < now {
+            if entry.is_expired(now, FILE_ACTIVITY_TTL_SECS) {
                 continue;
             }
             if let Some(paths) = paths
@@ -278,7 +279,7 @@ impl Storage {
         match table.get(key.as_str())? {
             Some(value) => {
                 let entry: FileActivityEntry = postcard::from_bytes(value.value())?;
-                if entry.timestamp.saturating_add(FILE_ACTIVITY_TTL_SECS) < now {
+                if entry.is_expired(now, FILE_ACTIVITY_TTL_SECS) {
                     return Ok(None);
                 }
                 Ok(Some(entry))

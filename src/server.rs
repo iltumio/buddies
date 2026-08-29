@@ -10,10 +10,11 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::activity::diff_summary;
+use crate::activity::{ConflictEvent, diff_summary};
 use crate::memory::{MemoryEntry, MemoryKind, SearchFilters};
 use crate::node::BuddiesNode;
 use crate::protocol::{P2PMessage, P2PMessageBody, SignerIdentity, TaskResult};
+use crate::room::PendingTask;
 use crate::skill::{SkillEntry, SkillSearchFilters, SkillVote, skill_content_hash};
 use crate::ticket::RoomTicket;
 
@@ -30,6 +31,85 @@ impl BuddiesServer {
             tool_router: Self::tool_router(),
         }
     }
+}
+
+fn conflict_notification_payload(event: &ConflictEvent) -> serde_json::Value {
+    let (peer_added, peer_removed) = diff_summary(&event.peer.diff);
+    let (local_added, local_removed) = diff_summary(&event.local.diff);
+    serde_json::json!({
+        "repo": event.peer.repo,
+        "path": event.peer.path,
+        "peer": event.peer.author,
+        "branch": event.peer.branch,
+        "kind": event.peer.kind.to_string(),
+        "timestamp": event.peer.timestamp,
+        "lines_added": peer_added,
+        "lines_removed": peer_removed,
+        "local": {
+            "peer": event.local.author,
+            "branch": event.local.branch,
+            "kind": event.local.kind.to_string(),
+            "timestamp": event.local.timestamp,
+            "lines_added": local_added,
+            "lines_removed": local_removed,
+        },
+        "instructions": format!(
+            "Peer '{}' changed '{}' (branch '{}'), which you have also modified locally. \
+             Call get_peer_diff to inspect their change and reconcile before continuing.",
+            event.peer.author, event.peer.path, event.peer.branch
+        ),
+    })
+}
+
+fn task_notification_payload(task: &PendingTask) -> serde_json::Value {
+    let instructions = format!(
+        "A peer agent has delegated a task to you. \
+         Execute the task described in 'description' using the available tools, \
+         then call 'submit_task_result' with: \
+         task_id='{}', room='{}', source_peer='{}', success=true/false, and your output.",
+        task.task_id, task.room, task.source_peer
+    );
+    serde_json::json!({
+        "task_id": task.task_id.to_string(),
+        "source_peer": task.source_peer,
+        "room": task.room,
+        "description": task.description,
+        "timestamp": task.timestamp,
+        "timeout_secs": task.timeout_secs,
+        "instructions": instructions,
+    })
+}
+
+fn spawn_notification_forwarder<T>(
+    peer: rmcp::service::Peer<rmcp::RoleServer>,
+    mut receiver: tokio::sync::broadcast::Receiver<T>,
+    method: &'static str,
+    payload: fn(&T) -> serde_json::Value,
+) where
+    T: Clone + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    let notification = ServerNotification::CustomNotification(
+                        CustomNotification::new(method, Some(payload(&event))),
+                    );
+                    if let Err(error) = peer.send_notification(notification).await {
+                        tracing::warn!(%method, %error, "failed to forward notification");
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(%method, skipped, "notification listener lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::debug!(%method, "notification channel closed");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -302,7 +382,7 @@ fn now_ts() -> u64 {
 fn ok_json<T: Serialize>(v: &T) -> Result<CallToolResult, McpError> {
     let text = serde_json::to_string_pretty(v)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 fn err(msg: impl std::fmt::Display) -> McpError {
@@ -870,7 +950,7 @@ impl BuddiesServer {
         &self,
         Parameters(req): Parameters<WatchRepoRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let repo = self
+        let state = self
             .node
             .watcher_manager
             .watch(Path::new(&req.repo_path), &req.room, req.repo_name)
@@ -878,8 +958,8 @@ impl BuddiesServer {
             .map_err(|e| err(e.to_string()))?;
         ok_json(&serde_json::json!({
             "watching": true,
-            "repo": repo,
-            "room": req.room,
+            "repo": state.repo,
+            "room": state.room,
         }))
     }
 
@@ -959,11 +1039,11 @@ impl BuddiesServer {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for BuddiesServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("P2P communication layer for AI agents. \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("P2P communication layer for AI agents. \
                  Join rooms to share knowledge, delegate tasks, and coordinate with other agents in real-time. \
                  When you receive a 'notifications/buddies/taskArrived' notification, you MUST: \
                  1) Execute the task described in the 'description' field using the available tools. \
@@ -973,102 +1053,61 @@ impl ServerHandler for BuddiesServer {
                  then call 'check_file_activity' before editing files to see what peers changed, and \
                  'get_peer_diff' to read a peer's change. When you receive a \
                  'notifications/buddies/fileConflict' notification, inspect the peer's diff and \
-                 reconcile with your local changes before continuing to edit that file.".into(),
-            ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+                 reconcile with your local changes before continuing to edit that file.")
     }
 
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
-        let peer = context.peer.clone();
-        let conflict_peer = context.peer.clone();
-        let mut rx = self.node.subscribe_task_events();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(task) => {
-                        let instructions = format!(
-                            "A peer agent has delegated a task to you. \
-                             Execute the task described in 'description' using the available tools, \
-                             then call 'submit_task_result' with: \
-                             task_id='{}', room='{}', source_peer='{}', success=true/false, and your output.",
-                            task.task_id, task.room, task.source_peer
-                        );
-                        let payload = serde_json::json!({
-                            "task_id": task.task_id.to_string(),
-                            "source_peer": task.source_peer,
-                            "room": task.room,
-                            "description": task.description,
-                            "timestamp": task.timestamp,
-                            "timeout_secs": task.timeout_secs,
-                            "instructions": instructions,
-                        });
-                        if let Err(e) = peer
-                            .send_notification(ServerNotification::CustomNotification(
-                                CustomNotification::new(
-                                    "notifications/buddies/taskArrived",
-                                    Some(payload),
-                                ),
-                            ))
-                            .await
-                        {
-                            tracing::warn!(error = %e, "failed to send task notification");
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "task notification listener lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::debug!("task broadcast channel closed");
-                        break;
-                    }
-                }
-            }
-        });
+        spawn_notification_forwarder(
+            context.peer.clone(),
+            self.node.subscribe_task_events(),
+            "notifications/buddies/taskArrived",
+            task_notification_payload,
+        );
+        spawn_notification_forwarder(
+            context.peer,
+            self.node.subscribe_conflict_events(),
+            "notifications/buddies/fileConflict",
+            conflict_notification_payload,
+        );
+    }
+}
 
-        let peer = conflict_peer;
-        let mut conflict_rx = self.node.subscribe_conflict_events();
-        tokio::spawn(async move {
-            loop {
-                match conflict_rx.recv().await {
-                    Ok(entry) => {
-                        let (added, removed) = crate::activity::diff_summary(&entry.diff);
-                        let payload = serde_json::json!({
-                            "repo": entry.repo,
-                            "path": entry.path,
-                            "peer": entry.author,
-                            "branch": entry.branch,
-                            "kind": entry.kind.to_string(),
-                            "timestamp": entry.timestamp,
-                            "lines_added": added,
-                            "lines_removed": removed,
-                            "instructions": format!(
-                                "Peer '{}' changed '{}' (branch '{}'), which you have also modified locally. \
-                                 Call get_peer_diff to inspect their change and reconcile before continuing.",
-                                entry.author, entry.path, entry.branch
-                            ),
-                        });
-                        if let Err(e) = peer
-                            .send_notification(ServerNotification::CustomNotification(
-                                CustomNotification::new(
-                                    "notifications/buddies/fileConflict",
-                                    Some(payload),
-                                ),
-                            ))
-                            .await
-                        {
-                            tracing::warn!(error = %e, "failed to send conflict notification");
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "conflict notification listener lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::activity::{ConflictEvent, FileActivityEntry, FileChangeKind};
+
+    fn activity(author: &str, branch: &str, diff: &str, timestamp: u64) -> FileActivityEntry {
+        FileActivityEntry {
+            repo: "repo".into(),
+            branch: branch.into(),
+            path: "src/lib.rs".into(),
+            kind: FileChangeKind::Changed,
+            diff: diff.into(),
+            content_hash: "abc".into(),
+            author: author.into(),
+            timestamp,
+        }
+    }
+
+    #[test]
+    fn conflict_payload_contains_local_and_peer_metadata() {
+        let event = ConflictEvent {
+            local: activity("me", "feature/local", "+ours\n", 10),
+            peer: activity("alice", "feature/peer", "+theirs\n-old\n", 20),
+        };
+
+        let payload = conflict_notification_payload(&event);
+
+        assert_eq!(payload["peer"], "alice");
+        assert_eq!(payload["branch"], "feature/peer");
+        assert_eq!(payload["timestamp"], 20);
+        assert_eq!(payload["lines_added"], 1);
+        assert_eq!(payload["lines_removed"], 1);
+        assert_eq!(payload["local"]["peer"], "me");
+        assert_eq!(payload["local"]["branch"], "feature/local");
+        assert_eq!(payload["local"]["timestamp"], 10);
+        assert_eq!(payload["local"]["lines_added"], 1);
+        assert_eq!(payload["local"]["lines_removed"], 0);
     }
 }

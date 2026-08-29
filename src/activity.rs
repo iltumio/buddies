@@ -4,6 +4,8 @@ use std::sync::RwLock;
 
 pub const MAX_DIFF_BYTES: usize = 64 * 1024;
 pub const DIFF_TRUNCATION_MARKER: &str = "\n[... diff truncated by buddies ...]";
+pub(crate) const MAX_ACTIVITY_FIELD_BYTES: usize = 1024;
+pub(crate) const MAX_CONTENT_HASH_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileChangeKind {
@@ -23,7 +25,7 @@ impl std::fmt::Display for FileChangeKind {
 }
 
 /// One peer's latest change to one file in a watched repo.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileActivityEntry {
     pub repo: String,
     pub branch: String,
@@ -36,6 +38,43 @@ pub struct FileActivityEntry {
     pub content_hash: String,
     pub author: String,
     pub timestamp: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConflictEvent {
+    pub local: FileActivityEntry,
+    pub peer: FileActivityEntry,
+}
+
+impl FileActivityEntry {
+    pub(crate) fn validate_received(
+        &self,
+        now: u64,
+        freshness_window_secs: u64,
+    ) -> Result<(), &'static str> {
+        if self.timestamp.abs_diff(now) > freshness_window_secs {
+            return Err("timestamp outside freshness window");
+        }
+        for field in [&self.repo, &self.path, &self.author, &self.branch] {
+            if field.as_bytes().contains(&0) {
+                return Err("field contains NUL byte");
+            }
+            if field.len() > MAX_ACTIVITY_FIELD_BYTES {
+                return Err("field exceeds length cap");
+            }
+        }
+        if self.diff.len() > MAX_DIFF_BYTES + DIFF_TRUNCATION_MARKER.len() {
+            return Err("diff exceeds length cap");
+        }
+        if self.content_hash.len() > MAX_CONTENT_HASH_BYTES {
+            return Err("content_hash exceeds length cap");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_expired(&self, now: u64, ttl_secs: u64) -> bool {
+        self.timestamp.saturating_add(ttl_secs) < now
+    }
 }
 
 /// (added, removed) line counts of a unified diff.
@@ -72,7 +111,13 @@ pub fn truncate_diff(mut diff: String) -> String {
 /// (writer) and the gossip handler (reader, for conflict detection).
 #[derive(Default)]
 pub struct DirtySet {
-    inner: RwLock<HashMap<String, HashSet<String>>>,
+    inner: RwLock<HashMap<String, DirtyRepo>>,
+}
+
+#[derive(Default)]
+struct DirtyRepo {
+    paths: HashSet<String>,
+    activity: HashMap<String, FileActivityEntry>,
 }
 
 impl DirtySet {
@@ -80,11 +125,31 @@ impl DirtySet {
         Self::default()
     }
 
+    #[cfg(test)]
     pub fn set_repo_dirty(&self, repo: &str, paths: HashSet<String>) {
-        self.inner
-            .write()
-            .expect("dirty set lock poisoned")
-            .insert(repo.to_string(), paths);
+        self.update_repo(repo, paths, std::iter::empty());
+    }
+
+    pub fn update_repo(
+        &self,
+        repo: &str,
+        paths: HashSet<String>,
+        entries: impl IntoIterator<Item = FileActivityEntry>,
+    ) {
+        let mut repos = self.inner.write().expect("dirty set lock poisoned");
+        if paths.is_empty() {
+            repos.remove(repo);
+            return;
+        }
+
+        let state = repos.entry(repo.to_string()).or_default();
+        state.paths = paths;
+        state.activity.retain(|path, _| state.paths.contains(path));
+        for entry in entries {
+            if state.paths.contains(&entry.path) {
+                state.activity.insert(entry.path.clone(), entry);
+            }
+        }
     }
 
     pub fn clear_repo(&self, repo: &str) {
@@ -94,12 +159,22 @@ impl DirtySet {
             .remove(repo);
     }
 
+    #[cfg(test)]
     pub fn is_dirty(&self, repo: &str, path: &str) -> bool {
         self.inner
             .read()
             .expect("dirty set lock poisoned")
             .get(repo)
-            .is_some_and(|paths| paths.contains(path))
+            .is_some_and(|state| state.paths.contains(path))
+    }
+
+    pub fn get(&self, repo: &str, path: &str) -> Option<FileActivityEntry> {
+        self.inner
+            .read()
+            .expect("dirty set lock poisoned")
+            .get(repo)
+            .and_then(|state| state.activity.get(path))
+            .cloned()
     }
 }
 
@@ -150,5 +225,35 @@ mod tests {
 
         dirty.clear_repo("repo-a");
         assert!(!dirty.is_dirty("repo-a", "src/b.rs"));
+    }
+
+    #[test]
+    fn dirty_set_retains_local_metadata_until_a_path_is_clean() {
+        let dirty = DirtySet::new();
+        let local = FileActivityEntry {
+            repo: "repo-a".into(),
+            branch: "feature/local".into(),
+            path: "src/a.rs".into(),
+            kind: FileChangeKind::Changed,
+            diff: "+local line\n".into(),
+            content_hash: "abc".into(),
+            author: "local-agent".into(),
+            timestamp: 42,
+        };
+
+        dirty.update_repo("repo-a", ["src/a.rs".to_string()].into(), [local.clone()]);
+        let stored = dirty
+            .get("repo-a", "src/a.rs")
+            .expect("local activity metadata");
+        assert_eq!(stored.branch, "feature/local");
+        assert_eq!(stored.diff, "+local line\n");
+        assert_eq!(stored.timestamp, 42);
+
+        // A deduplicated scan emits no new entry, but the file is still dirty.
+        dirty.update_repo("repo-a", ["src/a.rs".to_string()].into(), []);
+        assert!(dirty.get("repo-a", "src/a.rs").is_some());
+
+        dirty.update_repo("repo-a", HashSet::new(), []);
+        assert!(dirty.get("repo-a", "src/a.rs").is_none());
     }
 }

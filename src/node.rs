@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use iroh::Endpoint;
 use iroh::protocol::Router;
+use iroh::{Endpoint, endpoint::presets};
 use iroh_gossip::net::Gossip;
 
 use crate::activity::DirtySet;
@@ -37,7 +37,7 @@ pub struct BuddiesNodeConfig {
 
 impl BuddiesNode {
     pub async fn new(config: BuddiesNodeConfig) -> Result<Self> {
-        let endpoint = Endpoint::builder().bind().await?;
+        let endpoint = Endpoint::builder(presets::N0).bind().await?;
 
         let gossip = Gossip::builder()
             .max_message_size(GOSSIP_MAX_MESSAGE_SIZE)
@@ -85,7 +85,7 @@ impl BuddiesNode {
 
     pub fn subscribe_conflict_events(
         &self,
-    ) -> tokio::sync::broadcast::Receiver<crate::activity::FileActivityEntry> {
+    ) -> tokio::sync::broadcast::Receiver<crate::activity::ConflictEvent> {
         self.room_manager.subscribe_conflict_events()
     }
 

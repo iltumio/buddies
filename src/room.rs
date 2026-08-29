@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::activity::{DirtySet, FileActivityEntry};
+use crate::activity::{ConflictEvent, DirtySet};
 use crate::identity::{LocalSigner, verify_signature};
 use crate::memory::{MemoryEntry, SearchFilters};
 use crate::protocol::{
@@ -39,46 +39,6 @@ pub(crate) fn now_unix() -> u64 {
 
 fn is_message_fresh(sent_at: u64, now: u64) -> bool {
     sent_at.abs_diff(now) <= MAX_MESSAGE_AGE_SECS
-}
-
-/// Upper bound on the repo/path/author/branch fields of peer-supplied file
-/// activity. Generous for real values, small enough to bound storage keys.
-const MAX_ACTIVITY_FIELD_BYTES: usize = 1024;
-
-/// Upper bound on the content_hash field of peer-supplied file activity.
-/// A SHA-256 hex digest is 64 bytes; this leaves generous headroom for
-/// other hash formats without allowing unbounded storage.
-const MAX_CONTENT_HASH_BYTES: usize = 128;
-
-/// Validate a peer-supplied file activity entry before it reaches storage.
-/// Timestamps outside the freshness window would overflow or outlive the
-/// TTL arithmetic; NUL bytes in repo/path/author would alias the redb keys
-/// built as `repo\0path\0peer`. The gossip frame limit is 256 KiB
-/// (`GOSSIP_MAX_MESSAGE_SIZE` in node.rs), so diff/branch/content_hash must
-/// also be capped or a malicious peer could store near that much verbatim.
-fn validate_file_activity(entry: &FileActivityEntry, now: u64) -> Result<(), &'static str> {
-    if entry.timestamp.abs_diff(now) > MAX_MESSAGE_AGE_SECS {
-        return Err("timestamp outside freshness window");
-    }
-    for field in [&entry.repo, &entry.path, &entry.author, &entry.branch] {
-        if field.as_bytes().contains(&0) {
-            return Err("field contains NUL byte");
-        }
-        if field.len() > MAX_ACTIVITY_FIELD_BYTES {
-            return Err("field exceeds length cap");
-        }
-    }
-    // Honest senders always truncate diffs to at most MAX_DIFF_BYTES plus
-    // the truncation marker (see truncate_diff in activity.rs).
-    if entry.diff.len()
-        > crate::activity::MAX_DIFF_BYTES + crate::activity::DIFF_TRUNCATION_MARKER.len()
-    {
-        return Err("diff exceeds length cap");
-    }
-    if entry.content_hash.len() > MAX_CONTENT_HASH_BYTES {
-        return Err("content_hash exceeds length cap");
-    }
-    Ok(())
 }
 
 /// Bounded FIFO set of recently seen message nonces.
@@ -118,6 +78,32 @@ pub struct PeerInfo {
     pub name: String,
     pub agent: String,
     pub last_status: Option<String>,
+    signed_by: Option<SignerIdentity>,
+}
+
+impl PeerInfo {
+    fn new(name: String, agent: String, signed_by: Option<SignerIdentity>) -> Self {
+        Self {
+            name,
+            agent,
+            last_status: None,
+            signed_by,
+        }
+    }
+
+    fn accepts_identity(&self, identity: Option<&SignerIdentity>) -> bool {
+        self.signed_by.as_ref() == identity
+    }
+}
+
+fn peer_action_is_authenticated(
+    room_peers: &HashMap<String, PeerInfo>,
+    peer_name: &str,
+    signed_by: Option<&SignerIdentity>,
+) -> bool {
+    room_peers
+        .get(peer_name)
+        .is_some_and(|peer| peer.accepts_identity(signed_by))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -155,7 +141,7 @@ pub struct RoomManager {
     // std Mutex: critical sections are short and never hold across .await
     replay_guard: std::sync::Mutex<ReplayGuard>,
     dirty: Arc<DirtySet>,
-    conflict_broadcast: tokio::sync::broadcast::Sender<FileActivityEntry>,
+    conflict_broadcast: tokio::sync::broadcast::Sender<ConflictEvent>,
 }
 
 impl RoomManager {
@@ -197,7 +183,7 @@ impl RoomManager {
 
     /// Subscribe to conflict events: fired when a peer's file activity
     /// arrives for a path that is also locally modified in a watched repo.
-    pub fn subscribe_conflict_events(&self) -> tokio::sync::broadcast::Receiver<FileActivityEntry> {
+    pub fn subscribe_conflict_events(&self) -> tokio::sync::broadcast::Receiver<ConflictEvent> {
         self.conflict_broadcast.subscribe()
     }
 
@@ -631,20 +617,27 @@ impl RoomManager {
             return;
         }
 
+        self.handle_verified_message(room_name, msg).await;
+    }
+
+    /// Ingress seam after envelope verification. Keeping this crate-visible
+    /// lets tests exercise authorization, persistence, and conflict delivery
+    /// without constructing a real gossip transport.
+    pub(crate) async fn handle_verified_message(&self, room_name: &str, msg: P2PMessage) {
+        let signed_by = msg.signed_by.clone();
         match msg.body {
             P2PMessageBody::Join { name, agent } => {
                 let is_new = {
                     let mut peers = self.peers.write().await;
                     let room_peers = peers.entry(room_name.to_string()).or_default();
+                    if let Some(existing) = room_peers.get(&name)
+                        && !existing.accepts_identity(signed_by.as_ref())
+                    {
+                        warn!(room = %room_name, peer = %name, "rejected peer name takeover by a different identity");
+                        return;
+                    }
                     let is_new = !room_peers.contains_key(&name);
-                    room_peers.insert(
-                        name.clone(),
-                        PeerInfo {
-                            name,
-                            agent,
-                            last_status: None,
-                        },
-                    );
+                    room_peers.insert(name.clone(), PeerInfo::new(name, agent, signed_by));
                     is_new
                 };
 
@@ -661,8 +654,12 @@ impl RoomManager {
             }
             P2PMessageBody::Leave { name } => {
                 let mut peers = self.peers.write().await;
-                if let Some(room_peers) = peers.get_mut(room_name) {
+                if let Some(room_peers) = peers.get_mut(room_name)
+                    && peer_action_is_authenticated(room_peers, &name, signed_by.as_ref())
+                {
                     room_peers.remove(&name);
+                } else {
+                    warn!(room = %room_name, peer = %name, "dropped leave whose peer identity does not match");
                 }
             }
             P2PMessageBody::MemoryCreated { entry } => {
@@ -673,9 +670,12 @@ impl RoomManager {
             P2PMessageBody::StatusUpdate { author, text } => {
                 let mut peers = self.peers.write().await;
                 if let Some(room_peers) = peers.get_mut(room_name)
+                    && peer_action_is_authenticated(room_peers, &author, signed_by.as_ref())
                     && let Some(peer) = room_peers.get_mut(&author)
                 {
                     peer.last_status = Some(text);
+                } else {
+                    warn!(room = %room_name, peer = %author, "dropped status whose author identity does not match");
                 }
             }
             P2PMessageBody::SearchRequest {
@@ -816,16 +816,28 @@ impl RoomManager {
                 }
             }
             P2PMessageBody::FileActivity { entry } => {
-                if let Err(reason) = validate_file_activity(&entry, now_unix()) {
+                let author_is_authenticated = {
+                    let peers = self.peers.read().await;
+                    peers.get(room_name).is_some_and(|room_peers| {
+                        peer_action_is_authenticated(room_peers, &entry.author, signed_by.as_ref())
+                    })
+                };
+                if !author_is_authenticated {
+                    warn!(room = %room_name, author = %entry.author, "dropped file activity whose author does not match the joined peer identity");
+                    return;
+                }
+                if let Err(reason) = entry.validate_received(now_unix(), MAX_MESSAGE_AGE_SECS) {
                     warn!(room = %room_name, author = %entry.author, reason, "dropped invalid file activity");
                     return;
                 }
                 if let Err(e) = self.storage.store_file_activity(&entry, now_unix()) {
                     warn!(error = %e, "failed to store received file activity");
                 }
-                if self.dirty.is_dirty(&entry.repo, &entry.path) {
+                if let Some(local) = self.dirty.get(&entry.repo, &entry.path) {
                     info!(repo = %entry.repo, path = %entry.path, peer = %entry.author, "conflicting file activity from peer");
-                    let _ = self.conflict_broadcast.send(entry);
+                    let _ = self
+                        .conflict_broadcast
+                        .send(ConflictEvent { local, peer: entry });
                 }
             }
         }
@@ -919,7 +931,9 @@ impl RoomManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activity::FileActivityEntry;
     use crate::memory::MemoryKind;
+    use crate::node::{BuddiesNode, BuddiesNodeConfig};
 
     fn nonce(n: u8) -> [u8; 16] {
         [n; 16]
@@ -1018,25 +1032,135 @@ mod tests {
     }
 
     #[test]
+    fn signed_peer_identity_cannot_impersonate_another_author() {
+        let alice_identity = SignerIdentity::Gpg {
+            key_id: "ALICE".into(),
+        };
+        let mallory_identity = SignerIdentity::Gpg {
+            key_id: "MALLORY".into(),
+        };
+        let alice = PeerInfo::new("alice".into(), "codex".into(), Some(alice_identity.clone()));
+
+        assert!(alice.accepts_identity(Some(&alice_identity)));
+        assert!(!alice.accepts_identity(Some(&mallory_identity)));
+        assert!(!alice.accepts_identity(None));
+    }
+
+    #[test]
+    fn peer_actions_require_the_identity_that_joined_under_that_name() {
+        let alice_identity = SignerIdentity::Gpg {
+            key_id: "ALICE".into(),
+        };
+        let mallory_identity = SignerIdentity::Gpg {
+            key_id: "MALLORY".into(),
+        };
+        let mut peers = HashMap::new();
+        peers.insert(
+            "alice".into(),
+            PeerInfo::new("alice".into(), "codex".into(), Some(alice_identity.clone())),
+        );
+
+        assert!(peer_action_is_authenticated(
+            &peers,
+            "alice",
+            Some(&alice_identity)
+        ));
+        assert!(!peer_action_is_authenticated(
+            &peers,
+            "alice",
+            Some(&mallory_identity)
+        ));
+        assert!(!peer_action_is_authenticated(&peers, "mallory", None));
+    }
+
+    #[tokio::test]
+    async fn verified_ingress_rejects_forgery_then_stores_and_reports_real_conflict() {
+        let node = BuddiesNode::new(BuddiesNodeConfig {
+            user_name: "local".into(),
+            agent_name: "codex".into(),
+            data_dir: None,
+            signer: None,
+        })
+        .await
+        .expect("create in-memory node");
+        let mut conflicts = node.subscribe_conflict_events();
+        let now = now_unix();
+        let local = activity("repo", "src/a.rs", "local", now);
+        node.room_manager.dirty.update_repo(
+            "repo",
+            HashSet::from(["src/a.rs".to_string()]),
+            [local.clone()],
+        );
+
+        let alice_identity = SignerIdentity::Gpg {
+            key_id: "ALICE".into(),
+        };
+        let mallory_identity = SignerIdentity::Gpg {
+            key_id: "MALLORY".into(),
+        };
+        let mut join = P2PMessage::new(P2PMessageBody::Join {
+            name: "alice".into(),
+            agent: "codex".into(),
+        });
+        join.signed_by = Some(alice_identity.clone());
+        node.room_manager
+            .handle_verified_message("room-a", join)
+            .await;
+
+        let peer = activity("repo", "src/a.rs", "alice", now);
+        let mut forged = P2PMessage::new(P2PMessageBody::FileActivity {
+            entry: peer.clone(),
+        });
+        forged.signed_by = Some(mallory_identity);
+        node.room_manager
+            .handle_verified_message("room-a", forged)
+            .await;
+
+        assert!(
+            node.storage
+                .get_file_activity("repo", None, now)
+                .expect("read activity")
+                .is_empty()
+        );
+        assert!(conflicts.try_recv().is_err());
+
+        let mut authentic = P2PMessage::new(P2PMessageBody::FileActivity {
+            entry: peer.clone(),
+        });
+        authentic.signed_by = Some(alice_identity);
+        node.room_manager
+            .handle_verified_message("room-a", authentic)
+            .await;
+
+        assert_eq!(
+            node.storage
+                .get_file_activity("repo", None, now)
+                .expect("read activity"),
+            vec![peer.clone()]
+        );
+        let conflict = conflicts.try_recv().expect("conflict event");
+        assert_eq!(conflict.local, local);
+        assert_eq!(conflict.peer, peer);
+
+        node.shutdown().await.expect("shutdown node");
+    }
+
+    #[test]
     fn validate_file_activity_accepts_fresh_entry() {
         let now = 1_000_000;
         assert_eq!(
-            validate_file_activity(&activity("repo", "src/a.rs", "alice", now), now),
+            activity("repo", "src/a.rs", "alice", now).validate_received(now, MAX_MESSAGE_AGE_SECS),
             Ok(())
         );
         // skew inside the freshness window is fine in both directions
         assert_eq!(
-            validate_file_activity(
-                &activity("repo", "src/a.rs", "alice", now - MAX_MESSAGE_AGE_SECS),
-                now
-            ),
+            activity("repo", "src/a.rs", "alice", now - MAX_MESSAGE_AGE_SECS)
+                .validate_received(now, MAX_MESSAGE_AGE_SECS),
             Ok(())
         );
         assert_eq!(
-            validate_file_activity(
-                &activity("repo", "src/a.rs", "alice", now + MAX_MESSAGE_AGE_SECS),
-                now
-            ),
+            activity("repo", "src/a.rs", "alice", now + MAX_MESSAGE_AGE_SECS)
+                .validate_received(now, MAX_MESSAGE_AGE_SECS),
             Ok(())
         );
     }
@@ -1051,7 +1175,9 @@ mod tests {
             u64::MAX, // would overflow TTL arithmetic if stored
         ] {
             assert!(
-                validate_file_activity(&activity("repo", "src/a.rs", "alice", bad), now).is_err(),
+                activity("repo", "src/a.rs", "alice", bad)
+                    .validate_received(now, MAX_MESSAGE_AGE_SECS)
+                    .is_err(),
                 "timestamp {bad} should be rejected"
             );
         }
@@ -1067,7 +1193,7 @@ mod tests {
             activity("repo", "src/a.rs", "al\u{0}ice", now),
         ] {
             assert_eq!(
-                validate_file_activity(&entry, now),
+                entry.validate_received(now, MAX_MESSAGE_AGE_SECS),
                 Err("field contains NUL byte")
             );
         }
@@ -1076,21 +1202,21 @@ mod tests {
     #[test]
     fn validate_file_activity_rejects_oversized_fields() {
         let now = 1_000_000;
-        let big = "x".repeat(MAX_ACTIVITY_FIELD_BYTES + 1);
+        let big = "x".repeat(crate::activity::MAX_ACTIVITY_FIELD_BYTES + 1);
         for entry in [
             activity(&big, "src/a.rs", "alice", now),
             activity("repo", &big, "alice", now),
             activity("repo", "src/a.rs", &big, now),
         ] {
             assert_eq!(
-                validate_file_activity(&entry, now),
+                entry.validate_received(now, MAX_MESSAGE_AGE_SECS),
                 Err("field exceeds length cap")
             );
         }
         // exactly at the cap passes
-        let max = "x".repeat(MAX_ACTIVITY_FIELD_BYTES);
+        let max = "x".repeat(crate::activity::MAX_ACTIVITY_FIELD_BYTES);
         assert_eq!(
-            validate_file_activity(&activity(&max, &max, &max, now), now),
+            activity(&max, &max, &max, now).validate_received(now, MAX_MESSAGE_AGE_SECS),
             Ok(())
         );
     }
@@ -1099,15 +1225,15 @@ mod tests {
     fn validate_file_activity_rejects_oversized_branch() {
         let now = 1_000_000;
         let mut entry = activity("repo", "src/a.rs", "alice", now);
-        entry.branch = "x".repeat(MAX_ACTIVITY_FIELD_BYTES + 1);
+        entry.branch = "x".repeat(crate::activity::MAX_ACTIVITY_FIELD_BYTES + 1);
         assert_eq!(
-            validate_file_activity(&entry, now),
+            entry.validate_received(now, MAX_MESSAGE_AGE_SECS),
             Err("field exceeds length cap")
         );
 
         // exactly at the cap passes
-        entry.branch = "x".repeat(MAX_ACTIVITY_FIELD_BYTES);
-        assert_eq!(validate_file_activity(&entry, now), Ok(()));
+        entry.branch = "x".repeat(crate::activity::MAX_ACTIVITY_FIELD_BYTES);
+        assert_eq!(entry.validate_received(now, MAX_MESSAGE_AGE_SECS), Ok(()));
     }
 
     #[test]
@@ -1119,14 +1245,14 @@ mod tests {
 
         entry.diff = "x".repeat(max_diff_len + 1);
         assert_eq!(
-            validate_file_activity(&entry, now),
+            entry.validate_received(now, MAX_MESSAGE_AGE_SECS),
             Err("diff exceeds length cap")
         );
 
         // honest senders always truncate to at most this length; exactly at
         // the cap must be accepted
         entry.diff = "x".repeat(max_diff_len);
-        assert_eq!(validate_file_activity(&entry, now), Ok(()));
+        assert_eq!(entry.validate_received(now, MAX_MESSAGE_AGE_SECS), Ok(()));
     }
 
     #[test]
@@ -1134,15 +1260,15 @@ mod tests {
         let now = 1_000_000;
         let mut entry = activity("repo", "src/a.rs", "alice", now);
 
-        entry.content_hash = "x".repeat(MAX_CONTENT_HASH_BYTES + 1);
+        entry.content_hash = "x".repeat(crate::activity::MAX_CONTENT_HASH_BYTES + 1);
         assert_eq!(
-            validate_file_activity(&entry, now),
+            entry.validate_received(now, MAX_MESSAGE_AGE_SECS),
             Err("content_hash exceeds length cap")
         );
 
         // exactly at the cap passes (SHA-256 hex is 64 bytes, well under this)
-        entry.content_hash = "x".repeat(MAX_CONTENT_HASH_BYTES);
-        assert_eq!(validate_file_activity(&entry, now), Ok(()));
+        entry.content_hash = "x".repeat(crate::activity::MAX_CONTENT_HASH_BYTES);
+        assert_eq!(entry.validate_received(now, MAX_MESSAGE_AGE_SECS), Ok(()));
     }
 
     #[test]

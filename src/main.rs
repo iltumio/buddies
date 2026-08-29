@@ -86,11 +86,9 @@ async fn main() -> Result<()> {
             let service = StreamableHttpService::new(
                 move || Ok(BuddiesServer::new(Arc::clone(&node))),
                 LocalSessionManager::default().into(),
-                StreamableHttpServerConfig {
-                    stateful_mode: true,
-                    cancellation_token: ct.child_token(),
-                    ..Default::default()
-                },
+                StreamableHttpServerConfig::default()
+                    .with_legacy_session_mode(true)
+                    .with_cancellation_token(ct.child_token()),
             );
 
             let app = axum::Router::new().nest_service("/mcp", service);
