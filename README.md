@@ -230,6 +230,21 @@ sequenceDiagram
 
 Skills support versioning via `parent_hash` — publish an updated skill referencing the previous version's hash to create a revision chain.
 
+Votes require a signing identity. SSH voters are keyed by the public key without
+its comment; GPG voters must use a full fingerprint. A peer cannot choose another
+voter's name, and repeating a vote replaces that identity's previous vote.
+Search responses expose `rank_source: "local_verified_votes"`: ranking uses votes
+validated by this instance, not an aggregate supplied by a remote peer. Consequently,
+rankings can differ while peers have received different sets of votes.
+
+**Upgrade note:** legacy votes were stored without a verifiable identity binding.
+They remain in the database for inspection but are excluded from ranking after
+this update. Cast votes again to populate the new verified-vote table. Memories
+and skills are retained. Because skill storage is keyed by content hash, publishing
+identical content into another room now returns an error instead of moving the
+existing skill between rooms.
+
+
 ## The search flow
 
 No data is replicated unless explicitly stored. Peers only share what matches your query.
@@ -324,6 +339,22 @@ Git remains the source of truth — buddies never writes to your working tree. O
 
 **Privacy warning**: watching a repo shares source-code diffs with everyone in the room. Only watch repos in rooms with `require_signed=true` and an identity whitelist configured (see [Identity trust model](#identity-trust-model)).
 
+## Resource limits and shutdown
+
+Distributed searches accept at most 30 seconds; task delegation accepts 1–300
+seconds. Long polling is capped at 30 seconds. Each outgoing request registry
+allows 128 concurrent requests, and merged searches retain at most 50 results.
+Cancellation and broadcast errors release request registrations immediately.
+
+Database work runs outside the async runtime with four concurrent worker slots.
+Signing and verification use at most four child processes, with a 10-second
+queue/execution deadline; timed-out or cancelled commands are terminated.
+Configured signing failures are errors, never an automatic unsigned fallback.
+
+SIGINT/SIGTERM stops HTTP admission, cancels MCP sessions and notifications, and
+allows up to five seconds for HTTP connections to finish before stopping watchers,
+room receivers, and the Iroh router. The stdio transport also cleans up on EOF.
+
 ## Configuration
 
 | Environment variable | Default | Description |
@@ -364,7 +395,8 @@ Git remains the source of truth — buddies never writes to your working tree. O
 - If a room has whitelist entries, messages from non-whitelisted identities are dropped.
 - If `require_signed=true`, unsigned messages are dropped.
 - Peer-scoped actions must come from the identity that joined under that display name. A different signer cannot impersonate that peer in file activity, status, or leave messages.
-- Incoming skills with invalid embedded signatures are rejected.
+- Incoming skills with invalid hashes or embedded signatures are rejected, including search results. Signed-only room policies also require an embedded skill signature.
+- Remote searches are always scoped to the receiving room. Memory/skill/task payloads claiming a different room are rejected.
 - Signed messages carry a nonce and a `sent_at` timestamp: receivers drop signed messages older than 10 minutes (clock-skew tolerant) and messages whose nonce was already seen, so captured messages cannot be replayed.
 - GPG identities should be whitelisted by full fingerprint — short key ids are collision-prone.
 
@@ -433,7 +465,20 @@ cargo fmt --check                           # formatting
 cargo clippy --all-targets -- -D warnings   # lints
 ```
 
-CI runs all three on every pull request and on pushes to `main`. Warnings are errors, so run `cargo clippy` locally before opening a PR.
+CI runs all three, a Rust 1.91 compatibility check, and MCP transport/shutdown
+smoke tests on every pull request and on pushes to `main`. Warnings are errors,
+so run `cargo clippy` locally before opening a PR. Dependabot checks Cargo and
+GitHub Actions weekly; a separate weekly job runs `cargo audit`.
+
+To run the Linux transport test locally (requires Python 3, Git, and a debug build):
+
+```bash
+cargo build --locked
+python3 scripts/smoke_mcp.py
+```
+
+Signature regression tests require `ssh-keygen`. All smoke-test data and watched
+files are created in temporary directories.
 
 Two things to know before changing the wire format in `src/protocol.rs`:
 

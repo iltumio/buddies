@@ -7,9 +7,9 @@ use iroh::{Endpoint, endpoint::presets};
 use iroh_gossip::net::Gossip;
 
 use crate::activity::DirtySet;
+use crate::async_storage::AsyncStorage;
 use crate::identity::LocalSigner;
 use crate::room::RoomManager;
-use crate::storage::Storage;
 use crate::watcher::WatcherManager;
 
 /// Maximum gossip frame size. Must comfortably exceed the largest message
@@ -18,13 +18,14 @@ use crate::watcher::WatcherManager;
 /// and signature. iroh-gossip's default (4096 bytes) kills peer connections
 /// on larger frames; 256 KiB gives ample headroom. All peers must use the
 /// same limit (same wire-compat posture as the message format itself).
-const GOSSIP_MAX_MESSAGE_SIZE: usize = 256 * 1024;
+pub(crate) const GOSSIP_MAX_MESSAGE_SIZE: usize = 256 * 1024;
 
 pub struct BuddiesNode {
+    pub shutdown_token: tokio_util::sync::CancellationToken,
     pub endpoint: Endpoint,
     pub router: Router,
     pub room_manager: Arc<RoomManager>,
-    pub storage: Arc<Storage>,
+    pub storage: Arc<AsyncStorage>,
     pub watcher_manager: Arc<WatcherManager>,
 }
 
@@ -47,12 +48,7 @@ impl BuddiesNode {
             .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
 
-        let storage = if let Some(ref dir) = config.data_dir {
-            std::fs::create_dir_all(dir)?;
-            Arc::new(Storage::open(&dir.join("buddies.redb"))?)
-        } else {
-            Arc::new(Storage::in_memory()?)
-        };
+        let storage = Arc::new(AsyncStorage::open(config.data_dir).await?);
 
         let dirty = Arc::new(DirtySet::new());
         let author = config.user_name.clone();
@@ -69,6 +65,7 @@ impl BuddiesNode {
         let watcher_manager = WatcherManager::new(Arc::clone(&room_manager), dirty, author);
 
         Ok(Self {
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
             endpoint,
             router,
             room_manager,
@@ -90,6 +87,9 @@ impl BuddiesNode {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.shutdown_token.cancel();
+        self.watcher_manager.shutdown().await;
+        self.room_manager.shutdown().await;
         self.router.shutdown().await?;
         Ok(())
     }

@@ -31,12 +31,12 @@ impl LocalSigner {
         }
     }
 
-    pub fn sign(&self, payload: &[u8]) -> Result<Vec<u8>> {
+    pub async fn sign(&self, payload: &[u8]) -> Result<Vec<u8>> {
         match self {
-            Self::Gpg { key_id } => sign_with_gpg(payload, key_id),
+            Self::Gpg { key_id } => sign_with_gpg(payload, key_id).await,
             Self::Ssh {
                 private_key_path, ..
-            } => sign_with_ssh(payload, private_key_path),
+            } => sign_with_ssh(payload, private_key_path).await,
         }
     }
 }
@@ -84,14 +84,14 @@ pub fn discover_startup_identity(data_dir: Option<&Path>) -> Result<Option<Local
     }
 }
 
-pub fn verify_signature(
+pub async fn verify_signature(
     identity: &SignerIdentity,
     payload: &[u8],
     signature: &[u8],
 ) -> Result<bool> {
     match identity {
-        SignerIdentity::Gpg { key_id } => verify_with_gpg(payload, signature, key_id),
-        SignerIdentity::Ssh { public_key } => verify_with_ssh(payload, signature, public_key),
+        SignerIdentity::Gpg { key_id } => verify_with_gpg(payload, signature, key_id).await,
+        SignerIdentity::Ssh { public_key } => verify_with_ssh(payload, signature, public_key).await,
     }
 }
 
@@ -308,146 +308,111 @@ fn resolve_ssh_keys(signing_key: &str) -> Result<(String, PathBuf)> {
     Ok((public_key, priv_path))
 }
 
-fn sign_with_gpg(payload: &[u8], key_id: &str) -> Result<Vec<u8>> {
-    let temp = unique_temp_path("buddies-gpg-sign");
-    let sig = unique_temp_path("buddies-gpg-sign.sig");
+const SIGNING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+static SIGNING_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
-    fs::write(&temp, payload).context("failed to write temporary gpg payload")?;
-
-    let output = Command::new("gpg")
-        .args([
-            "--batch",
-            "--yes",
-            "--local-user",
-            key_id,
-            "--detach-sign",
-            "--output",
-            path_str(&sig)?,
-            path_str(&temp)?,
-        ])
-        .output()
-        .context("failed to invoke gpg for signing")?;
-
-    let _ = fs::remove_file(&temp);
-
-    if !output.status.success() {
-        let _ = fs::remove_file(&sig);
-        anyhow::bail!(
-            "gpg signing failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let signature = fs::read(&sig).context("failed to read gpg signature output")?;
-    let _ = fs::remove_file(&sig);
-    Ok(signature)
+async fn run_command(
+    mut command: tokio::process::Command,
+    input: Option<&[u8]>,
+    deadline: std::time::Duration,
+) -> Result<std::process::Output> {
+    tokio::time::timeout(deadline, async {
+        let _permit = SIGNING_SLOTS.acquire().await?;
+        command
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        let mut child = command.spawn().context("failed to start signing command")?;
+        let stdin = child.stdin.take();
+        let write = async {
+            if let (Some(mut stdin), Some(input)) = (stdin, input) {
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(input).await?;
+            }
+            Ok::<_, std::io::Error>(())
+        };
+        let (output, ()) = tokio::try_join!(child.wait_with_output(), write)?;
+        Ok(output)
+    })
+    .await
+    .context("signing command timed out")?
 }
 
-fn verify_with_gpg(payload: &[u8], signature: &[u8], key_id: &str) -> Result<bool> {
-    let temp = unique_temp_path("buddies-gpg-verify");
-    let sig = unique_temp_path("buddies-gpg-verify.sig");
-    fs::write(&temp, payload).context("failed to write temporary gpg payload")?;
-    fs::write(&sig, signature).context("failed to write temporary gpg signature")?;
+async fn sign_with_gpg(payload: &[u8], key_id: &str) -> Result<Vec<u8>> {
+    let mut command = tokio::process::Command::new("gpg");
+    command.args([
+        "--batch",
+        "--yes",
+        "--local-user",
+        key_id,
+        "--detach-sign",
+        "--output",
+        "-",
+    ]);
+    let output = run_command(command, Some(payload), SIGNING_TIMEOUT).await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "gpg signing failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(output.stdout)
+}
 
-    let output = Command::new("gpg")
-        .args([
-            "--batch",
-            "--status-fd",
-            "1",
-            "--verify",
-            path_str(&sig)?,
-            path_str(&temp)?,
-        ])
-        .output()
-        .context("failed to invoke gpg for verification")?;
+async fn verify_with_gpg(payload: &[u8], signature: &[u8], key_id: &str) -> Result<bool> {
+    let temp = tempfile::tempdir()?;
+    let sig = temp.path().join("signature");
+    let data = temp.path().join("payload");
+    tokio::fs::write(&sig, signature).await?;
+    tokio::fs::write(&data, payload).await?;
+    let mut command = tokio::process::Command::new("gpg");
+    command
+        .args(["--batch", "--status-fd", "1", "--verify"])
+        .arg(&sig)
+        .arg(&data);
+    let output = run_command(command, None, SIGNING_TIMEOUT).await?;
+    Ok(output.status.success()
+        && gpg_status_matches_key(&String::from_utf8_lossy(&output.stdout), key_id))
+}
 
-    let _ = fs::remove_file(&temp);
-    let _ = fs::remove_file(&sig);
+async fn sign_with_ssh(payload: &[u8], private_key_path: &Path) -> Result<Vec<u8>> {
+    let mut command = tokio::process::Command::new("ssh-keygen");
+    command
+        .args(["-Y", "sign", "-f"])
+        .arg(private_key_path)
+        .args(["-n", SSH_NAMESPACE]);
+    let output = run_command(command, Some(payload), SIGNING_TIMEOUT).await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ssh signing failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(output.stdout)
+}
 
-    if !output.status.success() {
+async fn verify_with_ssh(payload: &[u8], signature: &[u8], public_key: &str) -> Result<bool> {
+    // The allow-list file has one line per identity. Never allow a supplied key
+    // to inject an additional principal or verification option.
+    if public_key.contains(['\n', '\r', '\0']) {
         return Ok(false);
     }
-    let status_output = String::from_utf8_lossy(&output.stdout);
-    Ok(gpg_status_matches_key(&status_output, key_id))
-}
-
-fn sign_with_ssh(payload: &[u8], private_key_path: &Path) -> Result<Vec<u8>> {
-    let temp = unique_temp_path("buddies-ssh-sign");
-    fs::write(&temp, payload).context("failed to write temporary ssh payload")?;
-
-    let output = Command::new("ssh-keygen")
-        .args([
-            "-Y",
-            "sign",
-            "-f",
-            path_str(private_key_path)?,
-            "-n",
-            SSH_NAMESPACE,
-            path_str(&temp)?,
-        ])
-        .output()
-        .context("failed to invoke ssh-keygen for signing")?;
-
-    if !output.status.success() {
-        let _ = fs::remove_file(&temp);
-        anyhow::bail!(
-            "ssh signing failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let sig_path = PathBuf::from(format!("{}.sig", temp.display()));
-    let signature = fs::read(&sig_path).context("failed to read ssh signature output")?;
-
-    let _ = fs::remove_file(&temp);
-    let _ = fs::remove_file(&sig_path);
-    Ok(signature)
-}
-
-fn verify_with_ssh(payload: &[u8], signature: &[u8], public_key: &str) -> Result<bool> {
-    let sig = unique_temp_path("buddies-ssh-verify.sig");
-    let allowed = unique_temp_path("buddies-ssh-allowed");
-    fs::write(&sig, signature).context("failed to write temporary ssh signature")?;
-    fs::write(&allowed, format!("buddies {public_key}\n"))
-        .context("failed to write temporary allowed signers")?;
-
-    let mut child = Command::new("ssh-keygen")
-        .args([
-            "-Y",
-            "verify",
-            "-f",
-            path_str(&allowed)?,
-            "-I",
-            "buddies",
-            "-n",
-            SSH_NAMESPACE,
-            "-s",
-            path_str(&sig)?,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to invoke ssh-keygen for verification")?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin
-            .write_all(payload)
-            .context("failed to stream payload to ssh-keygen verify")?;
-    }
-
-    let status = child
-        .wait()
-        .context("ssh-keygen verification process failed")?;
-
-    let _ = fs::remove_file(&sig);
-    let _ = fs::remove_file(&allowed);
-    Ok(status.success())
-}
-
-fn unique_temp_path(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
+    let temp = tempfile::tempdir()?;
+    let sig = temp.path().join("signature");
+    let allowed = temp.path().join("allowed_signers");
+    tokio::fs::write(&sig, signature).await?;
+    tokio::fs::write(&allowed, format!("buddies {public_key}\n")).await?;
+    let mut command = tokio::process::Command::new("ssh-keygen");
+    command
+        .args(["-Y", "verify", "-f"])
+        .arg(&allowed)
+        .args(["-I", "buddies", "-n", SSH_NAMESPACE, "-s"])
+        .arg(&sig);
+    let output = run_command(command, Some(payload), SIGNING_TIMEOUT).await?;
+    Ok(output.status.success())
 }
 
 fn path_str(path: &Path) -> Result<&str> {
@@ -507,5 +472,86 @@ mod tests {
         // Non-hex claims (e.g. an email) cannot be bound to a fingerprint.
         assert!(!gpg_status_matches_key(&out, "alice@example.com"));
         assert!(!gpg_status_matches_key(&out, ""));
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn test_signer() -> (tempfile::TempDir, LocalSigner) {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("key");
+    let status = tokio::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&key)
+        .status()
+        .await
+        .expect("ssh-keygen is required for signature regression tests");
+    assert!(status.success());
+    let public_key = tokio::fs::read_to_string(key.with_extension("pub"))
+        .await
+        .unwrap();
+    (
+        dir,
+        LocalSigner::Ssh {
+            public_key: public_key.trim().to_owned(),
+            private_key_path: key,
+        },
+    )
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ssh_signatures_round_trip_and_reject_tampering() {
+        let (_dir, signer) = test_signer().await;
+        let signature = signer.sign(b"payload").await.unwrap();
+        assert!(
+            verify_signature(&signer.identity(), b"payload", &signature)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !verify_signature(&signer.identity(), b"tampered", &signature)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !verify_signature(&signer.identity(), b"payload", b"invalid")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signing_process_timeout_kills_child_without_blocking_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let pidfile = temp.path().join("pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; exec sleep 30", "sh"])
+            .arg(&pidfile);
+        let result = run_command(command, None, std::time::Duration::from_millis(200)).await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        let pid = tokio::fs::read_to_string(pidfile).await.unwrap();
+        // Reap runs asynchronously after kill_on_drop. Wait for the process to disappear.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let alive = tokio::process::Command::new("kill")
+                    .args(["-0", pid.trim()])
+                    .stderr(Stdio::null())
+                    .status()
+                    .await
+                    .unwrap()
+                    .success();
+                if !alive {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

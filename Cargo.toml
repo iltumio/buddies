@@ -2,12 +2,13 @@
 name = "buddies"
 version = "0.1.4"
 edition = "2024"
+rust-version = "1.91"
 description = "P2P communication layer for AI agents"
 license = "MIT"
 
 [dependencies]
 # MCP protocol
-rmcp = { version = "3.1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "3.4.1", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
 
 # P2P networking
 iroh = "1"
@@ -22,7 +23,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-postcard = { version = "1", features = ["alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 
 # Schema generation — must match rmcp's schemars v1
 schemars = "1"
@@ -39,6 +40,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 data-encoding = "2"
 rand = "0.10"
-dirs = "6"
+dirs = "7"
 whoami = "2"
 axum = "0.8"
+tempfile = "3"

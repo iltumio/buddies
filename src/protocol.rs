@@ -36,6 +36,25 @@ impl SignerIdentity {
         }
     }
 
+    /// Stable voter key: comments and casing must not create extra votes.
+    pub fn voting_label(&self) -> Option<String> {
+        match self {
+            Self::Gpg { key_id }
+                if matches!(key_id.len(), 40 | 64)
+                    && key_id.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                Some(format!("gpg:{}", key_id.to_ascii_uppercase()))
+            }
+            Self::Ssh { public_key } if !public_key.contains(['\n', '\r', '\0']) => {
+                let mut parts = public_key.split_whitespace();
+                let algorithm = parts.next()?;
+                let key = parts.next()?;
+                Some(format!("ssh:{algorithm} {key}"))
+            }
+            _ => None,
+        }
+    }
+
     pub fn parse(label: &str) -> anyhow::Result<Self> {
         let (scheme, value) = label
             .split_once(':')
@@ -196,5 +215,32 @@ mod tests {
     fn signer_identity_parse_rejects_unknown_scheme() {
         let err = SignerIdentity::parse("x509:foo").expect_err("must reject unknown scheme");
         assert!(err.to_string().contains("unsupported identity scheme"));
+    }
+    #[test]
+    fn voter_labels_do_not_allow_comment_or_case_aliases() {
+        let a = SignerIdentity::Ssh {
+            public_key: "ssh-ed25519 AAAA alice".into(),
+        };
+        let b = SignerIdentity::Ssh {
+            public_key: "ssh-ed25519 AAAA bob".into(),
+        };
+        assert_eq!(a.voting_label(), b.voting_label());
+        assert_eq!(
+            SignerIdentity::Gpg {
+                key_id: "abcd".repeat(10)
+            }
+            .voting_label(),
+            SignerIdentity::Gpg {
+                key_id: "ABCD".repeat(10)
+            }
+            .voting_label()
+        );
+        assert!(
+            SignerIdentity::Gpg {
+                key_id: "ABCD1234".into()
+            }
+            .voting_label()
+            .is_none()
+        );
     }
 }

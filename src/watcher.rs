@@ -191,6 +191,7 @@ pub struct WatcherManager {
     room_manager: Arc<RoomManager>,
     dirty: Arc<DirtySet>,
     author: String,
+    closing: std::sync::atomic::AtomicBool,
     watchers: tokio::sync::Mutex<HashMap<PathBuf, WatchedRepo>>,
 }
 
@@ -212,6 +213,7 @@ impl WatcherManager {
             room_manager,
             dirty,
             author,
+            closing: std::sync::atomic::AtomicBool::new(false),
             watchers: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
@@ -235,6 +237,10 @@ impl WatcherManager {
         }
 
         let mut watchers = self.watchers.lock().await;
+        anyhow::ensure!(
+            !self.closing.load(std::sync::atomic::Ordering::SeqCst),
+            "node is shutting down"
+        );
         if let Some(existing) = watchers.get(&repo_path) {
             return Ok(existing.state.clone());
         }
@@ -321,6 +327,19 @@ impl WatcherManager {
         Ok(state)
     }
 
+    pub async fn shutdown(&self) {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let watchers = std::mem::take(&mut *self.watchers.lock().await);
+        for watched in watchers.values() {
+            watched.scan_task.abort();
+        }
+        for (_, watched) in watchers {
+            let _ = watched.scan_task.await;
+            self.dirty.clear_repo(&watched.state.repo);
+        }
+    }
+
     pub async fn unwatch(&self, repo_path: &Path) -> Result<bool> {
         let repo_path = repo_path
             .canonicalize()
@@ -329,6 +348,7 @@ impl WatcherManager {
         match watchers.remove(&repo_path) {
             Some(watched) => {
                 watched.scan_task.abort();
+                let _ = watched.scan_task.await;
                 self.dirty.clear_repo(&watched.state.repo);
                 Ok(true)
             }
@@ -705,5 +725,49 @@ mod tests {
         assert!(!should_scan_event(&access, repo));
         assert!(!should_scan_event(&git_change, repo));
         assert!(should_scan_event(&source_change, repo));
+    }
+    #[tokio::test]
+    async fn node_shutdown_stops_active_watchers_and_clears_dirty_state() {
+        let repo = fixture_repo().await;
+        let node = BuddiesNode::new(BuddiesNodeConfig {
+            user_name: "local".into(),
+            agent_name: "test".into(),
+            data_dir: None,
+            signer: None,
+        })
+        .await
+        .unwrap();
+        node.room_manager.join_room("room", vec![]).await.unwrap();
+        tokio::fs::write(repo.join("tracked.txt"), "dirty\n")
+            .await
+            .unwrap();
+        node.watcher_manager
+            .watch(&repo, "room", Some("fixture".into()))
+            .await
+            .unwrap();
+        wait_until(|| {
+            node.watcher_manager
+                .dirty
+                .is_dirty("fixture", "tracked.txt")
+        })
+        .await;
+        node.shutdown().await.unwrap();
+        assert!(node.shutdown_token.is_cancelled());
+        assert!(node.watcher_manager.watchers.lock().await.is_empty());
+        assert!(
+            !node
+                .watcher_manager
+                .dirty
+                .is_dirty("fixture", "tracked.txt")
+        );
+        assert!(node.room_manager.list_rooms().await.is_empty());
+        assert!(node.room_manager.join_room("room", vec![]).await.is_err());
+        assert!(
+            node.watcher_manager
+                .watch(&repo, "room", None)
+                .await
+                .is_err()
+        );
+        tokio::fs::remove_dir_all(repo).await.unwrap();
     }
 }

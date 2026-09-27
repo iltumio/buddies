@@ -11,15 +11,19 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::activity::{ConflictEvent, DirtySet};
+use crate::async_storage::AsyncStorage;
 use crate::identity::{LocalSigner, verify_signature};
 use crate::memory::{MemoryEntry, SearchFilters};
+use crate::pending::PendingRequests;
 use crate::protocol::{
     P2PMessage, P2PMessageBody, SignerIdentity, TaskResult, TopicId, room_to_topic,
 };
 use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult, SkillVote};
-use crate::storage::Storage;
 
 const MAX_PENDING_TASKS: usize = 100;
+const MAX_SEARCH_SECONDS: u64 = 30;
+const MAX_TASK_SECONDS: u32 = 300;
+const MAX_SEARCH_RESULTS: usize = 50;
 
 /// How far a signed message's `sent_at` may deviate from local time (in
 /// either direction, to tolerate clock skew) before it is dropped as stale.
@@ -121,18 +125,32 @@ struct RoomInner {
     _receiver_handle: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct MemorySearch {
+    sender: tokio::sync::mpsc::Sender<Vec<MemoryEntry>>,
+    query: String,
+    filters: SearchFilters,
+}
+
+#[derive(Clone)]
+struct SkillSearch {
+    sender: tokio::sync::mpsc::Sender<Vec<SkillSearchResult>>,
+    query: String,
+    filters: SkillSearchFilters,
+}
+
 pub struct RoomManager {
     gossip: Gossip,
+    closing: std::sync::atomic::AtomicBool,
     user_name: String,
     agent_name: String,
     rooms: RwLock<HashMap<String, RoomInner>>,
     peers: Arc<RwLock<HashMap<String, HashMap<String, PeerInfo>>>>,
-    storage: Arc<Storage>,
-    pending_searches: Arc<Mutex<HashMap<Uuid, tokio::sync::mpsc::Sender<Vec<MemoryEntry>>>>>,
-    pending_skill_searches:
-        Arc<Mutex<HashMap<Uuid, tokio::sync::mpsc::Sender<Vec<SkillSearchResult>>>>>,
+    storage: Arc<AsyncStorage>,
+    pending_searches: PendingRequests<MemorySearch>,
+    pending_skill_searches: PendingRequests<SkillSearch>,
     incoming_tasks: Arc<Mutex<Vec<PendingTask>>>,
-    task_waiters: Arc<Mutex<HashMap<Uuid, oneshot::Sender<TaskResult>>>>,
+    task_waiters: PendingRequests<oneshot::Sender<TaskResult>>,
     task_notify: Arc<tokio::sync::Notify>,
     task_broadcast: tokio::sync::broadcast::Sender<PendingTask>,
     signer: Option<LocalSigner>,
@@ -149,21 +167,22 @@ impl RoomManager {
         gossip: Gossip,
         user_name: String,
         agent_name: String,
-        storage: Arc<Storage>,
+        storage: Arc<AsyncStorage>,
         signer: Option<LocalSigner>,
         dirty: Arc<DirtySet>,
     ) -> Arc<Self> {
         Arc::new(Self {
             gossip,
+            closing: std::sync::atomic::AtomicBool::new(false),
             user_name,
             agent_name,
             rooms: RwLock::new(HashMap::new()),
             peers: Arc::new(RwLock::new(HashMap::new())),
             storage,
-            pending_searches: Arc::new(Mutex::new(HashMap::new())),
-            pending_skill_searches: Arc::new(Mutex::new(HashMap::new())),
+            pending_searches: PendingRequests::default(),
+            pending_skill_searches: PendingRequests::default(),
             incoming_tasks: Arc::new(Mutex::new(Vec::new())),
-            task_waiters: Arc::new(Mutex::new(HashMap::new())),
+            task_waiters: PendingRequests::default(),
             task_notify: Arc::new(tokio::sync::Notify::new()),
             task_broadcast: tokio::sync::broadcast::channel(64).0,
             signer,
@@ -191,46 +210,42 @@ impl RoomManager {
         self.signer.as_ref().map(|s| s.identity().to_label())
     }
 
-    /// Sign a skill entry in place using the local signer (if configured).
-    pub fn try_sign_skill(&self, entry: &mut SkillEntry) {
-        let Some(signer) = self.signer.as_ref() else {
-            return;
-        };
-        let payload = entry.signing_payload();
-        match signer.sign(&payload) {
-            Ok(signature) => {
-                entry.signed_by = Some(signer.identity());
-                entry.signature = Some(signature);
-            }
-            Err(error) => {
-                warn!(%error, "failed to sign skill; publishing unsigned");
-            }
-        }
+    pub fn voter_identity_label(&self) -> Option<String> {
+        self.signer.as_ref()?.identity().voting_label()
     }
 
-    /// Verify the embedded signature on a skill entry.
-    /// Returns `true` if the signature is valid or absent (unsigned skills are
-    /// accepted unless room policy rejects them).
-    pub fn verify_skill_signature(&self, room_name: &str, entry: &SkillEntry) -> bool {
-        let Some(identity) = entry.signed_by.as_ref() else {
-            return true; // unsigned — room policy decides acceptance
-        };
-        let Some(signature) = entry.signature.as_ref() else {
-            warn!(room = %room_name, skill = %entry.hash, "skill has signer but no signature");
-            return false;
-        };
-        let payload = entry.signing_payload();
-        match verify_signature(identity, &payload, signature) {
-            Ok(true) => true,
-            Ok(false) => {
-                warn!(room = %room_name, skill = %entry.hash, identity = %identity.to_label(), "skill signature verification failed");
-                false
-            }
-            Err(error) => {
-                warn!(room = %room_name, skill = %entry.hash, %error, "skill signature verification errored");
-                false
-            }
+    /// An explicitly configured signer must succeed; never silently downgrade.
+    pub async fn try_sign_skill(&self, entry: &mut SkillEntry) -> Result<()> {
+        if let Some(signer) = &self.signer {
+            entry.signature = Some(signer.sign(&entry.signing_payload()).await?);
+            entry.signed_by = Some(signer.identity());
         }
+        Ok(())
+    }
+
+    async fn validate_skill(&self, room_name: &str, entry: &SkillEntry) -> bool {
+        let (whitelist, require_signed) = self.get_identity_policy(room_name).await;
+        crate::validation::validate_skill(room_name, entry, &whitelist, require_signed).await
+    }
+
+    async fn memory_results_for_peer(
+        &self,
+        room: &str,
+        query: &str,
+        mut filters: SearchFilters,
+    ) -> Result<Vec<MemoryEntry>> {
+        filters.room = Some(room.to_owned());
+        self.storage.search(query, &filters, 20).await
+    }
+
+    async fn skill_results_for_peer(
+        &self,
+        room: &str,
+        query: &str,
+        mut filters: SkillSearchFilters,
+    ) -> Result<Vec<SkillSearchResult>> {
+        filters.room = Some(room.to_owned());
+        self.storage.search_skills(query, &filters, 20).await
     }
 
     pub async fn set_identity_policy(
@@ -283,6 +298,10 @@ impl RoomManager {
         room_name: &str,
         bootstrap_peers: Vec<iroh::EndpointId>,
     ) -> Result<TopicId> {
+        anyhow::ensure!(
+            !self.closing.load(std::sync::atomic::Ordering::SeqCst),
+            "node is shutting down"
+        );
         let topic_id = room_to_topic(room_name);
 
         {
@@ -306,7 +325,9 @@ impl RoomManager {
             name: self.user_name.clone(),
             agent: self.agent_name.clone(),
         });
-        sender.broadcast(join_msg.to_bytes()).await?;
+        sender
+            .broadcast(self.try_sign_message(join_msg).await?.to_bytes())
+            .await?;
 
         let room_name_owned = room_name.to_string();
         let manager = Arc::clone(self);
@@ -323,6 +344,11 @@ impl RoomManager {
 
         {
             let mut rooms = self.rooms.write().await;
+            if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                receiver_handle.abort();
+                let _ = receiver_handle.await;
+                anyhow::bail!("node is shutting down");
+            }
             rooms.insert(
                 room_name.to_string(),
                 RoomInner {
@@ -345,8 +371,11 @@ impl RoomManager {
             let leave_msg = P2PMessage::new(P2PMessageBody::Leave {
                 name: self.user_name.clone(),
             });
-            let _ = room.sender.broadcast(leave_msg.to_bytes()).await;
+            if let Ok(msg) = self.try_sign_message(leave_msg).await {
+                let _ = room.sender.broadcast(msg.to_bytes()).await;
+            }
             room._receiver_handle.abort();
+            let _ = room._receiver_handle.await;
         }
 
         {
@@ -355,6 +384,23 @@ impl RoomManager {
         }
 
         Ok(())
+    }
+
+    pub async fn shutdown(&self) {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let rooms = std::mem::take(&mut *self.rooms.write().await);
+        for room in rooms.values() {
+            room._receiver_handle.abort();
+        }
+        for (_, room) in rooms {
+            let _ = room._receiver_handle.await;
+        }
+        self.peers.write().await.clear();
+        self.pending_searches.clear();
+        self.pending_skill_searches.clear();
+        self.task_waiters.clear();
+        self.incoming_tasks.lock().await.clear();
     }
 
     pub async fn is_joined(&self, room_name: &str) -> bool {
@@ -373,31 +419,30 @@ impl RoomManager {
     }
 
     pub async fn broadcast_to_room(&self, room_name: &str, msg: P2PMessage) -> Result<()> {
-        let msg = self.try_sign_message(msg);
-        let rooms = self.rooms.read().await;
-        let room = rooms
+        let sender = self
+            .rooms
+            .read()
+            .await
             .get(room_name)
-            .ok_or_else(|| anyhow::anyhow!("not in room: {room_name}"))?;
-        room.sender.broadcast(msg.to_bytes()).await?;
+            .ok_or_else(|| anyhow::anyhow!("not in room: {room_name}"))?
+            .sender
+            .clone();
+        let msg = self.try_sign_message(msg).await?;
+        let bytes = msg.to_bytes();
+        anyhow::ensure!(
+            bytes.len() <= crate::node::GOSSIP_MAX_MESSAGE_SIZE,
+            "gossip message exceeds size limit"
+        );
+        sender.broadcast(bytes).await?;
         Ok(())
     }
 
-    fn try_sign_message(&self, mut msg: P2PMessage) -> P2PMessage {
-        let Some(signer) = self.signer.as_ref() else {
-            return msg;
-        };
-        let payload = msg.signing_payload();
-        match signer.sign(&payload) {
-            Ok(signature) => {
-                msg.signed_by = Some(signer.identity());
-                msg.signature = Some(signature);
-                msg
-            }
-            Err(error) => {
-                warn!(%error, "failed to sign outgoing message; sending unsigned");
-                msg
-            }
+    async fn try_sign_message(&self, mut msg: P2PMessage) -> Result<P2PMessage> {
+        if let Some(signer) = &self.signer {
+            msg.signature = Some(signer.sign(&msg.signing_payload()).await?);
+            msg.signed_by = Some(signer.identity());
         }
+        Ok(msg)
     }
 
     pub async fn search_distributed(
@@ -407,15 +452,27 @@ impl RoomManager {
         filters: &SearchFilters,
         timeout_secs: u64,
     ) -> Result<Vec<MemoryEntry>> {
-        let mut local_results = self.storage.search(query, filters, 50)?;
+        anyhow::ensure!(
+            timeout_secs <= MAX_SEARCH_SECONDS,
+            "search timeout exceeds 30 seconds"
+        );
+        let mut filters = filters.clone();
+        filters.room = Some(room_name.to_owned());
+        let mut local_results = self.storage.search(query, &filters, 50).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
         let request_id = Uuid::new_v4();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<MemoryEntry>>(32);
 
-        {
-            let mut pending = self.pending_searches.lock().await;
-            pending.insert(request_id, tx);
-        }
+        let _registration = self.pending_searches.register(
+            request_id,
+            room_name,
+            MemorySearch {
+                sender: tx,
+                query: query.to_owned(),
+                filters: filters.clone(),
+            },
+        )?;
 
         let search_msg = P2PMessage::new(P2PMessageBody::SearchRequest {
             request_id,
@@ -423,27 +480,26 @@ impl RoomManager {
             filters: filters.clone(),
         });
 
-        if let Err(e) = self.broadcast_to_room(room_name, search_msg).await {
-            debug!(error = %e, "no peers to search (broadcasting failed)");
+        if !matches!(
+            tokio::time::timeout_at(deadline, self.broadcast_to_room(room_name, search_msg)).await,
+            Ok(Ok(()))
+        ) {
+            return Ok(local_results);
         }
 
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+        let deadline = tokio::time::sleep_until(deadline);
         tokio::pin!(deadline);
 
         loop {
             tokio::select! {
                 Some(results) = rx.recv() => {
                     local_results.extend(results);
+                    local_results = Self::finalize_memory_results(local_results, MAX_SEARCH_RESULTS);
                 }
                 () = &mut deadline => {
                     break;
                 }
             }
-        }
-
-        {
-            let mut pending = self.pending_searches.lock().await;
-            pending.remove(&request_id);
         }
 
         Ok(Self::finalize_memory_results(local_results, 50))
@@ -456,15 +512,27 @@ impl RoomManager {
         filters: &SkillSearchFilters,
         timeout_secs: u64,
     ) -> Result<Vec<SkillSearchResult>> {
-        let mut local_results = self.storage.search_skills(query, filters, 50)?;
+        anyhow::ensure!(
+            timeout_secs <= MAX_SEARCH_SECONDS,
+            "search timeout exceeds 30 seconds"
+        );
+        let mut filters = filters.clone();
+        filters.room = Some(room_name.to_owned());
+        let mut local_results = self.storage.search_skills(query, &filters, 50).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
         let request_id = Uuid::new_v4();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<SkillSearchResult>>(32);
 
-        {
-            let mut pending = self.pending_skill_searches.lock().await;
-            pending.insert(request_id, tx);
-        }
+        let _registration = self.pending_skill_searches.register(
+            request_id,
+            room_name,
+            SkillSearch {
+                sender: tx,
+                query: query.to_owned(),
+                filters: filters.clone(),
+            },
+        )?;
 
         let search_msg = P2PMessage::new(P2PMessageBody::SkillSearchRequest {
             request_id,
@@ -472,27 +540,27 @@ impl RoomManager {
             filters: filters.clone(),
         });
 
-        if let Err(e) = self.broadcast_to_room(room_name, search_msg).await {
-            debug!(error = %e, "no peers to search skills (broadcasting failed)");
+        if !matches!(
+            tokio::time::timeout_at(deadline, self.broadcast_to_room(room_name, search_msg)).await,
+            Ok(Ok(()))
+        ) {
+            return Ok(local_results);
         }
 
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+        let deadline = tokio::time::sleep_until(deadline);
         tokio::pin!(deadline);
 
         loop {
             tokio::select! {
                 Some(results) = rx.recv() => {
                     Self::merge_skill_results(&mut local_results, results);
+                    local_results.sort_by_key(|r| (std::cmp::Reverse(r.rank), std::cmp::Reverse(r.entry.timestamp)));
+                    local_results.truncate(MAX_SEARCH_RESULTS);
                 }
                 () = &mut deadline => {
                     break;
                 }
             }
-        }
-
-        {
-            let mut pending = self.pending_skill_searches.lock().await;
-            pending.remove(&request_id);
         }
 
         local_results.sort_by(|a, b| {
@@ -511,13 +579,16 @@ impl RoomManager {
         description: &str,
         timeout_secs: u32,
     ) -> Result<TaskResult> {
+        anyhow::ensure!(
+            timeout_secs > 0 && timeout_secs <= MAX_TASK_SECONDS,
+            "task timeout must be 1..=300 seconds"
+        );
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.into());
         let task_id = Uuid::new_v4();
         let (tx, rx) = oneshot::channel::<TaskResult>();
 
-        {
-            let mut waiters = self.task_waiters.lock().await;
-            waiters.insert(task_id, tx);
-        }
+        let _registration = self.task_waiters.register(task_id, room_name, tx)?;
 
         let now = now_unix();
 
@@ -530,15 +601,9 @@ impl RoomManager {
             timestamp: now,
         });
 
-        self.broadcast_to_room(room_name, msg).await?;
+        tokio::time::timeout_at(deadline, self.broadcast_to_room(room_name, msg)).await??;
 
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs as u64), rx).await;
-
-        {
-            let mut waiters = self.task_waiters.lock().await;
-            waiters.remove(&task_id);
-        }
+        let result = tokio::time::timeout_at(deadline, rx).await;
 
         match result {
             Ok(Ok(task_result)) => Ok(task_result),
@@ -555,7 +620,7 @@ impl RoomManager {
         let mut tasks = self.incoming_tasks.lock().await;
         let now = now_unix();
 
-        tasks.retain(|t| now < t.timestamp + t.timeout_secs as u64);
+        tasks.retain(|t| now < t.timestamp.saturating_add(t.timeout_secs as u64));
 
         let (matching, remaining): (Vec<_>, Vec<_>) = tasks
             .drain(..)
@@ -570,14 +635,17 @@ impl RoomManager {
         room_filter: Option<&str>,
         timeout_secs: u64,
     ) -> Vec<PendingTask> {
+        let notified = self.task_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         let immediate = self.poll_tasks(room_filter).await;
         if !immediate.is_empty() {
             return immediate;
         }
 
         let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            self.task_notify.notified(),
+            std::time::Duration::from_secs(timeout_secs.min(MAX_SEARCH_SECONDS)),
+            notified,
         )
         .await;
 
@@ -663,7 +731,10 @@ impl RoomManager {
                 }
             }
             P2PMessageBody::MemoryCreated { entry } => {
-                if let Err(e) = self.storage.store(&entry) {
+                if entry.room != room_name {
+                    return;
+                }
+                if let Err(e) = self.storage.store(&entry).await {
                     warn!(error = %e, "failed to store received memory");
                 }
             }
@@ -683,10 +754,16 @@ impl RoomManager {
                 query,
                 filters,
             } => {
-                let results = self
-                    .storage
-                    .search(&query, &filters, 20)
-                    .unwrap_or_default();
+                let results = match self
+                    .memory_results_for_peer(room_name, &query, filters)
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(error) => {
+                        warn!(%error, "memory search failed");
+                        return;
+                    }
+                };
                 if !results.is_empty() {
                     let response = P2PMessage::new(P2PMessageBody::SearchResponse {
                         request_id,
@@ -703,9 +780,16 @@ impl RoomManager {
                 results,
                 ..
             } => {
-                let pending = self.pending_searches.lock().await;
-                if let Some(tx) = pending.get(&request_id) {
-                    let _ = tx.send(results).await;
+                if let Some(pending) = self.pending_searches.get(request_id, room_name) {
+                    let results = results
+                        .into_iter()
+                        .filter(|entry| {
+                            entry.matches_filters(&pending.filters)
+                                && entry.matches_query(&pending.query)
+                        })
+                        .take(MAX_SEARCH_RESULTS)
+                        .collect();
+                    let _ = pending.sender.try_send(results);
                 }
             }
             P2PMessageBody::TaskRequest {
@@ -716,11 +800,20 @@ impl RoomManager {
                 timeout_secs,
                 timestamp,
             } => {
-                if source_peer == self.user_name {
+                if room != room_name
+                    || timeout_secs == 0
+                    || timeout_secs > MAX_TASK_SECONDS
+                    || !is_message_fresh(timestamp, now_unix())
+                    || source_peer == self.user_name
+                {
                     return;
                 }
                 info!(task_id = %task_id, from = %source_peer, "received delegated task");
                 let mut tasks = self.incoming_tasks.lock().await;
+                tasks.retain(|t| now_unix() < t.timestamp.saturating_add(t.timeout_secs.into()));
+                if tasks.iter().any(|t| t.task_id == task_id) {
+                    return;
+                }
                 if tasks.len() >= MAX_PENDING_TASKS {
                     warn!("incoming task queue full, dropping task {task_id}");
                     return;
@@ -751,21 +844,16 @@ impl RoomManager {
                 completed_by,
             } => {
                 info!(task_id = %task_id, by = %completed_by, "received task result");
-                let mut waiters = self.task_waiters.lock().await;
-                if let Some(tx) = waiters.remove(&task_id) {
+                if let Some(tx) = self.task_waiters.remove(task_id, room_name) {
                     let _ = tx.send(result);
                 }
             }
             P2PMessageBody::SkillPublished { entry } => {
-                if !entry.verify_content_hash() {
-                    warn!(room = %room_name, skill = %entry.hash, "dropped skill whose hash does not match its content");
+                if !self.validate_skill(room_name, &entry).await {
+                    warn!(room = %room_name, "dropped invalid skill");
                     return;
                 }
-                if !self.verify_skill_signature(room_name, &entry) {
-                    warn!(room = %room_name, skill = %entry.hash, "dropped skill with invalid signature");
-                    return;
-                }
-                if let Err(e) = self.storage.store_skill(&entry) {
+                if let Err(e) = self.storage.store_skill(&entry).await {
                     warn!(error = %e, "failed to store received skill");
                 }
             }
@@ -774,10 +862,16 @@ impl RoomManager {
                 query,
                 filters,
             } => {
-                let results = self
-                    .storage
-                    .search_skills(&query, &filters, 20)
-                    .unwrap_or_default();
+                let results = match self
+                    .skill_results_for_peer(room_name, &query, filters)
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(error) => {
+                        warn!(%error, "skill search failed");
+                        return;
+                    }
+                };
                 if !results.is_empty() {
                     let response = P2PMessage::new(P2PMessageBody::SkillSearchResponse {
                         request_id,
@@ -794,9 +888,23 @@ impl RoomManager {
                 results,
                 ..
             } => {
-                let pending = self.pending_skill_searches.lock().await;
-                if let Some(tx) = pending.get(&request_id) {
-                    let _ = tx.send(results).await;
+                if let Some(pending) = self.pending_skill_searches.get(request_id, room_name) {
+                    let mut validated = Vec::new();
+                    for mut result in results.into_iter().take(MAX_SEARCH_RESULTS) {
+                        if result.entry.matches_filters(&pending.filters)
+                            && result.entry.matches_query(&pending.query)
+                            && self.validate_skill(room_name, &result.entry).await
+                        {
+                            // Peer-provided aggregate ranks have no proof. Only use local votes.
+                            let Ok(rank) = self.storage.get_skill_rank(&result.entry.hash).await
+                            else {
+                                return;
+                            };
+                            result.rank = rank;
+                            validated.push(result);
+                        }
+                    }
+                    let _ = pending.sender.try_send(validated);
                 }
             }
             P2PMessageBody::SkillVoteCast {
@@ -804,6 +912,18 @@ impl RoomManager {
                 voter,
                 score,
             } => {
+                let Some(identity) = signed_by else {
+                    return;
+                };
+                if Some(&voter) != identity.voting_label().as_ref() {
+                    return;
+                }
+                let Ok(Some(skill)) = self.storage.get_skill(&skill_hash).await else {
+                    return;
+                };
+                if skill.room != room_name {
+                    return;
+                }
                 let now = now_unix();
                 let vote = SkillVote {
                     skill_hash,
@@ -811,7 +931,7 @@ impl RoomManager {
                     score,
                     timestamp: now,
                 };
-                if let Err(e) = self.storage.vote_skill(&vote) {
+                if let Err(e) = self.storage.vote_skill(&vote).await {
                     warn!(error = %e, "failed to store received skill vote");
                 }
             }
@@ -830,7 +950,7 @@ impl RoomManager {
                     warn!(room = %room_name, author = %entry.author, reason, "dropped invalid file activity");
                     return;
                 }
-                if let Err(e) = self.storage.store_file_activity(&entry, now_unix()) {
+                if let Err(e) = self.storage.store_file_activity(&entry, now_unix()).await {
                     warn!(error = %e, "failed to store received file activity");
                 }
                 if let Some(local) = self.dirty.get(&entry.repo, &entry.path) {
@@ -854,13 +974,11 @@ impl RoomManager {
         results
     }
 
-    /// Merge peer skill results into the accumulated list. Votes replicate to
-    /// every peer via gossip, so each peer's rank already reflects the full
-    /// vote set — take the max instead of summing to avoid double-counting.
+    /// Merge validated results; ranks have already been recomputed from local votes.
     fn merge_skill_results(local: &mut Vec<SkillSearchResult>, incoming: Vec<SkillSearchResult>) {
         for result in incoming {
             if let Some(existing) = local.iter_mut().find(|r| r.entry.hash == result.entry.hash) {
-                existing.rank = existing.rank.max(result.rank);
+                existing.rank = result.rank;
             } else {
                 local.push(result);
             }
@@ -896,7 +1014,7 @@ impl RoomManager {
         }
 
         let payload = msg.signing_payload();
-        match verify_signature(identity, &payload, signature) {
+        match verify_signature(identity, &payload, signature).await {
             Ok(true) => {}
             Ok(false) => {
                 warn!(room = %room_name, identity = %identity.to_label(), "signature verification failed");
@@ -1119,6 +1237,7 @@ mod tests {
         assert!(
             node.storage
                 .get_file_activity("repo", None, now)
+                .await
                 .expect("read activity")
                 .is_empty()
         );
@@ -1135,6 +1254,7 @@ mod tests {
         assert_eq!(
             node.storage
                 .get_file_activity("repo", None, now)
+                .await
                 .expect("read activity"),
             vec![peer.clone()]
         );
@@ -1272,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_skill_results_takes_max_rank_instead_of_summing() {
+    fn merge_skill_results_uses_latest_locally_computed_rank() {
         let mut local = vec![skill_result("hash-a", 3)];
 
         // Peer's rank reflects the same replicated votes, plus one vote we
@@ -1287,5 +1407,382 @@ mod tests {
         assert_eq!(local[0].rank, 4);
         assert_eq!(local[1].entry.hash, "hash-b");
         assert_eq!(local[1].rank, 1);
+    }
+    async fn regression_node() -> BuddiesNode {
+        BuddiesNode::new(BuddiesNodeConfig {
+            user_name: "local".into(),
+            agent_name: "test".into(),
+            data_dir: None,
+            signer: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn regression_rejects_cross_room_memory() {
+        let node = regression_node().await;
+        let entry = memory("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", now_unix());
+        node.room_manager
+            .handle_verified_message(
+                "room-b",
+                P2PMessage::new(P2PMessageBody::MemoryCreated {
+                    entry: entry.clone(),
+                }),
+            )
+            .await;
+        assert!(node.storage.get(entry.id).await.unwrap().is_none());
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn regression_failed_broadcast_cleans_task_waiter() {
+        let node = regression_node().await;
+        assert!(
+            node.room_manager
+                .delegate_task("not-joined", "test", 1)
+                .await
+                .is_err()
+        );
+        assert!(node.room_manager.task_waiters.len() == 0);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn regression_rejects_forged_voter() {
+        let node = regression_node().await;
+        let mut msg = P2PMessage::new(P2PMessageBody::SkillVoteCast {
+            skill_hash: "hash".into(),
+            voter: "victim".into(),
+            score: 1,
+        });
+        msg.signed_by = Some(SignerIdentity::Gpg {
+            key_id: "ATTACKER".into(),
+        });
+        node.room_manager
+            .handle_verified_message("room-a", msg)
+            .await;
+        assert_eq!(node.storage.get_skill_rank("hash").await.unwrap(), 0);
+        node.shutdown().await.unwrap();
+    }
+    fn valid_skill(title: &str, room: &str) -> SkillEntry {
+        let mut entry = skill_result(title, 0).entry;
+        entry.room = room.to_owned();
+        entry.hash = crate::skill::skill_content_hash(&entry.title, &entry.content, &entry.tags);
+        entry
+    }
+
+    #[tokio::test]
+    async fn regression_peer_queries_cannot_read_other_rooms() {
+        let node = regression_node().await;
+        let entry = memory("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1);
+        node.storage.store(&entry).await.unwrap();
+        node.storage
+            .store_skill(&valid_skill("secret", "room-a"))
+            .await
+            .unwrap();
+        for room in [None, Some("room-a".to_owned())] {
+            let memories = node
+                .room_manager
+                .memory_results_for_peer(
+                    "room-b",
+                    "",
+                    SearchFilters {
+                        room: room.clone(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let skills = node
+                .room_manager
+                .skill_results_for_peer(
+                    "room-b",
+                    "",
+                    SkillSearchFilters {
+                        room,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(memories.is_empty());
+            assert!(skills.is_empty());
+        }
+        assert_eq!(
+            node.room_manager
+                .memory_results_for_peer("room-a", "", SearchFilters::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            node.room_manager
+                .skill_results_for_peer("room-a", "", SkillSearchFilters::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn regression_skill_responses_verify_content_signature_filters_and_rank() {
+        let node = regression_node().await;
+        let (_dir, signer) = crate::identity::test_signer().await;
+        let identity = signer.identity();
+        let mut valid = valid_skill("wanted", "room-a");
+        valid.signature = Some(signer.sign(&valid.signing_payload()).await.unwrap());
+        valid.signed_by = Some(identity.clone());
+        node.room_manager
+            .set_identity_policy("room-a", vec![identity.clone()], true)
+            .await;
+        node.storage.store_skill(&valid).await.unwrap();
+        node.storage
+            .vote_skill(&SkillVote {
+                skill_hash: valid.hash.clone(),
+                voter: identity.to_label(),
+                score: -1,
+                timestamp: 0,
+            })
+            .await
+            .unwrap();
+        let mut bad_hash = valid.clone();
+        bad_hash.content = "forged".into();
+        let mut bad_sig = valid.clone();
+        bad_sig.signature = Some(vec![1, 2, 3]);
+        let mut unsigned = valid.clone();
+        unsigned.signature = None;
+        unsigned.signed_by = None;
+        let wrong_room = valid_skill("wanted", "room-b");
+        let wrong_query = valid_skill("unrelated", "room-a");
+        let results = [
+            bad_hash,
+            bad_sig,
+            unsigned,
+            wrong_room,
+            wrong_query,
+            valid.clone(),
+        ]
+        .into_iter()
+        .map(|entry| SkillSearchResult {
+            entry,
+            rank: i64::MAX,
+        })
+        .collect::<Vec<_>>();
+        let request_id = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let _registration = node
+            .room_manager
+            .pending_skill_searches
+            .register(
+                request_id,
+                "room-a",
+                SkillSearch {
+                    sender: tx,
+                    query: "wanted".into(),
+                    filters: SkillSearchFilters {
+                        room: Some("room-a".into()),
+                        tags: None,
+                    },
+                },
+            )
+            .unwrap();
+        let response = || {
+            P2PMessage::new(P2PMessageBody::SkillSearchResponse {
+                request_id,
+                results: results.clone(),
+                peer_name: "peer".into(),
+            })
+        };
+        node.room_manager
+            .handle_verified_message("room-b", response())
+            .await;
+        assert!(rx.try_recv().is_err());
+        node.room_manager
+            .handle_verified_message("room-a", response())
+            .await;
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].entry.hash, valid.hash);
+        assert_eq!(received[0].rank, -1);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn regression_full_response_queue_does_not_block_ingress() {
+        let node = regression_node().await;
+        let request_id = Uuid::new_v4();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(vec![]).unwrap();
+        let _registration = node
+            .room_manager
+            .pending_searches
+            .register(
+                request_id,
+                "room-a",
+                MemorySearch {
+                    sender: tx,
+                    query: "".into(),
+                    filters: SearchFilters {
+                        room: Some("room-a".into()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        let msg = P2PMessage::new(P2PMessageBody::SearchResponse {
+            request_id,
+            results: vec![],
+            peer_name: "peer".into(),
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            node.room_manager.handle_verified_message("room-a", msg),
+        )
+        .await
+        .unwrap();
+        assert!(rx.try_recv().is_ok());
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn regression_cancelled_search_and_task_release_waiters() {
+        let node = regression_node().await;
+        node.room_manager.join_room("room-a", vec![]).await.unwrap();
+        let manager = node.room_manager.clone();
+        let search = tokio::spawn(async move {
+            manager
+                .search_distributed("room-a", "", &SearchFilters::default(), 30)
+                .await
+        });
+        let manager = node.room_manager.clone();
+        let skills = tokio::spawn(async move {
+            manager
+                .search_skills_distributed("room-a", "", &SkillSearchFilters::default(), 30)
+                .await
+        });
+        let manager = node.room_manager.clone();
+        let task = tokio::spawn(async move { manager.delegate_task("room-a", "task", 30).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while node.room_manager.pending_searches.len() == 0
+                || node.room_manager.pending_skill_searches.len() == 0
+                || node.room_manager.task_waiters.len() == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        search.abort();
+        skills.abort();
+        task.abort();
+        let _ = search.await;
+        let _ = skills.await;
+        let _ = task.await;
+        assert_eq!(node.room_manager.pending_searches.len(), 0);
+        assert_eq!(node.room_manager.pending_skill_searches.len(), 0);
+        assert_eq!(node.room_manager.task_waiters.len(), 0);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn regression_rejects_cross_room_skills_tasks_and_task_responses() {
+        let node = regression_node().await;
+        let entry = valid_skill("secret", "room-a");
+        node.room_manager
+            .handle_verified_message(
+                "room-b",
+                P2PMessage::new(P2PMessageBody::SkillPublished {
+                    entry: entry.clone(),
+                }),
+            )
+            .await;
+        assert!(node.storage.get_skill(&entry.hash).await.unwrap().is_none());
+        let task_id = Uuid::new_v4();
+        node.room_manager
+            .handle_verified_message(
+                "room-b",
+                P2PMessage::new(P2PMessageBody::TaskRequest {
+                    task_id,
+                    source_peer: "peer".into(),
+                    room: "room-a".into(),
+                    description: "task".into(),
+                    timeout_secs: 30,
+                    timestamp: now_unix(),
+                }),
+            )
+            .await;
+        assert!(node.room_manager.poll_tasks(None).await.is_empty());
+        let (tx, mut rx) = oneshot::channel();
+        let _registration = node
+            .room_manager
+            .task_waiters
+            .register(task_id, "room-a", tx)
+            .unwrap();
+        let response = || {
+            P2PMessage::new(P2PMessageBody::TaskResponse {
+                task_id,
+                result: TaskResult::Error {
+                    message: "result".into(),
+                },
+                completed_by: "peer".into(),
+            })
+        };
+        node.room_manager
+            .handle_verified_message("room-b", response())
+            .await;
+        assert!(rx.try_recv().is_err());
+        node.room_manager
+            .handle_verified_message("room-a", response())
+            .await;
+        assert!(rx.try_recv().is_ok());
+        node.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn regression_authenticated_votes_are_one_per_identity_and_room() {
+        let node = regression_node().await;
+        let (_dir, signer) = crate::identity::test_signer().await;
+        let identity = signer.identity();
+        let entry = valid_skill("voted", "room-a");
+        node.storage.store_skill(&entry).await.unwrap();
+        let canonical = identity.voting_label().unwrap();
+        for voter in ["forged".to_owned(), identity.to_label()] {
+            if voter == canonical {
+                continue;
+            }
+            let mut msg = P2PMessage::new(P2PMessageBody::SkillVoteCast {
+                skill_hash: entry.hash.clone(),
+                voter,
+                score: 1,
+            });
+            msg.signed_by = Some(identity.clone());
+            node.room_manager
+                .handle_verified_message("room-a", msg)
+                .await;
+        }
+        assert_eq!(node.storage.get_skill_rank(&entry.hash).await.unwrap(), 0);
+        for (room, score, expected) in [
+            ("room-b", 1, 0),
+            ("room-a", 1, 1),
+            ("room-a", 1, 1),
+            ("room-a", -1, -1),
+            ("room-a", 10, -1),
+        ] {
+            let mut msg = P2PMessage::new(P2PMessageBody::SkillVoteCast {
+                skill_hash: entry.hash.clone(),
+                voter: canonical.clone(),
+                score,
+            });
+            msg.signed_by = Some(identity.clone());
+            node.room_manager.handle_verified_message(room, msg).await;
+            assert_eq!(
+                node.storage.get_skill_rank(&entry.hash).await.unwrap(),
+                expected
+            );
+        }
+        node.shutdown().await.unwrap();
     }
 }

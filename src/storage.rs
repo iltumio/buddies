@@ -11,7 +11,8 @@ use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult, SkillVote}
 
 const MEMORIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("memories");
 const SKILLS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("skills");
-const SKILL_VOTES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("skill_votes");
+const SKILL_VOTES_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("verified_skill_votes_v2");
 const FILE_ACTIVITY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("file_activity");
 
 /// Peer file activity older than this is pruned/ignored.
@@ -61,6 +62,13 @@ impl Storage {
         let tx = self.db.begin_write()?;
         {
             let mut table = tx.open_table(MEMORIES_TABLE)?;
+            if let Some(existing) = table.get(key.as_str())? {
+                let existing: MemoryEntry = postcard::from_bytes(existing.value())?;
+                anyhow::ensure!(
+                    existing.room == entry.room,
+                    "memory id belongs to another room"
+                );
+            }
             table.insert(key.as_str(), value.as_slice())?;
         }
         tx.commit()?;
@@ -126,6 +134,13 @@ impl Storage {
         let tx = self.db.begin_write()?;
         {
             let mut table = tx.open_table(SKILLS_TABLE)?;
+            if let Some(existing) = table.get(entry.hash.as_str())? {
+                let existing: SkillEntry = postcard::from_bytes(existing.value())?;
+                anyhow::ensure!(
+                    existing.room == entry.room,
+                    "skill hash belongs to another room"
+                );
+            }
             table.insert(entry.hash.as_str(), value.as_slice())?;
         }
         tx.commit()?;
@@ -164,12 +179,13 @@ impl Storage {
         let tx = self.db.begin_read()?;
         let table = tx.open_table(SKILL_VOTES_TABLE)?;
         let mut rank: i64 = 0;
-        for item in table.iter()? {
+        for item in table.range(prefix.as_str()..)? {
             let (key, value) = item?;
-            if key.value().starts_with(&prefix) {
-                let vote: SkillVote = postcard::from_bytes(value.value())?;
-                rank += vote.score as i64;
+            if !key.value().starts_with(&prefix) {
+                break;
             }
+            let vote: SkillVote = postcard::from_bytes(value.value())?;
+            rank += vote.score as i64;
         }
         Ok(rank)
     }
@@ -191,13 +207,18 @@ impl Storage {
                 candidates.push(entry);
             }
         }
-        drop(table);
-        drop(tx);
-
+        // Aggregate all votes once in the same read snapshot as the skills.
+        let votes = tx.open_table(SKILL_VOTES_TABLE)?;
+        let mut ranks = std::collections::HashMap::<String, i64>::new();
+        for item in votes.iter()? {
+            let (_, value) = item?;
+            let vote: SkillVote = postcard::from_bytes(value.value())?;
+            *ranks.entry(vote.skill_hash).or_default() += i64::from(vote.score);
+        }
         let mut results: Vec<SkillSearchResult> = candidates
             .into_iter()
             .map(|entry| {
-                let rank = self.get_skill_rank(&entry.hash).unwrap_or(0);
+                let rank = ranks.get(&entry.hash).copied().unwrap_or(0);
                 SkillSearchResult { entry, rank }
             })
             .collect();
@@ -543,5 +564,93 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].title, "db decision");
         assert_eq!(matches[0].kind.to_string(), "decision");
+    }
+    #[test]
+    fn ranking_dataset_regression() {
+        use crate::skill::{SkillEntry, SkillSearchFilters, skill_content_hash};
+        let storage = Storage::in_memory().unwrap();
+        for i in 0..200 {
+            let title = format!("skill-{i}");
+            let skill = SkillEntry {
+                hash: skill_content_hash(&title, "body", &[]),
+                title,
+                content: "body".into(),
+                room: "bench".into(),
+                author: "test".into(),
+                timestamp: i,
+                tags: vec![],
+                version: 1,
+                parent_hash: None,
+                signed_by: None,
+                signature: None,
+            };
+            storage.store_skill(&skill).unwrap();
+            for voter in 0..20 {
+                storage
+                    .vote_skill(&SkillVote {
+                        skill_hash: skill.hash.clone(),
+                        voter: format!("gpg:{voter}"),
+                        score: if i == 199 { 1 } else { -1 },
+                        timestamp: 1,
+                    })
+                    .unwrap();
+            }
+        }
+        let start = std::time::Instant::now();
+        let results = storage
+            .search_skills("", &SkillSearchFilters::default(), 50)
+            .unwrap();
+        eprintln!("ranking: 200 skills / 4000 votes: {:?}", start.elapsed());
+        assert_eq!(results.len(), 50);
+        assert_eq!(results[0].entry.title, "skill-199");
+        assert_eq!(results[0].rank, 20);
+        assert_eq!(results[1].rank, -20);
+    }
+    #[test]
+    fn legacy_unverified_votes_do_not_enter_verified_ranking() {
+        use redb::{ReadableDatabase, TableDefinition};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let storage = Storage::open(&path).unwrap();
+        let vote = SkillVote {
+            skill_hash: "hash".into(),
+            voter: "forged".into(),
+            score: 1,
+            timestamp: 0,
+        };
+        let tx = storage.db.begin_write().unwrap();
+        {
+            let mut table = tx
+                .open_table(TableDefinition::<&str, &[u8]>::new("skill_votes"))
+                .unwrap();
+            let bytes = postcard::to_allocvec(&vote).unwrap();
+            table.insert("hash:forged", bytes.as_slice()).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(storage);
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(storage.get_skill_rank("hash").unwrap(), 0);
+        // Old data remains intact for inspection; it is not promoted to trusted data.
+        let tx = storage.db.begin_read().unwrap();
+        let table = tx
+            .open_table(TableDefinition::<&str, &[u8]>::new("skill_votes"))
+            .unwrap();
+        assert!(table.get("hash:forged").unwrap().is_some());
+    }
+
+    #[test]
+    fn skill_search_propagates_corrupt_vote_errors() {
+        let storage = Storage::in_memory().unwrap();
+        let tx = storage.db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(super::SKILL_VOTES_TABLE).unwrap();
+            table.insert("hash:voter", &[255u8][..]).unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(
+            storage
+                .search_skills("", &crate::skill::SkillSearchFilters::default(), 50)
+                .is_err()
+        );
     }
 }

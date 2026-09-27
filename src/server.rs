@@ -85,12 +85,18 @@ fn spawn_notification_forwarder<T>(
     mut receiver: tokio::sync::broadcast::Receiver<T>,
     method: &'static str,
     payload: fn(&T) -> serde_json::Value,
+    shutdown: tokio_util::sync::CancellationToken,
 ) where
     T: Clone + Send + 'static,
 {
     tokio::spawn(async move {
         loop {
-            match receiver.recv().await {
+            let received = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                received = receiver.recv() => received,
+            };
+            match received {
                 Ok(event) => {
                     let notification = ServerNotification::CustomNotification(
                         CustomNotification::new(method, Some(payload(&event))),
@@ -337,6 +343,7 @@ struct SkillSearchResultOutput {
     signed_by: Option<String>,
     timestamp: u64,
     rank: i64,
+    rank_source: &'static str,
 }
 
 impl From<crate::skill::SkillSearchResult> for SkillSearchResultOutput {
@@ -353,6 +360,7 @@ impl From<crate::skill::SkillSearchResult> for SkillSearchResultOutput {
             signed_by: r.entry.signed_by.as_ref().map(|s| s.to_label()),
             timestamp: r.entry.timestamp,
             rank: r.rank,
+            rank_source: "local_verified_votes",
         }
     }
 }
@@ -476,6 +484,7 @@ impl BuddiesServer {
         self.node
             .storage
             .store(&entry)
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let broadcast_msg = P2PMessage::new(P2PMessageBody::MemoryCreated {
@@ -517,6 +526,7 @@ impl BuddiesServer {
             self.node
                 .storage
                 .search(&req.query, &filters, 50)
+                .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
         };
 
@@ -543,6 +553,7 @@ impl BuddiesServer {
             .node
             .storage
             .list(&filters, limit)
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let outputs: Vec<MemoryOutput> = results.into_iter().map(Into::into).collect();
@@ -816,11 +827,16 @@ impl BuddiesServer {
             signature: None,
         };
 
-        self.node.room_manager.try_sign_skill(&mut entry);
+        self.node
+            .room_manager
+            .try_sign_skill(&mut entry)
+            .await
+            .map_err(|e| err(e.to_string()))?;
 
         self.node
             .storage
             .store_skill(&entry)
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let broadcast_msg = P2PMessage::new(P2PMessageBody::SkillPublished {
@@ -861,6 +877,7 @@ impl BuddiesServer {
             self.node
                 .storage
                 .search_skills(&req.query, &filters, 50)
+                .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
         };
 
@@ -880,7 +897,20 @@ impl BuddiesServer {
             return Err(err("score must be 1 (upvote) or -1 (downvote)"));
         }
 
-        let voter = self.node.endpoint.id().to_string();
+        let voter = self
+            .node
+            .room_manager
+            .voter_identity_label()
+            .ok_or_else(|| err("voting requires SSH signing or a full GPG fingerprint"))?;
+        let skill = self
+            .node
+            .storage
+            .get_skill(&req.hash)
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        if skill.is_none_or(|s| s.room != req.room) {
+            return Err(err("skill not found in this room"));
+        }
 
         let vote = SkillVote {
             skill_hash: req.hash.clone(),
@@ -892,6 +922,7 @@ impl BuddiesServer {
         self.node
             .storage
             .vote_skill(&vote)
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let broadcast_msg = P2PMessage::new(P2PMessageBody::SkillVoteCast {
@@ -905,7 +936,12 @@ impl BuddiesServer {
             .broadcast_to_room(&req.room, broadcast_msg)
             .await;
 
-        let rank = self.node.storage.get_skill_rank(&req.hash).unwrap_or(0);
+        let rank = self
+            .node
+            .storage
+            .get_skill_rank(&req.hash)
+            .await
+            .map_err(|e| err(e.to_string()))?;
 
         ok_json(&serde_json::json!({
             "voted": true,
@@ -927,11 +963,17 @@ impl BuddiesServer {
             .node
             .storage
             .get_skill(&req.hash)
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         match entry {
             Some(skill) => {
-                let rank = self.node.storage.get_skill_rank(&req.hash).unwrap_or(0);
+                let rank = self
+                    .node
+                    .storage
+                    .get_skill_rank(&req.hash)
+                    .await
+                    .map_err(|e| err(e.to_string()))?;
                 let output = SkillSearchResultOutput::from(crate::skill::SkillSearchResult {
                     entry: skill,
                     rank,
@@ -989,6 +1031,7 @@ impl BuddiesServer {
             .node
             .storage
             .get_file_activity(&req.repo, req.paths.as_deref(), now_ts())
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let activity: Vec<serde_json::Value> = entries
             .iter()
@@ -1020,6 +1063,7 @@ impl BuddiesServer {
             .node
             .storage
             .get_peer_file_activity(&req.repo, &req.path, &req.peer, now_ts())
+            .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match entry {
             Some(e) => ok_json(&serde_json::json!({
@@ -1041,8 +1085,8 @@ impl BuddiesServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for BuddiesServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions("P2P communication layer for AI agents. \
                  Join rooms to share knowledge, delegate tasks, and coordinate with other agents in real-time. \
                  When you receive a 'notifications/buddies/taskArrived' notification, you MUST: \
@@ -1062,12 +1106,14 @@ impl ServerHandler for BuddiesServer {
             self.node.subscribe_task_events(),
             "notifications/buddies/taskArrived",
             task_notification_payload,
+            self.node.shutdown_token.clone(),
         );
         spawn_notification_forwarder(
             context.peer,
             self.node.subscribe_conflict_events(),
             "notifications/buddies/fileConflict",
             conflict_notification_payload,
+            self.node.shutdown_token.clone(),
         );
     }
 }
