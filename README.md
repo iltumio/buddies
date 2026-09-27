@@ -415,6 +415,25 @@ includes its `agent_id`. `list_rooms` lists that session's memberships, and
 monitor includes everyone and labels each participant `local` or `remote`.
 A room can have active local participants and zero network neighbors.
 
+Room tickets belong to the buddies process, not to individual agents. Use
+`join_room({"room":"my-project"})` on every local client; they all receive the
+same process-owned ticket. To connect an external room, one client supplies
+`join_room({"room":"my-project","ticket":"<external-ticket>"})` once.
+Buddies validates the room and topic, merges the external endpoints, and saves
+the ticket in its database. All subsequent clients join by name, even after
+leaving the room or restarting the service. A new external ticket can update
+peer addresses while the room is already active. Importing a ticket does not
+replace the memberships of other local agents.
+
+The transport identity is now stored in the same database, so endpoint IDs
+survive restarts. Ticket addresses are refreshed for the local endpoint after
+restart; remote relay and direct addresses from imported tickets are retained.
+The first start with this version creates a persistent transport identity;
+previously issued tickets may need to be exchanged once. Keep the data directory
+to retain tickets and identity. Rooms are rejoined on demand, and new MCP
+sessions still call `join_room` by name. A saved ticket supplies connection
+information; it cannot make an offline external process reachable.
+
 `notify_peers` updates the sender's local status and sends
 `notifications/buddies/status` to other local members. `delegate_task` assigns
 one other local member when available, excluding the sender; otherwise it uses

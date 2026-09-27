@@ -36,6 +36,7 @@ jobs:
           cargo build --locked
           python3 scripts/smoke_mcp.py
           python3 scripts/smoke_local_agents.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/smoke_room_tickets.py
 
   msrv:
     runs-on: ubuntu-latest

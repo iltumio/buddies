@@ -16,7 +16,6 @@ use crate::node::BuddiesNode;
 use crate::protocol::{P2PMessage, P2PMessageBody, SignerIdentity, TaskResult};
 use crate::room::PendingTask;
 use crate::skill::{SkillEntry, SkillSearchFilters, SkillVote, skill_content_hash};
-use crate::ticket::RoomTicket;
 
 #[derive(Clone)]
 pub struct BuddiesServer {
@@ -137,7 +136,9 @@ fn spawn_notification_forwarder<T>(
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JoinRoomRequest {
     pub room: String,
-    #[schemars(description = "Optional ticket string from another peer to bootstrap connection")]
+    #[schemars(
+        description = "Only needed once to connect an external room. Stored by this buddies instance and reused by all sessions, including after restart. Omit for local or previously imported rooms."
+    )]
     pub ticket: Option<String>,
 }
 
@@ -417,43 +418,23 @@ fn err(msg: impl std::fmt::Display) -> McpError {
 impl BuddiesServer {
     #[tool(
         name = "join_room",
-        description = "Join a named collaboration room. Optionally provide a ticket from another peer to bootstrap P2P connection. Returns a ticket immediately; use get_room_status to check connectivity while bootstrap peers reconnect."
+        description = "Join by room name. This buddies instance owns and persists the room ticket; local agents never need to exchange tickets. Provide an external ticket only on first import or to update peer addresses. Later joins reuse it, including after restart. Use get_room_status to check connectivity."
     )]
     async fn join_room(
         &self,
         Parameters(req): Parameters<JoinRoomRequest>,
     ) -> Result<CallToolResult, McpError> {
         let _membership = self.node.local_membership.lock().await;
-        let mut bootstrap_peers = vec![];
-
-        if let Some(ref ticket_str) = req.ticket {
-            let ticket: RoomTicket = ticket_str
-                .parse()
-                .map_err(|e: anyhow::Error| err(format!("invalid ticket: {e}")))?;
-            if ticket.room != req.room {
-                return Err(err("ticket belongs to a different room"));
-            }
-            bootstrap_peers = ticket
-                .endpoints
-                .iter()
-                .map(|e| e.id)
-                .filter(|id| *id != self.node.endpoint.id())
-                .collect();
-        }
-
-        let topic_id = self
+        let ticket = self
             .node
-            .room_manager
-            .join_room(&req.room, bootstrap_peers)
+            .join_room(&req.room, req.ticket.as_deref())
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| err(e.to_string()))?;
 
         self.node
             .clients
             .join(self.session_id, &req.room)
             .map_err(|e| err(e.to_string()))?;
-        let my_addr = self.node.endpoint.addr();
-        let ticket = RoomTicket::new(req.room.clone(), topic_id, vec![my_addr]);
 
         let result = serde_json::json!({
             "room": req.room,
@@ -1190,6 +1171,8 @@ impl ServerHandler for BuddiesServer {
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions("P2P communication layer for AI agents. \
                  Join rooms to share knowledge, delegate tasks, and coordinate with other agents in real-time. \
+                 Call join_room with only the room name for local or previously imported rooms. \
+                 This process persists a shared ticket per room; provide a ticket only to import or update an external room. \
                  When you receive a 'notifications/buddies/taskArrived' notification, you MUST: \
                  1) Execute the task described in the 'description' field using the available tools. \
                  2) Call 'submit_task_result' with the task_id, room, source_peer, success=true/false, and your output. \

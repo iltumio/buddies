@@ -9,6 +9,9 @@ use crate::activity::FileActivityEntry;
 use crate::memory::{MemoryEntry, SearchFilters};
 use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult, SkillVote};
 
+const ROOM_TICKETS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("room_tickets");
+const NODE_SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("node_settings");
+
 const MEMORIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("memories");
 const SKILLS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("skills");
 const SKILL_VOTES_TABLE: TableDefinition<&str, &[u8]> =
@@ -34,6 +37,8 @@ impl Storage {
         let db = Database::create(path)?;
         let tx = db.begin_write()?;
         {
+            let _ = tx.open_table(ROOM_TICKETS_TABLE)?;
+            let _ = tx.open_table(NODE_SETTINGS_TABLE)?;
             let _ = tx.open_table(MEMORIES_TABLE)?;
             let _ = tx.open_table(SKILLS_TABLE)?;
             let _ = tx.open_table(SKILL_VOTES_TABLE)?;
@@ -47,6 +52,8 @@ impl Storage {
         let db = Database::builder().create_with_backend(InMemoryBackend::new())?;
         let tx = db.begin_write()?;
         {
+            let _ = tx.open_table(ROOM_TICKETS_TABLE)?;
+            let _ = tx.open_table(NODE_SETTINGS_TABLE)?;
             let _ = tx.open_table(MEMORIES_TABLE)?;
             let _ = tx.open_table(SKILLS_TABLE)?;
             let _ = tx.open_table(SKILL_VOTES_TABLE)?;
@@ -54,6 +61,46 @@ impl Storage {
         }
         tx.commit()?;
         Ok(Self { db })
+    }
+
+    /// Create the transport identity once, atomically with its persistence.
+    pub fn endpoint_secret(&self) -> Result<iroh::SecretKey> {
+        let tx = self.db.begin_write()?;
+        let secret = {
+            let mut table = tx.open_table(NODE_SETTINGS_TABLE)?;
+            let existing = table.get("endpoint_secret")?.map(|v| v.value().to_vec());
+            if let Some(bytes) = existing {
+                let bytes: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid stored endpoint key"))?;
+                iroh::SecretKey::from_bytes(&bytes)
+            } else {
+                let secret = iroh::SecretKey::generate();
+                table.insert("endpoint_secret", secret.to_bytes().as_slice())?;
+                secret
+            }
+        };
+        tx.commit()?;
+        Ok(secret)
+    }
+
+    pub fn room_ticket(&self, room: &str) -> Result<Option<crate::ticket::RoomTicket>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(ROOM_TICKETS_TABLE)?;
+        table
+            .get(room)?
+            .map(|value| value.value().parse())
+            .transpose()
+    }
+
+    pub fn save_room_ticket(&self, ticket: &crate::ticket::RoomTicket) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(ROOM_TICKETS_TABLE)?;
+            table.insert(ticket.room.as_str(), ticket.to_string().as_str())?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn store(&self, entry: &MemoryEntry) -> Result<()> {

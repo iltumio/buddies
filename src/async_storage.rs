@@ -43,6 +43,18 @@ impl AsyncStorage {
         })
         .await?
     }
+    pub async fn endpoint_secret(&self) -> Result<iroh::SecretKey> {
+        self.run(Storage::endpoint_secret).await
+    }
+    pub async fn room_ticket(&self, room: &str) -> Result<Option<crate::ticket::RoomTicket>> {
+        let room = room.to_owned();
+        self.run(move |storage| storage.room_ticket(&room)).await
+    }
+    pub async fn save_room_ticket(&self, ticket: &crate::ticket::RoomTicket) -> Result<()> {
+        let ticket = ticket.clone();
+        self.run(move |storage| storage.save_room_ticket(&ticket))
+            .await
+    }
     pub async fn store(&self, entry: &MemoryEntry) -> Result<()> {
         let entry = entry.clone();
         self.run(move |storage| storage.store(&entry)).await

@@ -148,6 +148,7 @@ impl Default for RoomHealth {
 }
 
 struct RoomInner {
+    bootstrap: Vec<iroh::EndpointId>,
     sender: Option<GossipSender>,
     health: Arc<RwLock<RoomHealth>>,
     _receiver_handle: tokio::task::JoinHandle<()>,
@@ -336,8 +337,25 @@ impl RoomManager {
         );
         self.presence.validate()?;
         let topic_id = room_to_topic(room_name);
-        if self.rooms.read().await.contains_key(room_name) {
-            return Ok(topic_id);
+        {
+            let mut rooms = self.rooms.write().await;
+            if let Some(room) = rooms.get_mut(room_name) {
+                let new: Vec<_> = bootstrap_peers
+                    .iter()
+                    .copied()
+                    .filter(|id| !room.bootstrap.contains(id))
+                    .collect();
+                room.bootstrap.extend(new.iter().copied());
+                let sender = room.sender.clone();
+                drop(rooms);
+                // Importing a ticket into an existing local room must start dialing.
+                if !new.is_empty()
+                    && let Some(sender) = sender
+                {
+                    tokio::time::timeout(Duration::from_secs(5), sender.join_peers(new)).await??;
+                }
+                return Ok(topic_id);
+            }
         }
         // Subscription must not wait indefinitely for an unreachable bootstrap peer.
         let topic = tokio::time::timeout(
@@ -353,6 +371,7 @@ impl RoomManager {
         let initial_sender = sender.clone();
         // Publish the room before its receiver can process a Join and reply.
         let (start_tx, start_rx) = oneshot::channel();
+        let saved_bootstrap = bootstrap_peers.clone();
         let receiver_handle = tokio::spawn(async move {
             if start_rx.await.is_ok() {
                 manager
@@ -374,6 +393,7 @@ impl RoomManager {
         self.rooms.write().await.insert(
             room_name.to_owned(),
             RoomInner {
+                bootstrap: saved_bootstrap,
                 sender: Some(sender),
                 health,
                 _receiver_handle: receiver_handle,
@@ -713,6 +733,9 @@ impl RoomManager {
             }
             tokio::time::sleep(backoff.next()).await;
             health.write().await.reconnect_attempts += 1;
+            if let Some(entry) = self.rooms.read().await.get(room) {
+                known.extend(entry.bootstrap.iter().copied());
+            }
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
                 self.gossip
@@ -782,6 +805,9 @@ impl RoomManager {
                     None => return Ok(()),
                 },
                 _ = heartbeat.tick() => {
+                    if let Some(entry) = self.rooms.read().await.get(room) {
+                        known.extend(entry.bootstrap.iter().copied());
+                    }
                     self.broadcast_to_room(room, P2PMessage::new(P2PMessageBody::Join {
                         name: self.user_name.clone(), agent: self.agent_name.clone(),
                     })).await?;
