@@ -104,6 +104,8 @@ def main():
                                "clientInfo": {"name": "second-client", "version": "1"}})
             headers["MCP-Protocol-Version"] = "2025-03-26"
             rpc("notifications/initialized", {}, notification=True)
+            assert json.loads(rpc("tools/call", {"name": "list_rooms", "arguments": {}})["content"][0]["text"])["rooms"] == []
+            rpc("tools/call", {"name": "join_room", "arguments": {"room": "smoke"}})
             result = rpc("tools/call", {"name": "list_rooms", "arguments": {}})
             assert "smoke" in json.loads(result["content"][0]["text"])["rooms"]
             snapshot = json.loads(subprocess.check_output(
@@ -143,6 +145,8 @@ def main():
                                "clientInfo": {"name": "reconnected", "version": "1"}})
             headers["MCP-Protocol-Version"] = "2025-03-26"
             rpc("notifications/initialized", {}, notification=True)
+            assert json.loads(rpc("tools/call", {"name": "list_rooms", "arguments": {}})["content"][0]["text"])["rooms"] == []
+            rpc("tools/call", {"name": "join_room", "arguments": {"room": "smoke"}})
             result = rpc("tools/call", {"name": "list_rooms", "arguments": {}})
             assert "smoke" in json.loads(result["content"][0]["text"])["rooms"]
             print("Abandoned session expiry/404/reinitialize with room retained: OK")

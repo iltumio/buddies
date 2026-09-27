@@ -20,6 +20,7 @@ use crate::ticket::RoomTicket;
 
 #[derive(Clone)]
 pub struct BuddiesServer {
+    session_id: Uuid,
     node: Arc<BuddiesNode>,
     tool_router: ToolRouter<Self>,
 }
@@ -27,6 +28,7 @@ pub struct BuddiesServer {
 impl BuddiesServer {
     pub fn new(node: Arc<BuddiesNode>) -> Self {
         Self {
+            session_id: Uuid::new_v4(),
             node,
             tool_router: Self::tool_router(),
         }
@@ -61,7 +63,7 @@ fn conflict_notification_payload(event: &ConflictEvent) -> serde_json::Value {
     })
 }
 
-fn task_notification_payload(task: &PendingTask) -> serde_json::Value {
+pub(crate) fn task_notification_payload(task: &PendingTask) -> serde_json::Value {
     let instructions = format!(
         "A peer agent has delegated a task to you. \
          Execute the task described in 'description' using the available tools, \
@@ -86,6 +88,7 @@ fn spawn_notification_forwarder<T>(
     method: &'static str,
     payload: fn(&T) -> serde_json::Value,
     shutdown: tokio_util::sync::CancellationToken,
+    filter: impl Fn(&T) -> bool + Send + 'static,
 ) where
     T: Clone + Send + 'static,
 {
@@ -103,6 +106,9 @@ fn spawn_notification_forwarder<T>(
             };
             match received {
                 Ok(event) => {
+                    if !filter(&event) {
+                        continue;
+                    }
                     let notification = ServerNotification::CustomNotification(
                         CustomNotification::new(method, Some(payload(&event))),
                     );
@@ -417,13 +423,22 @@ impl BuddiesServer {
         &self,
         Parameters(req): Parameters<JoinRoomRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _membership = self.node.local_membership.lock().await;
         let mut bootstrap_peers = vec![];
 
         if let Some(ref ticket_str) = req.ticket {
             let ticket: RoomTicket = ticket_str
                 .parse()
                 .map_err(|e: anyhow::Error| err(format!("invalid ticket: {e}")))?;
-            bootstrap_peers = ticket.endpoints.iter().map(|e| e.id).collect();
+            if ticket.room != req.room {
+                return Err(err("ticket belongs to a different room"));
+            }
+            bootstrap_peers = ticket
+                .endpoints
+                .iter()
+                .map(|e| e.id)
+                .filter(|id| *id != self.node.endpoint.id())
+                .collect();
         }
 
         let topic_id = self
@@ -433,6 +448,10 @@ impl BuddiesServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        self.node
+            .clients
+            .join(self.session_id, &req.room)
+            .map_err(|e| err(e.to_string()))?;
         let my_addr = self.node.endpoint.addr();
         let ticket = RoomTicket::new(req.room.clone(), topic_id, vec![my_addr]);
 
@@ -440,6 +459,7 @@ impl BuddiesServer {
             "room": req.room,
             "ticket": ticket.to_string(),
             "endpoint_id": self.node.endpoint.id().to_string(),
+            "agent_id": crate::local::agent_id(self.session_id),
             "connection": self.node.room_manager.room_health(&req.room).await,
         });
 
@@ -451,11 +471,18 @@ impl BuddiesServer {
         &self,
         Parameters(req): Parameters<LeaveRoomRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _membership = self.node.local_membership.lock().await;
         self.node
-            .room_manager
-            .leave_room(&req.room)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .clients
+            .require_member(self.session_id, &req.room)
+            .map_err(|e| err(e.to_string()))?;
+        if self.node.clients.leave(self.session_id, &req.room) == 0 {
+            self.node
+                .room_manager
+                .leave_room(&req.room)
+                .await
+                .map_err(|e| err(e.to_string()))?;
+        }
 
         ok_json(&serde_json::json!({ "left": req.room }))
     }
@@ -482,7 +509,7 @@ impl BuddiesServer {
 
         let entry = MemoryEntry {
             id: Uuid::new_v4(),
-            author: self.node.endpoint.id().to_string(),
+            author: crate::local::agent_id(self.session_id),
             timestamp: now_ts(),
             room: req.room.clone(),
             kind,
@@ -579,8 +606,13 @@ impl BuddiesServer {
         &self,
         Parameters(req): Parameters<NotifyPeersRequest>,
     ) -> Result<CallToolResult, McpError> {
+        self.node
+            .clients
+            .notify(self.session_id, &req.room, &req.text)
+            .await
+            .map_err(|e| err(e.to_string()))?;
         let msg = P2PMessage::new(P2PMessageBody::StatusUpdate {
-            author: self.node.endpoint.id().to_string(),
+            author: self.node.room_manager.peer_id().to_owned(),
             text: req.text.clone(),
         });
 
@@ -604,13 +636,18 @@ impl BuddiesServer {
         &self,
         Parameters(req): Parameters<GetRoomStatusRequest>,
     ) -> Result<CallToolResult, McpError> {
+        self.node
+            .clients
+            .require_member(self.session_id, &req.room)
+            .map_err(|e| err(e.to_string()))?;
         let peers = self.node.room_manager.get_room_peers(&req.room).await;
 
-        let peer_list: Vec<serde_json::Value> = peers
+        let mut peer_list: Vec<serde_json::Value> = peers
             .values()
             .map(|p| {
                 serde_json::json!({
                     "name": p.name,
+                    "scope": "remote",
                     "agent": p.agent,
                     "last_status": p.last_status,
                     "presence": p.presence(self.node.room_manager.presence),
@@ -619,7 +656,20 @@ impl BuddiesServer {
             })
             .collect();
 
+        peer_list.extend(
+            self.node
+                .clients
+                .agents(&req.room, Some(self.session_id))
+                .into_iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "name": p.name, "agent": p.agent, "scope": "local", "last_status": p.status,
+                        "presence": p.presence, "last_seen_secs": p.last_seen_secs,
+                    })
+                }),
+        );
         ok_json(&serde_json::json!({
+            "self": crate::local::agent_id(self.session_id),
             "room": req.room,
             "peers": peer_list,
             "connection": self.node.room_manager.room_health(&req.room).await,
@@ -631,7 +681,7 @@ impl BuddiesServer {
         description = "List all rooms you are currently in."
     )]
     async fn list_rooms(&self) -> Result<CallToolResult, McpError> {
-        let rooms = self.node.room_manager.list_rooms().await;
+        let rooms = self.node.clients.rooms(self.session_id);
         ok_json(&serde_json::json!({ "rooms": rooms }))
     }
 
@@ -645,12 +695,21 @@ impl BuddiesServer {
     ) -> Result<CallToolResult, McpError> {
         let timeout = req.timeout_secs.unwrap_or(60);
 
-        let result = self
+        let result = match self
             .node
-            .room_manager
-            .delegate_task(&req.room, &req.description, timeout)
+            .clients
+            .delegate(self.session_id, &req.room, &req.description, timeout)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .map_err(|e| err(e.to_string()))?
+        {
+            Some(result) => result,
+            None => self
+                .node
+                .room_manager
+                .delegate_task(&req.room, &req.description, timeout)
+                .await
+                .map_err(|e| err(e.to_string()))?,
+        };
 
         match result {
             TaskResult::Success { output } => ok_json(&serde_json::json!({
@@ -675,13 +734,24 @@ impl BuddiesServer {
         let wait = req.wait_secs.unwrap_or(30);
         let room_filter = req.room.as_deref();
 
-        let tasks = if wait == 0 {
-            self.node.room_manager.poll_tasks(room_filter).await
-        } else {
+        if let Some(room) = room_filter {
             self.node
-                .room_manager
-                .wait_for_tasks(room_filter, wait)
-                .await
+                .clients
+                .require_member(self.session_id, room)
+                .map_err(|e| err(e.to_string()))?;
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait.min(30));
+        let tasks = loop {
+            let mut tasks = self.node.clients.poll(self.session_id, room_filter);
+            for room in self.node.clients.rooms(self.session_id) {
+                if room_filter.is_none_or(|filter| filter == room) {
+                    tasks.extend(self.node.room_manager.poll_tasks(Some(&room)).await);
+                }
+            }
+            if !tasks.is_empty() || tokio::time::Instant::now() >= deadline {
+                break tasks;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
 
         let task_list: Vec<serde_json::Value> = tasks
@@ -734,10 +804,21 @@ impl BuddiesServer {
         };
 
         self.node
-            .room_manager
-            .submit_task_result(&task, result)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .clients
+            .require_member(self.session_id, &req.room)
+            .map_err(|e| err(e.to_string()))?;
+        if !self
+            .node
+            .clients
+            .submit(self.session_id, &task, result.clone())
+            .map_err(|e| err(e.to_string()))?
+        {
+            self.node
+                .room_manager
+                .submit_task_result(&task, result)
+                .await
+                .map_err(|e| err(e.to_string()))?;
+        }
 
         ok_json(&serde_json::json!({
             "submitted": true,
@@ -829,7 +910,7 @@ impl BuddiesServer {
 
         let mut entry = SkillEntry {
             hash: hash.clone(),
-            author: self.node.endpoint.id().to_string(),
+            author: crate::local::agent_id(self.session_id),
             timestamp: now_ts(),
             room: req.room.clone(),
             title: req.title,
@@ -1006,11 +1087,16 @@ impl BuddiesServer {
         &self,
         Parameters(req): Parameters<WatchRepoRequest>,
     ) -> Result<CallToolResult, McpError> {
+        let _membership = self.node.local_membership.lock().await;
         let state = self
             .node
             .watcher_manager
             .watch(Path::new(&req.repo_path), &req.room, req.repo_name)
             .await
+            .map_err(|e| err(e.to_string()))?;
+        self.node
+            .clients
+            .join(self.session_id, &state.room)
             .map_err(|e| err(e.to_string()))?;
         ok_json(&serde_json::json!({
             "watching": true,
@@ -1116,13 +1202,18 @@ impl ServerHandler for BuddiesServer {
     }
 
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
-        self.node.clients.register(context.peer.clone());
+        self.node
+            .clients
+            .register(self.session_id, context.peer.clone());
+        let node = self.node.clone();
+        let session_id = self.session_id;
         spawn_notification_forwarder(
             context.peer.clone(),
             self.node.subscribe_task_events(),
             "notifications/buddies/taskArrived",
             task_notification_payload,
             self.node.shutdown_token.clone(),
+            move |task| node.clients.require_member(session_id, &task.room).is_ok(),
         );
         spawn_notification_forwarder(
             context.peer,
@@ -1130,6 +1221,7 @@ impl ServerHandler for BuddiesServer {
             "notifications/buddies/fileConflict",
             conflict_notification_payload,
             self.node.shutdown_token.clone(),
+            |_| true,
         );
     }
 }

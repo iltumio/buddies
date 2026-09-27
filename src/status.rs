@@ -1,41 +1,9 @@
 //! Read-only live state. Never opens the on-disk database.
-use std::sync::{Arc, Mutex};
-
-use axum::{Json, extract::State};
-use rmcp::{Peer, RoleServer};
-use serde::{Deserialize, Serialize};
-
+pub use crate::local::Clients;
 use crate::node::BuddiesNode;
-
-#[derive(Default)]
-pub struct Clients(Mutex<Vec<Peer<RoleServer>>>);
-
-impl Clients {
-    pub fn prune(&self) {
-        self.0.lock().unwrap().retain(|p| !p.is_transport_closed());
-    }
-
-    pub fn register(&self, peer: Peer<RoleServer>) {
-        let mut clients = self.0.lock().unwrap();
-        clients.retain(|p| !p.is_transport_closed());
-        clients.push(peer);
-    }
-
-    fn snapshot(&self) -> Vec<Client> {
-        let mut clients = self.0.lock().unwrap();
-        clients.retain(|p| !p.is_transport_closed());
-        let mut result: Vec<_> = clients
-            .iter()
-            .filter_map(|p| p.peer_info())
-            .map(|info| Client {
-                name: info.client_info.name.clone(),
-                version: info.client_info.version.clone(),
-            })
-            .collect();
-        result.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(&b.version)));
-        result
-    }
-}
+use axum::{Json, extract::State};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -47,6 +15,10 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Client {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub rooms: Vec<String>,
     pub name: String,
     pub version: String,
 }
@@ -61,6 +33,8 @@ pub struct Room {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
+    #[serde(default = "remote_scope")]
+    pub scope: String,
     pub name: String,
     pub agent: String,
     pub status: Option<String>,
@@ -68,6 +42,10 @@ pub struct Agent {
     pub presence: crate::resilience::Presence,
     #[serde(default)]
     pub last_seen_secs: u64,
+}
+
+fn remote_scope() -> String {
+    "remote".into()
 }
 
 pub async fn snapshot(State(node): State<Arc<BuddiesNode>>) -> Json<Snapshot> {
@@ -81,6 +59,7 @@ pub async fn snapshot(State(node): State<Arc<BuddiesNode>>) -> Json<Snapshot> {
             .await
             .into_values()
             .map(|p| Agent {
+                scope: "remote".into(),
                 presence: p.presence(node.room_manager.presence),
                 last_seen_secs: p.last_seen.elapsed().as_secs(),
                 name: p.name,
@@ -88,6 +67,7 @@ pub async fn snapshot(State(node): State<Arc<BuddiesNode>>) -> Json<Snapshot> {
                 status: p.last_status,
             })
             .collect();
+        peers.extend(node.clients.agents(&name, None));
         peers.sort_by(|a, b| a.name.cmp(&b.name));
         let connection = node
             .room_manager

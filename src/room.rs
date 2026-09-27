@@ -181,7 +181,6 @@ pub struct RoomManager {
     pending_skill_searches: PendingRequests<SkillSearch>,
     incoming_tasks: Arc<Mutex<Vec<PendingTask>>>,
     task_waiters: PendingRequests<oneshot::Sender<TaskResult>>,
-    task_notify: Arc<tokio::sync::Notify>,
     task_broadcast: tokio::sync::broadcast::Sender<PendingTask>,
     signer: Option<LocalSigner>,
     room_whitelists: Arc<RwLock<HashMap<String, HashSet<SignerIdentity>>>>,
@@ -216,7 +215,6 @@ impl RoomManager {
             pending_skill_searches: PendingRequests::default(),
             incoming_tasks: Arc::new(Mutex::new(Vec::new())),
             task_waiters: PendingRequests::default(),
-            task_notify: Arc::new(tokio::sync::Notify::new()),
             task_broadcast: tokio::sync::broadcast::channel(64).0,
             signer,
             room_whitelists: Arc::new(RwLock::new(HashMap::new())),
@@ -663,28 +661,6 @@ impl RoomManager {
         matching
     }
 
-    pub async fn wait_for_tasks(
-        &self,
-        room_filter: Option<&str>,
-        timeout_secs: u64,
-    ) -> Vec<PendingTask> {
-        let notified = self.task_notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        let immediate = self.poll_tasks(room_filter).await;
-        if !immediate.is_empty() {
-            return immediate;
-        }
-
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs.min(MAX_SEARCH_SECONDS)),
-            notified,
-        )
-        .await;
-
-        self.poll_tasks(room_filter).await
-    }
-
     pub async fn submit_task_result(&self, task: &PendingTask, result: TaskResult) -> Result<()> {
         let msg = P2PMessage::new(P2PMessageBody::TaskResponse {
             task_id: task.task_id,
@@ -998,7 +974,6 @@ impl RoomManager {
                 let task_clone = task.clone();
                 tasks.push(task);
                 drop(tasks);
-                self.task_notify.notify_waiters();
                 let _ = self.task_broadcast.send(task_clone);
             }
             P2PMessageBody::TaskClaimed {

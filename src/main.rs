@@ -1,6 +1,7 @@
 mod activity;
 mod async_storage;
 mod identity;
+mod local;
 mod memory;
 mod monitor;
 mod node;

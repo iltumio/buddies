@@ -407,11 +407,34 @@ identity. Keep the HTTP server bound to loopback for local use: both `/mcp` and
 `/status` are available on its configured listener.
 
 To share buddies between Codex, Claude and concurrent sessions, run **one** HTTP
-server with one data directory, then configure every MCP client with its
-`http://127.0.0.1:8080/mcp` URL. They share the node identity and storage. Separate
-stdio processes must use separate data directories because the database permits
-only one open instance per file. Back up existing directories before switching;
-changing the client URL does not merge their previous databases.
+server and configure every client with its `http://127.0.0.1:8080/mcp` URL.
+Each initialized session receives a distinct `local:<uuid>` agent ID, including
+clients with identical names. Each agent must call `join_room`; the response
+includes its `agent_id`. `list_rooms` lists that session's memberships, and
+`get_room_status` lists other local participants plus remote P2P peers. The
+monitor includes everyone and labels each participant `local` or `remote`.
+A room can have active local participants and zero network neighbors.
+
+`notify_peers` updates the sender's local status and sends
+`notifications/buddies/status` to other local members. `delegate_task` assigns
+one other local member when available, excluding the sender; otherwise it uses
+P2P delegation. The assignee receives `notifications/buddies/taskArrived` and
+can also use `poll_pending_tasks`. Results are checked against assignee, room
+and source agent; late or duplicate local results are rejected. Local tasks
+are cancelled on timeout, departure, disconnection or request cancellation.
+They are not automatically re-executed after failure.
+
+Leaving a room removes only that session; the network subscription is closed
+when the last explicit local member leaves. Disconnects remove local presence
+without tearing down shared room subscriptions. A new session must rejoin.
+`watch_repo` also registers its caller in the actual watched room. The node's
+cryptographic identity, database and repository watchers remain shared: these
+session IDs are participant identities, not separate security tenants. Remote
+nodes still see the shared node's P2P identity.
+
+Separate stdio processes must use separate data directories because the database
+permits only one open instance per file. Back up existing directories before
+switching; changing the client URL does not merge their previous databases.
 
 For Linux/systemd user sessions, a service template is provided (adjust `ExecStart`
 if the binary is installed outside `~/.cargo/bin`). Stop existing stdio instances

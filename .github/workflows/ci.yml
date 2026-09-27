@@ -35,6 +35,7 @@ jobs:
         run: |
           cargo build --locked
           python3 scripts/smoke_mcp.py
+          python3 scripts/smoke_local_agents.py
 
   msrv:
     runs-on: ubuntu-latest

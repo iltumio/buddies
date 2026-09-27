@@ -142,11 +142,11 @@ pub async fn run(base: &str, once: bool) -> Result<()> {
             let mut selection = ListState::default().with_selected((!rooms.is_empty()).then_some(room_index));
             frame.render_stateful_widget(List::new(room_items).block(Block::bordered().title(" Rooms "))
                 .highlight_style(Style::default().bg(Color::DarkGray)).highlight_symbol("› "), left[0], &mut selection);
-            let clients = snapshot.as_ref().map(|s| s.clients.iter().map(|c| format!("{} {}", clean(&c.name), clean(&c.version))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+            let clients = snapshot.as_ref().map(|s| s.clients.iter().map(|c| format!("{} {} [{}]", clean(&c.name), clean(&c.version), clean(&c.id).chars().take(14).collect::<String>())).collect::<Vec<_>>().join("\n")).unwrap_or_default();
             frame.render_widget(Paragraph::new(if clients.is_empty() { "No active MCP sessions".into() } else { clients })
                 .block(Block::bordered().title(" Local MCP sessions ")), left[1]);
-            let rows = peers.iter().map(|p| Row::new(vec![clean(&p.name), clean(&p.agent), p.presence.to_string(), format!("{}s", p.last_seen_secs), clean(p.status.as_deref().unwrap_or("—"))]));
-            let title = if peers.is_empty() { " Known P2P agents — no peers " } else { " Known P2P agents — last reported state " };
+            let rows = peers.iter().map(|p| Row::new(vec![clean(&p.name), format!("{} · {}", clean(&p.scope), clean(&p.agent)), p.presence.to_string(), format!("{}s", p.last_seen_secs), clean(p.status.as_deref().unwrap_or("—"))]));
+            let title = if peers.is_empty() { " Room participants — none " } else { " Room participants — local / remote " };
             let table = Table::new(rows, [Constraint::Percentage(20), Constraint::Percentage(20), Constraint::Length(12), Constraint::Length(8), Constraint::Min(10)])
                 .header(Row::new(["User", "Agent", "Presence", "Seen", "Last status"]).style(Style::default().fg(Color::Cyan)))
                 .block(Block::bordered().title(title))
@@ -156,7 +156,7 @@ pub async fn run(base: &str, once: bool) -> Result<()> {
             let footer = if error.is_some() { "Retrying automatically; displayed data may be stale. q: quit" }
                 else { "↑/↓ or j/k: rooms · PgUp/PgDn: agents · q/Esc/Ctrl-C: quit\nP2P membership is last known state, not a live connection guarantee." };
             let diagnostic = rooms.get(room_index).map(|r| format!(
-                "{} · {} neighbors · {} retries · {}", clean(&r.connection.state),
+                "{} local agents · network {} · {} neighbors · {} retries · {}", r.peers.iter().filter(|p| p.scope == "local").count(), clean(&r.connection.state),
                 r.connection.neighbors, r.connection.reconnect_attempts,
                 clean(r.connection.last_error.as_deref().unwrap_or("no transport errors"))
             )).unwrap_or_default();
