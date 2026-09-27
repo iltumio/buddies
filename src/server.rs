@@ -1101,6 +1101,7 @@ impl BuddiesServer {
 impl ServerHandler for BuddiesServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .with_instructions("P2P communication layer for AI agents. \
                  Join rooms to share knowledge, delegate tasks, and coordinate with other agents in real-time. \
                  When you receive a 'notifications/buddies/taskArrived' notification, you MUST: \

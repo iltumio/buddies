@@ -20,6 +20,12 @@ def main():
         ["cargo", "metadata", "--no-deps", "--locked", "--format-version", "1"]
     ))
     binary = Path(metadata["target_directory"]) / "debug/buddies"
+    package = next(p for p in metadata["packages"] if p["name"] == "buddies")
+
+    def check_server_info(result):
+        assert result["serverInfo"]["name"] == package["name"], result
+        assert result["serverInfo"]["version"] == package["version"], result
+
     with tempfile.TemporaryDirectory(prefix="buddies-smoke-") as temp:
         root = Path(temp)
         repo = root / "repo"
@@ -79,6 +85,8 @@ def main():
                         message = json.load(response)
                     assert "error" not in message, message
                     assert not message["result"].get("isError"), message
+                    if method == "initialize":
+                        check_server_info(message["result"])
                     return message["result"]
 
             rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
@@ -175,6 +183,8 @@ def main():
                         assert select.select([process.stdout], [], [], 15)[0], "stdio timeout"
                         result = json.loads(process.stdout.readline())
                         assert result["id"] == msg["id"] and "result" in result, result
+                        if msg["method"] == "initialize":
+                            check_server_info(result["result"])
                 assert len(result["result"]["tools"]) == 22
                 process.stdin.close()
                 assert process.wait(timeout=10) == 0
