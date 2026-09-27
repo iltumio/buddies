@@ -2,10 +2,21 @@ name: Build
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
+
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Existing release tag to build and publish
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag (also used to retry a draft release)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -25,6 +36,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -68,7 +81,7 @@ jobs:
     permissions:
       contents: write
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
@@ -76,9 +89,14 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create release
+      - name: Attach binaries and publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          gh release create "$TAG" artifacts/*/buddies-* --generate-notes --repo "$GITHUB_REPOSITORY"
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" artifacts/*/buddies-* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest

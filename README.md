@@ -487,6 +487,32 @@ Two things to know before changing the wire format in `src/protocol.rs`:
 
 Fields that arrive from peers are attacker-controlled. Validate them at receipt (length, timestamps, NUL bytes) rather than trusting the sender, and do it *after* signature verification so unverified traffic can't reach the validation path.
 
+## Automatic releases
+
+[release-plz](https://release-plz.dev/docs/config#the-git_only-field) manages
+versions and `CHANGELOG.md` using the existing `v{{ version }}` tags. Releases
+are GitHub-only; no crates.io token is required.
+
+1. A push to `main` runs the shared CI checks, then release-plz opens or updates
+   a release PR with the next version and changelog. Conventional Commits drive
+   version selection. CI is explicitly dispatched on the generated branch.
+2. Review and merge the release PR. Once CI passes, release-plz creates the tag
+   and a draft GitHub release.
+3. The workflow builds Linux x86_64 and ARM64 binaries from that exact tag,
+   attaches both binaries, and publishes the release as latest. This keeps the
+   installer's existing download URLs working.
+
+Automation uses the repository's `GITHUB_TOKEN`. In **Settings → Actions →
+General → Workflow permissions**, enable **Allow GitHub Actions to create and
+approve pull requests**. No additional PAT or registry secret is needed.
+The build is invoked as a reusable workflow because tags created with
+`GITHUB_TOKEN` do not trigger another push workflow.
+
+If binary compilation fails, the release stays a draft. Rerun the failed jobs,
+or manually run the **Build** workflow with `release_tag` set to the existing
+version tag. Uploads are idempotent. Regular CI can also be run manually through
+its `workflow_dispatch` trigger.
+
 ## License
 
 MIT — see [LICENSE](LICENSE)

@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.91"
 description = "P2P communication layer for AI agents"
 license = "MIT"
+repository = "https://github.com/iltumio/buddies"
 
 [dependencies]
 # MCP protocol

@@ -2,9 +2,9 @@ name: CI
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
+  # Main pushes run these same checks through release-plz before publishing.
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read

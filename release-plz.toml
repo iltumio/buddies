@@ -1,0 +1,15 @@
+[workspace]
+# This application is distributed as GitHub release binaries.
+git_only = true
+release_always = false
+semver_check = false
+# Dependabot owns dependency updates; release PRs only change the package version.
+dependencies_update = false
+# Publish only after both binary artifacts have been attached.
+git_release_draft = true
+git_release_latest = false
+
+[[package]]
+name = "buddies"
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
