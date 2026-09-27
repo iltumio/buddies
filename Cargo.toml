@@ -45,3 +45,6 @@ dirs = "7"
 whoami = "2"
 axum = "0.8"
 tempfile = "3"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+clap = { version = "4", features = ["derive", "env"] }

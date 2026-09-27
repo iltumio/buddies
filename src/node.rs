@@ -21,6 +21,7 @@ use crate::watcher::WatcherManager;
 pub(crate) const GOSSIP_MAX_MESSAGE_SIZE: usize = 256 * 1024;
 
 pub struct BuddiesNode {
+    pub clients: crate::status::Clients,
     pub shutdown_token: tokio_util::sync::CancellationToken,
     pub endpoint: Endpoint,
     pub router: Router,
@@ -65,6 +66,7 @@ impl BuddiesNode {
         let watcher_manager = WatcherManager::new(Arc::clone(&room_manager), dirty, author);
 
         Ok(Self {
+            clients: crate::status::Clients::default(),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             endpoint,
             router,

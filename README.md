@@ -355,6 +355,53 @@ SIGINT/SIGTERM stops HTTP admission, cancels MCP sessions and notifications, and
 allows up to five seconds for HTTP connections to finish before stopping watchers,
 room receivers, and the Iroh router. The stdio transport also cleans up on EOF.
 
+## Network monitor
+
+Run `buddies monitor` to inspect a running HTTP server in a Ratatui terminal UI:
+
+```sh
+BUDDIES_TRANSPORT=http buddies
+# In another terminal:
+buddies monitor
+# Custom endpoint, or a single machine-readable snapshot:
+buddies monitor --url http://127.0.0.1:8080/mcp
+buddies monitor --once
+```
+
+The monitor shows joined rooms, known P2P agents and their last reported status,
+plus active local MCP sessions (client name/version). Use ↑/↓ or j/k to select a
+room, PgUp/PgDn to browse its agents, and q, Esc or Ctrl-C to exit. It refreshes
+every second and retries automatically if the server is unavailable, marking
+previous data as stale. P2P membership is last known state, not proof that a peer
+is still online; MCP sessions are separate from P2P identities.
+
+`--url` also accepts `BUDDIES_URL`; the default is `http://127.0.0.1:8080`.
+Monitoring reads `GET /status` and never opens a database or generates an
+identity. Keep the HTTP server bound to loopback for local use: both `/mcp` and
+`/status` are available on its configured listener.
+
+To share buddies between Codex, Claude and concurrent sessions, run **one** HTTP
+server with one data directory, then configure every MCP client with its
+`http://127.0.0.1:8080/mcp` URL. They share the node identity and storage. Separate
+stdio processes must use separate data directories because the database permits
+only one open instance per file. Back up existing directories before switching;
+changing the client URL does not merge their previous databases.
+
+For Linux/systemd user sessions, a service template is provided (adjust `ExecStart`
+if the binary is installed outside `~/.cargo/bin`). Stop existing stdio instances
+using the same database before starting the service:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/buddies.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now buddies.service
+buddies monitor
+```
+
+The service starts with your user session. Check logs with
+`journalctl --user -u buddies.service`; restart it after upgrading the binary.
+
 ## Configuration
 
 | Environment variable | Default | Description |

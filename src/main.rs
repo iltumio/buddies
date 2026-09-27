@@ -2,12 +2,14 @@ mod activity;
 mod async_storage;
 mod identity;
 mod memory;
+mod monitor;
 mod node;
 mod pending;
 mod protocol;
 mod room;
 mod server;
 mod skill;
+mod status;
 mod storage;
 mod ticket;
 mod validation;
@@ -17,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::{
@@ -35,8 +38,32 @@ fn default_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".buddies"))
 }
 
+#[derive(Parser)]
+#[command(version, about = "P2P communication for AI agents")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Monitor a running buddies HTTP server without opening its database.
+    Monitor {
+        /// Server URL (the /mcp suffix is also accepted).
+        #[arg(long, env = "BUDDIES_URL", default_value = "http://127.0.0.1:8080")]
+        url: String,
+        /// Print one JSON snapshot instead of opening the terminal UI.
+        #[arg(long)]
+        once: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if let Some(Command::Monitor { url, once }) = cli.command {
+        return monitor::run(&url, once).await;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -138,6 +165,7 @@ async fn serve_http(
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let ct = node.shutdown_token.clone();
+    let status_node = node.clone();
     let service = StreamableHttpService::new(
         move || Ok(BuddiesServer::new(node.clone())),
         LocalSessionManager::default().into(),
@@ -145,7 +173,10 @@ async fn serve_http(
             .with_legacy_session_mode(true)
             .with_cancellation_token(ct.child_token()),
     );
-    let app = axum::Router::new().nest_service("/mcp", service);
+    let app = axum::Router::new()
+        .route("/status", axum::routing::get(status::snapshot))
+        .with_state(status_node)
+        .nest_service("/mcp", service);
     let serve = axum::serve(listener, app)
         .with_graceful_shutdown(ct.clone().cancelled_owned())
         .into_future();

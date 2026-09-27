@@ -88,6 +88,33 @@ def main():
             rpc("tools/call", {"name": "join_room", "arguments": {"room": "smoke"}})
             rpc("tools/call", {"name": "watch_repo", "arguments": {
                 "room": "smoke", "repo_path": str(repo), "repo_name": "fixture"}})
+            # A second MCP client shares this node and database.
+            first_headers = headers.copy()
+            headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+            rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
+                               "clientInfo": {"name": "second-client", "version": "1"}})
+            headers["MCP-Protocol-Version"] = "2025-03-26"
+            rpc("notifications/initialized", {}, notification=True)
+            result = rpc("tools/call", {"name": "list_rooms", "arguments": {}})
+            assert "smoke" in json.loads(result["content"][0]["text"])["rooms"]
+            snapshot = json.loads(subprocess.check_output(
+                [str(binary), "monitor", "--url", url, "--once"],
+                env=dict(env, BUDDIES_DATA_DIR="/nonexistent/monitor-must-not-open-db")))
+            assert [r["name"] for r in snapshot["rooms"]] == ["smoke"], snapshot
+            assert {c["name"] for c in snapshot["clients"]} == {"smoke-test", "second-client"}, snapshot
+            request = urllib.request.Request(url, method="DELETE", headers=headers)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                assert response.status in (200, 202, 204)
+            deadline = time.monotonic() + 5
+            while True:
+                with urllib.request.urlopen(url.removesuffix("/mcp") + "/status", timeout=3) as response:
+                    snapshot = json.load(response)
+                if len(snapshot["clients"]) == 1:
+                    break
+                assert time.monotonic() < deadline, snapshot
+                time.sleep(0.05)
+            headers = first_headers
+            print("Shared MCP clients/status/monitor JSON/session disconnect: OK")
             # Keep a real notification stream open while shutting down.
             sse = http.client.HTTPConnection(urllib.parse.urlparse(url).netloc, timeout=10)
             sse.request("GET", "/mcp", headers={**headers, "Accept": "text/event-stream"})

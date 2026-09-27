@@ -1,0 +1,21 @@
+[Unit]
+Description=Buddies shared MCP server
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/buddies
+WorkingDirectory=%h
+Environment=BUDDIES_TRANSPORT=http
+Environment=BUDDIES_HOST=127.0.0.1
+Environment=BUDDIES_PORT=8080
+Environment=BUDDIES_AGENT=shared
+Environment=BUDDIES_SIGNER=generated
+Environment=BUDDIES_DATA_DIR=%h/.local/share/buddies
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+UMask=0077
+
+[Install]
+WantedBy=default.target

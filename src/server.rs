@@ -1101,6 +1101,7 @@ impl ServerHandler for BuddiesServer {
     }
 
     async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::RoleServer>) {
+        self.node.clients.register(context.peer.clone());
         spawn_notification_forwarder(
             context.peer.clone(),
             self.node.subscribe_task_events(),
