@@ -31,6 +31,7 @@ pub struct BuddiesNode {
 }
 
 pub struct BuddiesNodeConfig {
+    pub presence: crate::resilience::PresenceConfig,
     pub user_name: String,
     pub agent_name: String,
     pub data_dir: Option<PathBuf>,
@@ -61,6 +62,7 @@ impl BuddiesNode {
             Arc::clone(&storage),
             config.signer,
             Arc::clone(&dirty),
+            config.presence,
         );
 
         let watcher_manager = WatcherManager::new(Arc::clone(&room_manager), dirty, author);

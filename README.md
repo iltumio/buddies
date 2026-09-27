@@ -375,6 +375,32 @@ every second and retries automatically if the server is unavailable, marking
 previous data as stale. P2P membership is last known state, not proof that a peer
 is still online; MCP sessions are separate from P2P identities.
 
+Timing values accept 1–86400 seconds, with heartbeat < suspect < offline.
+
+Presence is refreshed by periodic `Join` announcements (10 seconds by default),
+without resetting the agent's last status. The monitor and `get_room_status` show
+`online`, `unreachable` after 30 seconds, and `offline` after 90 seconds without
+an accepted announcement/message. Elapsed time is measured locally. Signed
+messages must pass signature and replay checks; unsigned rooms still allow
+unauthenticated presence. Offline entries are retained for at least one hour.
+Older peers without periodic announcements can appear offline while idle.
+
+Rooms show `waiting`, `connected`, or `reconnecting`, direct-neighbor counts,
+retry counts and the last transport error. A room without neighbors can be
+valid (for example, its first member). Joining registers the room immediately;
+bootstrap discovery continues in the background. Failed subscriptions are
+recreated, and known peers retried with exponential delays of 1–30 seconds plus
+up to 500 ms of jitter. Leaving a room or shutting down cancels these retries.
+
+HTTP sessions expire after five minutes without an incoming MCP request.
+Polling `/status` does not extend a session. Expired session IDs return HTTP 404;
+the MCP client must initialize a new session. Session cleanup also releases
+notification listeners, even when no further notifications arrive. Configure a
+longer idle timeout for clients that only listen for notifications for long
+periods. Reinitializing a client keeps the running node's rooms and database.
+Restarting the **server** still requires rejoining rooms: room persistence and
+reliable task replay are not implemented by this recovery layer.
+
 `--url` also accepts `BUDDIES_URL`; the default is `http://127.0.0.1:8080`.
 Monitoring reads `GET /status` and never opens a database or generates an
 identity. Keep the HTTP server bound to loopback for local use: both `/mcp` and
@@ -413,6 +439,10 @@ The service starts with your user session. Check logs with
 | `BUDDIES_TRANSPORT` | `stdio` | Transport mode: `stdio` (default, for MCP clients that spawn the process) or `http` (standalone HTTP server) |
 | `BUDDIES_PORT` | `8080` | HTTP listen port (only used when `BUDDIES_TRANSPORT=http`) |
 | `BUDDIES_HOST` | `127.0.0.1` | HTTP bind address (only used when `BUDDIES_TRANSPORT=http`) |
+| `BUDDIES_HEARTBEAT_SECS` | `10` | Presence announcement interval |
+| `BUDDIES_SUSPECT_SECS` | `30` | Elapsed time before a peer becomes unreachable |
+| `BUDDIES_OFFLINE_SECS` | `90` | Elapsed time before a peer becomes offline |
+| `BUDDIES_MCP_IDLE_SECS` | `300` | HTTP session inactivity limit; expired clients must initialize again |
 | `BUDDIES_SIGNER` | `git` | Signing identity source: `git`, `none`, `gpg`, `ssh`, `generated` |
 | `BUDDIES_GPG_KEY_ID` | unset | GPG key ID when `BUDDIES_SIGNER=gpg` (or use `BUDDIES_SIGNING_KEY`) |
 | `BUDDIES_SSH_PRIVATE_KEY` | unset | SSH private key path when `BUDDIES_SIGNER=ssh` |

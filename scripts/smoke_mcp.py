@@ -28,7 +28,8 @@ def main():
         (repo / "untracked.txt").write_text("local fixture\n")
         env = dict(os.environ, BUDDIES_DATA_DIR=str(root / "http-data"),
                    BUDDIES_SIGNER="none", BUDDIES_TRANSPORT="http",
-                   BUDDIES_HOST="127.0.0.1", BUDDIES_PORT="0", BUDDIES_USER="smoke-test")
+                   BUDDIES_HOST="127.0.0.1", BUDDIES_PORT="0", BUDDIES_USER="smoke-test",
+                   BUDDIES_MCP_IDLE_SECS="3")
         process = subprocess.Popen([str(binary)], env=env, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.PIPE)
         sse = None
@@ -115,6 +116,28 @@ def main():
                 time.sleep(0.05)
             headers = first_headers
             print("Shared MCP clients/status/monitor JSON/session disconnect: OK")
+            # An abandoned client must expire even while /status is polled.
+            deadline = time.monotonic() + 8
+            while True:
+                with urllib.request.urlopen(url.removesuffix("/mcp") + "/status", timeout=3) as response:
+                    snapshot = json.load(response)
+                if not snapshot["clients"]:
+                    break
+                assert time.monotonic() < deadline, snapshot
+                time.sleep(0.1)
+            try:
+                rpc("tools/list", {})
+                raise AssertionError("expired session unexpectedly accepted")
+            except urllib.error.HTTPError as error:
+                assert error.code == 404, error
+            headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+            rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
+                               "clientInfo": {"name": "reconnected", "version": "1"}})
+            headers["MCP-Protocol-Version"] = "2025-03-26"
+            rpc("notifications/initialized", {}, notification=True)
+            result = rpc("tools/call", {"name": "list_rooms", "arguments": {}})
+            assert "smoke" in json.loads(result["content"][0]["text"])["rooms"]
+            print("Abandoned session expiry/404/reinitialize with room retained: OK")
             # Keep a real notification stream open while shutting down.
             sse = http.client.HTTPConnection(urllib.parse.urlparse(url).netloc, timeout=10)
             sse.request("GET", "/mcp", headers={**headers, "Accept": "text/event-stream"})

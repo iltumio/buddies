@@ -90,10 +90,15 @@ fn spawn_notification_forwarder<T>(
     T: Clone + Send + 'static,
 {
     tokio::spawn(async move {
+        let mut cleanup = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             let received = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => break,
+                _ = cleanup.tick() => {
+                    if peer.is_transport_closed() { break; }
+                    continue;
+                }
                 received = receiver.recv() => received,
             };
             match received {
@@ -101,8 +106,13 @@ fn spawn_notification_forwarder<T>(
                     let notification = ServerNotification::CustomNotification(
                         CustomNotification::new(method, Some(payload(&event))),
                     );
-                    if let Err(error) = peer.send_notification(notification).await {
-                        tracing::warn!(%method, %error, "failed to forward notification");
+                    let sent = tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        sent = tokio::time::timeout(std::time::Duration::from_secs(5),
+                            peer.send_notification(notification)) => sent,
+                    };
+                    if !matches!(sent, Ok(Ok(_))) {
+                        tracing::warn!(%method, "notification transport closed or timed out");
                         break;
                     }
                 }
@@ -401,7 +411,7 @@ fn err(msg: impl std::fmt::Display) -> McpError {
 impl BuddiesServer {
     #[tool(
         name = "join_room",
-        description = "Join a named collaboration room. Optionally provide a ticket from another peer to bootstrap P2P connection. Returns a ticket that others can use to join."
+        description = "Join a named collaboration room. Optionally provide a ticket from another peer to bootstrap P2P connection. Returns a ticket immediately; use get_room_status to check connectivity while bootstrap peers reconnect."
     )]
     async fn join_room(
         &self,
@@ -430,6 +440,7 @@ impl BuddiesServer {
             "room": req.room,
             "ticket": ticket.to_string(),
             "endpoint_id": self.node.endpoint.id().to_string(),
+            "connection": self.node.room_manager.room_health(&req.room).await,
         });
 
         ok_json(&result)
@@ -602,6 +613,8 @@ impl BuddiesServer {
                     "name": p.name,
                     "agent": p.agent,
                     "last_status": p.last_status,
+                    "presence": p.presence(self.node.room_manager.presence),
+                    "last_seen_secs": p.last_seen.elapsed().as_secs(),
                 })
             })
             .collect();
@@ -609,6 +622,7 @@ impl BuddiesServer {
         ok_json(&serde_json::json!({
             "room": req.room,
             "peers": peer_list,
+            "connection": self.node.room_manager.room_health(&req.room).await,
         }))
     }
 

@@ -1,6 +1,8 @@
+use crate::resilience::{Backoff, Presence, PresenceConfig};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::Instant;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -83,6 +85,7 @@ pub struct PeerInfo {
     pub agent: String,
     pub last_status: Option<String>,
     signed_by: Option<SignerIdentity>,
+    pub last_seen: Instant,
 }
 
 impl PeerInfo {
@@ -91,8 +94,13 @@ impl PeerInfo {
             name,
             agent,
             last_status: None,
+            last_seen: Instant::now(),
             signed_by,
         }
+    }
+
+    pub fn presence(&self, config: PresenceConfig) -> Presence {
+        config.state(self.last_seen.elapsed())
     }
 
     fn accepts_identity(&self, identity: Option<&SignerIdentity>) -> bool {
@@ -120,8 +128,28 @@ pub struct PendingTask {
     pub timeout_secs: u32,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoomHealth {
+    pub state: String,
+    pub neighbors: usize,
+    pub reconnect_attempts: u64,
+    pub last_error: Option<String>,
+}
+
+impl Default for RoomHealth {
+    fn default() -> Self {
+        Self {
+            state: "waiting".into(),
+            neighbors: 0,
+            reconnect_attempts: 0,
+            last_error: None,
+        }
+    }
+}
+
 struct RoomInner {
-    sender: GossipSender,
+    sender: Option<GossipSender>,
+    health: Arc<RwLock<RoomHealth>>,
     _receiver_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -141,6 +169,8 @@ struct SkillSearch {
 
 pub struct RoomManager {
     gossip: Gossip,
+    lifecycle: Mutex<()>,
+    pub presence: PresenceConfig,
     closing: std::sync::atomic::AtomicBool,
     user_name: String,
     agent_name: String,
@@ -170,9 +200,12 @@ impl RoomManager {
         storage: Arc<AsyncStorage>,
         signer: Option<LocalSigner>,
         dirty: Arc<DirtySet>,
+        presence: PresenceConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
             gossip,
+            lifecycle: Mutex::new(()),
+            presence,
             closing: std::sync::atomic::AtomicBool::new(false),
             user_name,
             agent_name,
@@ -298,70 +331,62 @@ impl RoomManager {
         room_name: &str,
         bootstrap_peers: Vec<iroh::EndpointId>,
     ) -> Result<TopicId> {
+        let _operation = self.lifecycle.lock().await;
         anyhow::ensure!(
             !self.closing.load(std::sync::atomic::Ordering::SeqCst),
             "node is shutting down"
         );
+        self.presence.validate()?;
         let topic_id = room_to_topic(room_name);
-
-        {
-            let rooms = self.rooms.read().await;
-            if rooms.contains_key(room_name) {
-                return Ok(topic_id);
-            }
+        if self.rooms.read().await.contains_key(room_name) {
+            return Ok(topic_id);
         }
-
-        let topic = if bootstrap_peers.is_empty() {
-            self.gossip.subscribe(topic_id, bootstrap_peers).await?
-        } else {
-            self.gossip
-                .subscribe_and_join(topic_id, bootstrap_peers)
-                .await?
-        };
-
+        // Subscription must not wait indefinitely for an unreachable bootstrap peer.
+        let topic = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.gossip.subscribe(topic_id, bootstrap_peers.clone()),
+        )
+        .await??;
         let (sender, receiver) = topic.split();
-
-        let join_msg = P2PMessage::new(P2PMessageBody::Join {
-            name: self.user_name.clone(),
-            agent: self.agent_name.clone(),
-        });
-        sender
-            .broadcast(self.try_sign_message(join_msg).await?.to_bytes())
-            .await?;
-
-        let room_name_owned = room_name.to_string();
+        let health = Arc::new(RwLock::new(RoomHealth::default()));
+        let name = room_name.to_owned();
         let manager = Arc::clone(self);
+        let room_health = health.clone();
+        let initial_sender = sender.clone();
+        // Publish the room before its receiver can process a Join and reply.
+        let (start_tx, start_rx) = oneshot::channel();
         let receiver_handle = tokio::spawn(async move {
-            if let Err(e) = manager.receive_loop(&room_name_owned, receiver).await {
-                warn!(room = %room_name_owned, error = %e, "room receive loop ended");
+            if start_rx.await.is_ok() {
+                manager
+                    .supervise_room(
+                        &name,
+                        bootstrap_peers,
+                        initial_sender,
+                        receiver,
+                        room_health,
+                    )
+                    .await;
             }
         });
-
-        {
-            let mut peers = self.peers.write().await;
-            peers.entry(room_name.to_string()).or_default();
-        }
-
-        {
-            let mut rooms = self.rooms.write().await;
-            if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
-                receiver_handle.abort();
-                let _ = receiver_handle.await;
-                anyhow::bail!("node is shutting down");
-            }
-            rooms.insert(
-                room_name.to_string(),
-                RoomInner {
-                    sender,
-                    _receiver_handle: receiver_handle,
-                },
-            );
-        }
-
+        self.peers
+            .write()
+            .await
+            .entry(room_name.to_owned())
+            .or_default();
+        self.rooms.write().await.insert(
+            room_name.to_owned(),
+            RoomInner {
+                sender: Some(sender),
+                health,
+                _receiver_handle: receiver_handle,
+            },
+        );
+        let _ = start_tx.send(());
         Ok(topic_id)
     }
 
     pub async fn leave_room(&self, room_name: &str) -> Result<()> {
+        let _operation = self.lifecycle.lock().await;
         let room = {
             let mut rooms = self.rooms.write().await;
             rooms.remove(room_name)
@@ -371,10 +396,16 @@ impl RoomManager {
             let leave_msg = P2PMessage::new(P2PMessageBody::Leave {
                 name: self.user_name.clone(),
             });
-            if let Ok(msg) = self.try_sign_message(leave_msg).await {
-                let _ = room.sender.broadcast(msg.to_bytes()).await;
-            }
+            // Stop supervision before announcing departure, so it cannot rejoin.
             room._receiver_handle.abort();
+            if let Some(sender) = room.sender {
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    let msg = self.try_sign_message(leave_msg).await?;
+                    sender.broadcast(msg.to_bytes()).await?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+            }
             let _ = room._receiver_handle.await;
         }
 
@@ -387,6 +418,7 @@ impl RoomManager {
     }
 
     pub async fn shutdown(&self) {
+        let _operation = self.lifecycle.lock().await;
         self.closing
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let rooms = std::mem::take(&mut *self.rooms.write().await);
@@ -426,14 +458,15 @@ impl RoomManager {
             .get(room_name)
             .ok_or_else(|| anyhow::anyhow!("not in room: {room_name}"))?
             .sender
-            .clone();
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("room is reconnecting: {room_name}"))?;
         let msg = self.try_sign_message(msg).await?;
         let bytes = msg.to_bytes();
         anyhow::ensure!(
             bytes.len() <= crate::node::GOSSIP_MAX_MESSAGE_SIZE,
             "gossip message exceeds size limit"
         );
-        sender.broadcast(bytes).await?;
+        tokio::time::timeout(Duration::from_secs(5), sender.broadcast(bytes)).await??;
         Ok(())
     }
 
@@ -661,15 +694,135 @@ impl RoomManager {
         self.broadcast_to_room(&task.room, msg).await
     }
 
-    async fn receive_loop(&self, room_name: &str, mut receiver: GossipReceiver) -> Result<()> {
-        use n0_future::TryStreamExt;
+    pub async fn room_health(&self, room_name: &str) -> Option<RoomHealth> {
+        let health = self.rooms.read().await.get(room_name)?.health.clone();
+        Some(health.read().await.clone())
+    }
 
-        while let Some(event) = receiver.try_next().await? {
-            if let Event::Received(msg) = event {
-                self.handle_message(room_name, &msg.content).await;
+    async fn supervise_room(
+        &self,
+        room: &str,
+        bootstrap: Vec<iroh::EndpointId>,
+        sender: GossipSender,
+        receiver: GossipReceiver,
+        health: Arc<RwLock<RoomHealth>>,
+    ) {
+        let mut known: HashSet<_> = bootstrap.into_iter().take(128).collect();
+        let mut transport = Some((sender, receiver));
+        let mut backoff = Backoff::default();
+        loop {
+            if let Some((sender, receiver)) = transport.take() {
+                let started = Instant::now();
+                let result = self
+                    .receive_loop(room, &sender, receiver, &mut known, &health)
+                    .await;
+                if started.elapsed() >= Duration::from_secs(30) {
+                    backoff.reset();
+                }
+                let error = result
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "room event stream closed".into());
+                warn!(%room, %error, "reconnecting room subscription");
+                let mut state = health.write().await;
+                state.state = "reconnecting".into();
+                state.neighbors = 0;
+                state.last_error = Some(error);
+            }
+            // Release every sender for the failed subscription before creating another.
+            if let Some(entry) = self.rooms.write().await.get_mut(room) {
+                entry.sender = None;
+            } else {
+                return;
+            }
+            tokio::time::sleep(backoff.next()).await;
+            health.write().await.reconnect_attempts += 1;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.gossip
+                    .subscribe(room_to_topic(room), known.iter().copied().collect()),
+            )
+            .await;
+            match result {
+                Ok(Ok(topic)) => {
+                    let (sender, receiver) = topic.split();
+                    if let Some(entry) = self.rooms.write().await.get_mut(room) {
+                        entry.sender = Some(sender.clone());
+                    } else {
+                        return;
+                    }
+                    // Reset only after a useful connection, not a subscription that
+                    // can immediately fail again. The inner loop tracks peer retries.
+                    transport = Some((sender, receiver));
+                }
+                error => {
+                    health.write().await.last_error = Some(format!("resubscribe failed: {error:?}"))
+                }
             }
         }
-        Ok(())
+    }
+
+    async fn receive_loop(
+        &self,
+        room: &str,
+        sender: &GossipSender,
+        mut receiver: GossipReceiver,
+        known: &mut HashSet<iroh::EndpointId>,
+        health: &RwLock<RoomHealth>,
+    ) -> Result<()> {
+        use n0_future::TryStreamExt;
+        let mut heartbeat = tokio::time::interval(self.presence.heartbeat);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut neighbors = HashSet::new();
+        let mut retry = Backoff::default();
+        let mut retry_at = Instant::now() + retry.next();
+        loop {
+            tokio::select! {
+                event = receiver.try_next() => match event? {
+                    Some(Event::Received(msg)) => self.handle_message(room, &msg.content).await,
+                    Some(Event::NeighborUp(id)) => {
+                        neighbors.insert(id);
+                        if known.len() < 128 { known.insert(id); }
+                        retry.reset();
+                        let mut state = health.write().await;
+                        state.state = "connected".into();
+                        state.neighbors = neighbors.len();
+                        state.last_error = None;
+                        // Advertise immediately to newly reachable peers.
+                        heartbeat.reset_immediately();
+                    }
+                    Some(Event::NeighborDown(id)) => {
+                        neighbors.remove(&id);
+                        let mut state = health.write().await;
+                        state.neighbors = neighbors.len();
+                        if neighbors.is_empty() {
+                            state.state = "reconnecting".into();
+                            state.last_error = Some("all direct neighbors disconnected".into());
+                            retry.reset();
+                            retry_at = Instant::now() + retry.next();
+                        }
+                    }
+                    Some(Event::Lagged) => anyhow::bail!("gossip event stream lagged; resynchronizing presence"),
+                    None => return Ok(()),
+                },
+                _ = heartbeat.tick() => {
+                    self.broadcast_to_room(room, P2PMessage::new(P2PMessageBody::Join {
+                        name: self.user_name.clone(), agent: self.agent_name.clone(),
+                    })).await?;
+                    // Keep offline peers for diagnostics, but bound their retention.
+                    let retention = self.presence.offline_after.max(Duration::from_secs(3600));
+                    if let Some(peers) = self.peers.write().await.get_mut(room) {
+                        peers.retain(|_, p| p.last_seen.elapsed() < retention);
+                    }
+                }
+                _ = tokio::time::sleep_until(retry_at), if neighbors.is_empty() && !known.is_empty() => {
+                    health.write().await.reconnect_attempts += 1;
+                    tokio::time::timeout(Duration::from_secs(5),
+                        sender.join_peers(known.iter().copied().collect())).await??;
+                    retry_at = Instant::now() + retry.next();
+                }
+            }
+        }
     }
 
     async fn handle_message(&self, room_name: &str, content: &Bytes) {
@@ -693,6 +846,16 @@ impl RoomManager {
     /// without constructing a real gossip transport.
     pub(crate) async fn handle_verified_message(&self, room_name: &str, msg: P2PMessage) {
         let signed_by = msg.signed_by.clone();
+        if signed_by.is_some()
+            && let Some(peers) = self.peers.write().await.get_mut(room_name)
+        {
+            for peer in peers
+                .values_mut()
+                .filter(|p| p.accepts_identity(signed_by.as_ref()))
+            {
+                peer.last_seen = Instant::now();
+            }
+        }
         match msg.body {
             P2PMessageBody::Join { name, agent } => {
                 let is_new = {
@@ -705,7 +868,12 @@ impl RoomManager {
                         return;
                     }
                     let is_new = !room_peers.contains_key(&name);
-                    room_peers.insert(name.clone(), PeerInfo::new(name, agent, signed_by));
+                    if let Some(peer) = room_peers.get_mut(&name) {
+                        peer.agent = agent;
+                        peer.last_seen = Instant::now();
+                    } else {
+                        room_peers.insert(name.clone(), PeerInfo::new(name, agent, signed_by));
+                    }
                     is_new
                 };
 
@@ -745,6 +913,7 @@ impl RoomManager {
                     && let Some(peer) = room_peers.get_mut(&author)
                 {
                     peer.last_status = Some(text);
+                    peer.last_seen = Instant::now();
                 } else {
                     warn!(room = %room_name, peer = %author, "dropped status whose author identity does not match");
                 }
@@ -1194,6 +1363,7 @@ mod tests {
     #[tokio::test]
     async fn verified_ingress_rejects_forgery_then_stores_and_reports_real_conflict() {
         let node = BuddiesNode::new(BuddiesNodeConfig {
+            presence: crate::resilience::PresenceConfig::default(),
             user_name: "local".into(),
             agent_name: "codex".into(),
             data_dir: None,
@@ -1410,6 +1580,7 @@ mod tests {
     }
     async fn regression_node() -> BuddiesNode {
         BuddiesNode::new(BuddiesNodeConfig {
+            presence: crate::resilience::PresenceConfig::default(),
             user_name: "local".into(),
             agent_name: "test".into(),
             data_dir: None,
@@ -1784,5 +1955,189 @@ mod tests {
             );
         }
         node.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn heartbeat_recovers_presence_without_erasing_status_or_accepting_takeover() {
+        let node = regression_node().await;
+        let manager = &node.room_manager;
+        let identity = SignerIdentity::Gpg {
+            key_id: "a".repeat(40),
+        };
+        let mut peer = PeerInfo::new("alice".into(), "test".into(), Some(identity.clone()));
+        peer.last_status = Some("working".into());
+        peer.last_seen = Instant::now() - Duration::from_secs(100);
+        manager
+            .peers
+            .write()
+            .await
+            .entry("a".into())
+            .or_default()
+            .insert("alice".into(), peer);
+        let join = || {
+            P2PMessage::new(P2PMessageBody::Join {
+                name: "alice".into(),
+                agent: "updated".into(),
+            })
+        };
+        let mut forged = join();
+        forged.signed_by = Some(SignerIdentity::Gpg {
+            key_id: "b".repeat(40),
+        });
+        manager.handle_verified_message("a", forged).await;
+        let peers = manager.get_room_peers("a").await;
+        assert_eq!(peers["alice"].presence(manager.presence), Presence::Offline);
+        let mut genuine = join();
+        genuine.signed_by = Some(identity);
+        manager.handle_verified_message("a", genuine).await;
+        let peers = manager.get_room_peers("a").await;
+        assert_eq!(peers["alice"].presence(manager.presence), Presence::Online);
+        assert_eq!(peers["alice"].last_status.as_deref(), Some("working"));
+        assert_eq!(peers["alice"].agent, "updated");
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_room_stream_retries_and_leave_cancels_supervision() {
+        let node = regression_node().await;
+        let manager = &node.room_manager;
+        manager.join_room("failure", vec![]).await.unwrap();
+        manager.gossip.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let health = manager.room_health("failure").await.unwrap();
+                if health.reconnect_attempts > 0 && health.last_error.is_some() {
+                    assert_eq!(health.state, "reconnecting");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let health = manager.rooms.read().await["failure"].health.clone();
+        manager.leave_room("failure").await.unwrap();
+        let retries = health.read().await.reconnect_attempts;
+        tokio::time::sleep(Duration::from_millis(1600)).await;
+        assert!(!manager.is_joined("failure").await);
+        assert_eq!(health.read().await.reconnect_attempts, retries);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_joins_create_one_subscription() {
+        let node = regression_node().await;
+        let manager = &node.room_manager;
+        let (a, b) = tokio::join!(
+            manager.join_room("a", vec![]),
+            manager.join_room("a", vec![])
+        );
+        assert_eq!(a.unwrap(), b.unwrap());
+        assert_eq!(manager.list_rooms().await, vec!["a"]);
+        node.shutdown().await.unwrap();
+        assert!(manager.join_room("a", vec![]).await.is_err());
+    }
+    #[tokio::test]
+    async fn p2p_presence_expires_and_recovers_after_unannounced_departure() {
+        use iroh::{
+            Endpoint, address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router,
+        };
+        let lookup = MemoryLookup::new();
+        let a = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .address_lookup(lookup.clone())
+            .bind()
+            .await
+            .unwrap();
+        let b = Endpoint::builder(presets::Minimal)
+            .bind_addr("127.0.0.1:0")
+            .unwrap()
+            .address_lookup(lookup.clone())
+            .bind()
+            .await
+            .unwrap();
+        lookup.add_endpoint_info(a.addr());
+        lookup.add_endpoint_info(b.addr());
+        let ga = Gossip::builder().spawn(a.clone());
+        let gb = Gossip::builder().spawn(b.clone());
+        let ra = Router::builder(a.clone())
+            .accept(iroh_gossip::ALPN, ga.clone())
+            .spawn();
+        let rb = Router::builder(b.clone())
+            .accept(iroh_gossip::ALPN, gb.clone())
+            .spawn();
+        let config = PresenceConfig {
+            heartbeat: Duration::from_millis(100),
+            suspect_after: Duration::from_millis(400),
+            offline_after: Duration::from_millis(800),
+        };
+        let storage = Arc::new(AsyncStorage::open(None).await.unwrap());
+        let ma = RoomManager::new(
+            ga,
+            "alice".into(),
+            "test".into(),
+            storage.clone(),
+            None,
+            Arc::new(DirtySet::new()),
+            config,
+        );
+        let mb = RoomManager::new(
+            gb.clone(),
+            "bob".into(),
+            "test".into(),
+            storage.clone(),
+            None,
+            Arc::new(DirtySet::new()),
+            config,
+        );
+        ma.join_room("test", vec![]).await.unwrap();
+        mb.join_room("test", vec![a.id()]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if ma.get_room_peers("test").await.contains_key("bob") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Stop receiving/sending without broadcasting Leave (crash-like behavior).
+        mb.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if ma.get_room_peers("test").await["bob"].presence(config) == Presence::Offline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let returned = RoomManager::new(
+            gb,
+            "bob".into(),
+            "test".into(),
+            storage,
+            None,
+            Arc::new(DirtySet::new()),
+            config,
+        );
+        returned.join_room("test", vec![a.id()]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if ma.get_room_peers("test").await["bob"].presence(config) == Presence::Online {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ma.room_health("test").await.unwrap().state, "connected");
+        ma.shutdown().await;
+        returned.shutdown().await;
+        ra.shutdown().await.unwrap();
+        rb.shutdown().await.unwrap();
     }
 }

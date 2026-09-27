@@ -11,6 +11,10 @@ use crate::node::BuddiesNode;
 pub struct Clients(Mutex<Vec<Peer<RoleServer>>>);
 
 impl Clients {
+    pub fn prune(&self) {
+        self.0.lock().unwrap().retain(|p| !p.is_transport_closed());
+    }
+
     pub fn register(&self, peer: Peer<RoleServer>) {
         let mut clients = self.0.lock().unwrap();
         clients.retain(|p| !p.is_transport_closed());
@@ -51,6 +55,8 @@ pub struct Client {
 pub struct Room {
     pub name: String,
     pub peers: Vec<Agent>,
+    #[serde(default)]
+    pub connection: crate::room::RoomHealth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +64,10 @@ pub struct Agent {
     pub name: String,
     pub agent: String,
     pub status: Option<String>,
+    #[serde(default)]
+    pub presence: crate::resilience::Presence,
+    #[serde(default)]
+    pub last_seen_secs: u64,
 }
 
 pub async fn snapshot(State(node): State<Arc<BuddiesNode>>) -> Json<Snapshot> {
@@ -71,13 +81,24 @@ pub async fn snapshot(State(node): State<Arc<BuddiesNode>>) -> Json<Snapshot> {
             .await
             .into_values()
             .map(|p| Agent {
+                presence: p.presence(node.room_manager.presence),
+                last_seen_secs: p.last_seen.elapsed().as_secs(),
                 name: p.name,
                 agent: p.agent,
                 status: p.last_status,
             })
             .collect();
         peers.sort_by(|a, b| a.name.cmp(&b.name));
-        rooms.push(Room { name, peers });
+        let connection = node
+            .room_manager
+            .room_health(&name)
+            .await
+            .unwrap_or_default();
+        rooms.push(Room {
+            name,
+            peers,
+            connection,
+        });
     }
     Json(Snapshot {
         node_id: node.endpoint.id().to_string(),

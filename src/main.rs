@@ -6,8 +6,10 @@ mod monitor;
 mod node;
 mod pending;
 mod protocol;
+mod resilience;
 mod room;
 mod server;
+mod sessions;
 mod skill;
 mod status;
 mod storage;
@@ -22,9 +24,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use std::future::{Future, IntoFuture};
 use std::time::Duration;
 
@@ -104,6 +104,7 @@ async fn main() -> Result<()> {
             agent_name,
             signer,
             data_dir: data_path,
+            presence: resilience::PresenceConfig::from_env()?,
         })
         .await?,
     );
@@ -166,9 +167,20 @@ async fn serve_http(
 ) -> Result<()> {
     let ct = node.shutdown_token.clone();
     let status_node = node.clone();
+    let sessions = sessions::Sessions::new(resilience::env_duration("BUDDIES_MCP_IDLE_SECS", 300)?);
+    let maintenance_node = node.clone();
+    let maintenance_sessions = sessions.clone();
+    let maintenance = async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            maintenance_sessions.sweep().await;
+            maintenance_node.clients.prune();
+        }
+    };
     let service = StreamableHttpService::new(
         move || Ok(BuddiesServer::new(node.clone())),
-        LocalSessionManager::default().into(),
+        sessions.manager.clone(),
         StreamableHttpServerConfig::default()
             .with_legacy_session_mode(true)
             .with_cancellation_token(ct.child_token()),
@@ -176,12 +188,18 @@ async fn serve_http(
     let app = axum::Router::new()
         .route("/status", axum::routing::get(status::snapshot))
         .with_state(status_node)
-        .nest_service("/mcp", service);
+        .nest_service(
+            "/mcp",
+            axum::Router::new().fallback_service(service).layer(
+                axum::middleware::from_fn_with_state(sessions, sessions::activity),
+            ),
+        );
     let serve = axum::serve(listener, app)
         .with_graceful_shutdown(ct.clone().cancelled_owned())
         .into_future();
     tokio::pin!(serve);
     tokio::select! {
+        _ = maintenance => unreachable!("session maintenance does not terminate"),
         result = &mut serve => { result?; }
         _ = shutdown => {
             ct.cancel();

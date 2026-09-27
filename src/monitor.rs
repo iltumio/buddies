@@ -122,7 +122,7 @@ pub async fn run(base: &str, once: bool) -> Result<()> {
             .unwrap_or_default();
         peer_index = peer_index.min(peers.len().saturating_sub(1));
         terminal.draw(|frame| {
-            let areas = Layout::vertical([Constraint::Length(4), Constraint::Min(3), Constraint::Length(3)]).split(frame.area());
+            let areas = Layout::vertical([Constraint::Length(4), Constraint::Min(3), Constraint::Length(5)]).split(frame.area());
             let state = match (&error, updated) {
                 (Some(e), _) => format!("OFFLINE — {}", clean(e)),
                 (None, Some(t)) => format!("LIVE — updated {}s ago", t.elapsed().as_secs()),
@@ -137,7 +137,7 @@ pub async fn run(base: &str, once: bool) -> Result<()> {
             let room_items: Vec<ListItem> = if rooms.is_empty() {
                 vec![ListItem::new("No rooms joined")]
             } else {
-                rooms.iter().map(|r| ListItem::new(format!("{} ({})", clean(&r.name), r.peers.len()))).collect()
+                rooms.iter().map(|r| ListItem::new(format!("{} ({}) [{}]", clean(&r.name), r.peers.len(), clean(&r.connection.state)))).collect()
             };
             let mut selection = ListState::default().with_selected((!rooms.is_empty()).then_some(room_index));
             frame.render_stateful_widget(List::new(room_items).block(Block::bordered().title(" Rooms "))
@@ -145,17 +145,22 @@ pub async fn run(base: &str, once: bool) -> Result<()> {
             let clients = snapshot.as_ref().map(|s| s.clients.iter().map(|c| format!("{} {}", clean(&c.name), clean(&c.version))).collect::<Vec<_>>().join("\n")).unwrap_or_default();
             frame.render_widget(Paragraph::new(if clients.is_empty() { "No active MCP sessions".into() } else { clients })
                 .block(Block::bordered().title(" Local MCP sessions ")), left[1]);
-            let rows = peers.iter().map(|p| Row::new(vec![clean(&p.name), clean(&p.agent), clean(p.status.as_deref().unwrap_or("—"))]));
+            let rows = peers.iter().map(|p| Row::new(vec![clean(&p.name), clean(&p.agent), p.presence.to_string(), format!("{}s", p.last_seen_secs), clean(p.status.as_deref().unwrap_or("—"))]));
             let title = if peers.is_empty() { " Known P2P agents — no peers " } else { " Known P2P agents — last reported state " };
-            let table = Table::new(rows, [Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(50)])
-                .header(Row::new(["User", "Agent", "Last status"]).style(Style::default().fg(Color::Cyan)))
+            let table = Table::new(rows, [Constraint::Percentage(20), Constraint::Percentage(20), Constraint::Length(12), Constraint::Length(8), Constraint::Min(10)])
+                .header(Row::new(["User", "Agent", "Presence", "Seen", "Last status"]).style(Style::default().fg(Color::Cyan)))
                 .block(Block::bordered().title(title))
                 .row_highlight_style(Style::default().bg(Color::DarkGray));
             let mut state = TableState::default().with_selected((!peers.is_empty()).then_some(peer_index));
             frame.render_stateful_widget(table, columns[1], &mut state);
             let footer = if error.is_some() { "Retrying automatically; displayed data may be stale. q: quit" }
                 else { "↑/↓ or j/k: rooms · PgUp/PgDn: agents · q/Esc/Ctrl-C: quit\nP2P membership is last known state, not a live connection guarantee." };
-            frame.render_widget(Paragraph::new(footer).block(Block::bordered()), areas[2]);
+            let diagnostic = rooms.get(room_index).map(|r| format!(
+                "{} · {} neighbors · {} retries · {}", clean(&r.connection.state),
+                r.connection.neighbors, r.connection.reconnect_attempts,
+                clean(r.connection.last_error.as_deref().unwrap_or("no transport errors"))
+            )).unwrap_or_default();
+            frame.render_widget(Paragraph::new(format!("{footer}\n{diagnostic}")).block(Block::bordered()), areas[2]);
         })?;
         if event::poll(Duration::ZERO)?
             && let Event::Key(key) = event::read()?

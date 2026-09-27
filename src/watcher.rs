@@ -545,6 +545,7 @@ mod tests {
     async fn repeated_watch_returns_the_room_that_is_actually_active() {
         let repo = fixture_repo().await;
         let node = BuddiesNode::new(BuddiesNodeConfig {
+            presence: crate::resilience::PresenceConfig::default(),
             user_name: "alice".into(),
             agent_name: "codex".into(),
             data_dir: None,
@@ -587,6 +588,7 @@ mod tests {
     async fn watcher_debounces_edits_and_clears_dirty_state_after_commit() {
         let repo = fixture_repo().await;
         let node = BuddiesNode::new(BuddiesNodeConfig {
+            presence: crate::resilience::PresenceConfig::default(),
             user_name: "alice".into(),
             agent_name: "codex".into(),
             data_dir: None,
@@ -648,6 +650,7 @@ mod tests {
     async fn watcher_reconciles_stale_dirty_state_when_an_event_is_missed() {
         let repo = fixture_repo().await;
         let node = BuddiesNode::new(BuddiesNodeConfig {
+            presence: crate::resilience::PresenceConfig::default(),
             user_name: "alice".into(),
             agent_name: "codex".into(),
             data_dir: None,
@@ -730,6 +733,7 @@ mod tests {
     async fn node_shutdown_stops_active_watchers_and_clears_dirty_state() {
         let repo = fixture_repo().await;
         let node = BuddiesNode::new(BuddiesNodeConfig {
+            presence: crate::resilience::PresenceConfig::default(),
             user_name: "local".into(),
             agent_name: "test".into(),
             data_dir: None,
