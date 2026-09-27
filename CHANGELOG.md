@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/iltumio/buddies/compare/v0.1.5...v0.1.6) - 2026-09-27
+
+### Added
+
+- add Ratatui network monitor for shared buddies service
+
 ## [0.1.5](https://github.com/iltumio/buddies/compare/v0.1.4...v0.1.5) - 2026-09-27
 
 ### Added
