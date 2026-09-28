@@ -93,7 +93,7 @@ def main():
                                "clientInfo": {"name": "smoke-test", "version": "1"}})
             headers["MCP-Protocol-Version"] = "2025-03-26"
             rpc("notifications/initialized", {}, notification=True)
-            assert len(rpc("tools/list", {})["tools"]) == 22
+            assert len(rpc("tools/list", {})["tools"]) == 23
             rpc("tools/call", {"name": "join_room", "arguments": {"room": "smoke"}})
             rpc("tools/call", {"name": "watch_repo", "arguments": {
                 "room": "smoke", "repo_path": str(repo), "repo_name": "fixture"}})
@@ -189,7 +189,7 @@ def main():
                         assert result["id"] == msg["id"] and "result" in result, result
                         if msg["method"] == "initialize":
                             check_server_info(result["result"])
-                assert len(result["result"]["tools"]) == 22
+                assert len(result["result"]["tools"]) == 23
                 process.stdin.close()
                 assert process.wait(timeout=10) == 0
                 print("stdio initialize/tools/EOF: OK")

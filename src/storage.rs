@@ -63,6 +63,31 @@ impl Storage {
         Ok(Self { db })
     }
 
+    /// Commit a durable queue operation atomically.
+    pub fn worker_queue<T>(
+        &self,
+        operation: impl FnOnce(&mut crate::worker_queue::Queue) -> Result<T>,
+    ) -> Result<T> {
+        const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("worker_queue");
+        let tx = self.db.begin_write()?;
+        let result = {
+            let mut table = tx.open_table(TABLE)?;
+            let previous = table.get("state")?.map(|v| v.value().to_vec());
+            let mut queue = match &previous {
+                Some(value) => serde_json::from_slice(value)?,
+                None => crate::worker_queue::Queue::default(),
+            };
+            let result = operation(&mut queue)?;
+            let bytes = serde_json::to_vec(&queue)?;
+            if previous.as_deref() != Some(bytes.as_slice()) {
+                table.insert("state", bytes.as_slice())?;
+            }
+            result
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Create the transport identity once, atomically with its persistence.
     pub fn endpoint_secret(&self) -> Result<iroh::SecretKey> {
         let tx = self.db.begin_write()?;

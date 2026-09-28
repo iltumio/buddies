@@ -43,6 +43,13 @@ impl AsyncStorage {
         })
         .await?
     }
+    pub async fn worker_queue<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut crate::worker_queue::Queue) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.run(move |storage| storage.worker_queue(operation))
+            .await
+    }
     pub async fn endpoint_secret(&self) -> Result<iroh::SecretKey> {
         self.run(Storage::endpoint_secret).await
     }

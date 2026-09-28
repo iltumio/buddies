@@ -49,7 +49,20 @@ fn remote_scope() -> String {
 }
 
 pub async fn snapshot(State(node): State<Arc<BuddiesNode>>) -> Json<Snapshot> {
+    let workers = node
+        .storage
+        .worker_queue(|q| Ok(q.workers(crate::worker_queue::now())))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error=%e, "cannot read worker status");
+            Vec::new()
+        });
     let mut names = node.room_manager.list_rooms().await;
+    for worker in &workers {
+        if !names.contains(&worker.room) {
+            names.push(worker.room.clone());
+        }
+    }
     names.sort();
     let mut rooms = Vec::with_capacity(names.len());
     for name in names {
@@ -68,6 +81,21 @@ pub async fn snapshot(State(node): State<Arc<BuddiesNode>>) -> Json<Snapshot> {
             })
             .collect();
         peers.extend(node.clients.agents(&name, None));
+        peers.extend(workers.iter().filter(|w| w.room == name).map(|w| {
+            let age = crate::worker_queue::now().saturating_sub(w.last_seen);
+            Agent {
+                name: w.id.clone(),
+                agent: w.agent.clone(),
+                scope: "worker".into(),
+                status: Some("automatic executor".into()),
+                presence: if age < crate::worker_queue::LEASE_SECS {
+                    crate::resilience::Presence::Online
+                } else {
+                    crate::resilience::Presence::Offline
+                },
+                last_seen_secs: age,
+            }
+        }));
         peers.sort_by(|a, b| a.name.cmp(&b.name));
         let connection = node
             .room_manager

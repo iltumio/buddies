@@ -189,11 +189,27 @@ pub struct GetRoomStatusRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DelegateTaskRequest {
+    #[schemars(
+        description = "Optional stable worker ID or agent name, e.g. codex. Live workers are preferred automatically when omitted."
+    )]
+    pub target_agent: Option<String>,
+    #[schemars(
+        description = "Return a durable worker task ID immediately instead of waiting (worker tasks only)."
+    )]
+    #[serde(default)]
+    pub background: bool,
     pub room: String,
     #[schemars(description = "A clear description of the task for the remote agent to execute")]
     pub description: String,
     #[schemars(description = "Seconds to wait for a peer to complete the task (default 60)")]
     pub timeout_secs: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetTaskStatusRequest {
+    pub room: String,
+    #[schemars(with = "String")]
+    pub task_id: Uuid,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -457,7 +473,18 @@ impl BuddiesServer {
             .clients
             .require_member(self.session_id, &req.room)
             .map_err(|e| err(e.to_string()))?;
-        if self.node.clients.leave(self.session_id, &req.room) == 0 {
+        let room = req.room.clone();
+        let has_worker = self
+            .node
+            .storage
+            .worker_queue(move |q| {
+                Ok(q.workers(crate::worker_queue::now())
+                    .iter()
+                    .any(|w| w.room == room))
+            })
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        if self.node.clients.leave(self.session_id, &req.room) == 0 && !has_worker {
             self.node
                 .room_manager
                 .leave_room(&req.room)
@@ -649,7 +676,20 @@ impl BuddiesServer {
                     })
                 }),
         );
+        let room = req.room.clone();
+        let workers = self
+            .node
+            .storage
+            .worker_queue(move |q| {
+                Ok(q.workers(crate::worker_queue::now())
+                    .into_iter()
+                    .filter(|w| w.room == room)
+                    .collect::<Vec<_>>())
+            })
+            .await
+            .map_err(|e| err(e.to_string()))?;
         ok_json(&serde_json::json!({
+            "workers": workers,
             "self": crate::local::agent_id(self.session_id),
             "room": req.room,
             "peers": peer_list,
@@ -668,13 +708,65 @@ impl BuddiesServer {
 
     #[tool(
         name = "delegate_task",
-        description = "Delegate a task to a peer agent in the room. Broadcasts the task and blocks until a peer completes it or the timeout expires. The result is returned as if executed locally."
+        description = "Delegate to an automatic worker when available, otherwise a local MCP agent or P2P peer. Use target_agent=codex to select a registered worker. background=true returns a durable task_id for get_task_status; otherwise waits for completion. Merely connected MCP agents may require manual polling."
     )]
     async fn delegate_task(
         &self,
         Parameters(req): Parameters<DelegateTaskRequest>,
     ) -> Result<CallToolResult, McpError> {
         let timeout = req.timeout_secs.unwrap_or(60);
+
+        self.node
+            .clients
+            .require_member(self.session_id, &req.room)
+            .map_err(|e| err(e.to_string()))?;
+        let room = req.room.clone();
+        let description = req.description.clone();
+        let target = req.target_agent.clone();
+        let queued = self
+            .node
+            .storage
+            .worker_queue(move |q| {
+                q.enqueue(
+                    &room,
+                    &description,
+                    target.as_deref(),
+                    timeout,
+                    crate::worker_queue::now(),
+                )
+            })
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        if let Some(mut job) = queued {
+            if req.background {
+                return ok_json(
+                    &serde_json::json!({"task_id":job.id,"status":job.state,"worker_id":job.worker_id,"room":job.room}),
+                );
+            }
+            loop {
+                if let Some(outcome) = &job.outcome {
+                    return ok_json(
+                        &serde_json::json!({"task_id":job.id,"worker_id":job.worker_id,
+                        "status":if outcome.success {"completed"} else {"error"},
+                        "output":outcome.output,"error":if outcome.success {None} else {Some(&outcome.output)}}),
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let room = req.room.clone();
+                let id = job.id;
+                job = self
+                    .node
+                    .storage
+                    .worker_queue(move |q| q.get(&room, id, crate::worker_queue::now()))
+                    .await
+                    .map_err(|e| err(e.to_string()))?;
+            }
+        }
+        if req.background {
+            return Err(err(
+                "background delegation requires a registered worker; specify target_agent for an offline worker",
+            ));
+        }
 
         let result = match self
             .node
@@ -702,6 +794,27 @@ impl BuddiesServer {
                 "error": message,
             })),
         }
+    }
+
+    #[tool(
+        name = "get_task_status",
+        description = "Read a durable worker task by task_id and room, including after reconnecting. Returns queued, running, completed or failed and the stored outcome."
+    )]
+    async fn get_task_status(
+        &self,
+        Parameters(req): Parameters<GetTaskStatusRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        self.node
+            .clients
+            .require_member(self.session_id, &req.room)
+            .map_err(|e| err(e.to_string()))?;
+        let job = self
+            .node
+            .storage
+            .worker_queue(move |q| q.get(&req.room, req.task_id, crate::worker_queue::now()))
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        ok_json(&job)
     }
 
     #[tool(

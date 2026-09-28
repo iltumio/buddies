@@ -146,7 +146,7 @@ pub async fn run(base: &str, once: bool) -> Result<()> {
             frame.render_widget(Paragraph::new(if clients.is_empty() { "No active MCP sessions".into() } else { clients })
                 .block(Block::bordered().title(" Local MCP sessions ")), left[1]);
             let rows = peers.iter().map(|p| Row::new(vec![clean(&p.name), format!("{} · {}", clean(&p.scope), clean(&p.agent)), p.presence.to_string(), format!("{}s", p.last_seen_secs), clean(p.status.as_deref().unwrap_or("—"))]));
-            let title = if peers.is_empty() { " Room participants — none " } else { " Room participants — local / remote " };
+            let title = if peers.is_empty() { " Room participants — none " } else { " Room participants — local / worker / remote " };
             let table = Table::new(rows, [Constraint::Percentage(20), Constraint::Percentage(20), Constraint::Length(12), Constraint::Length(8), Constraint::Min(10)])
                 .header(Row::new(["User", "Agent", "Presence", "Seen", "Last status"]).style(Style::default().fg(Color::Cyan)))
                 .block(Block::bordered().title(title))

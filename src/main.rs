@@ -17,6 +17,8 @@ mod storage;
 mod ticket;
 mod validation;
 mod watcher;
+mod worker;
+mod worker_queue;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +50,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run an automatic Codex executor for one room and repository.
+    Worker(worker::Options),
     /// Monitor a running buddies HTTP server without opening its database.
     Monitor {
         /// Server URL (the /mcp suffix is also accepted).
@@ -62,8 +66,10 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(Command::Monitor { url, once }) = cli.command {
-        return monitor::run(&url, once).await;
+    match cli.command {
+        Some(Command::Monitor { url, once }) => return monitor::run(&url, once).await,
+        Some(Command::Worker(options)) => return worker::run(options).await,
+        None => {}
     }
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -188,6 +194,7 @@ async fn serve_http(
     );
     let app = axum::Router::new()
         .route("/status", axum::routing::get(status::snapshot))
+        .route("/worker", axum::routing::post(worker_queue::handle))
         .with_state(status_node)
         .nest_service(
             "/mcp",

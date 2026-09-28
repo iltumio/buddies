@@ -16,10 +16,10 @@ def decode(ticket):
 
 
 class Server:
-    def __init__(self, binary, directory, name):
+    def __init__(self, binary, directory, name, port="0"):
         self.proc = subprocess.Popen([str(binary)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             env=dict(os.environ, BUDDIES_DATA_DIR=directory, BUDDIES_SIGNER='none',
-                     BUDDIES_USER=name, BUDDIES_TRANSPORT='http', BUDDIES_HOST='127.0.0.1', BUDDIES_PORT='0'))
+                     BUDDIES_USER=name, BUDDIES_TRANSPORT='http', BUDDIES_HOST='127.0.0.1', BUDDIES_PORT=str(port)))
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if select.select([self.proc.stderr], [], [], .1)[0]:

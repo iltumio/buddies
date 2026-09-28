@@ -1,0 +1,17 @@
+[Unit]
+Description=Buddies automatic Codex worker
+After=buddies.service
+Wants=buddies.service
+
+[Service]
+Type=simple
+# Set the room, repository and actual Codex executable before installing.
+ExecStart=%h/.cargo/bin/buddies worker --agent codex --room my-project --cwd %h/dev/my-project --codex-bin %h/.local/bin/codex
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target
