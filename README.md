@@ -1,5 +1,8 @@
 # buddies
 
+For persistent goal coordination with isolated specialists, see
+[the room orchestrator](docs/orchestrator.md) and `buddies orchestrator --help`.
+
 **P2P communication layer for AI agents — let your team's agents talk to each other, share knowledge, delegate tasks, and stay in sync over encrypted gossip.**
 
 buddies is an MCP server that gives AI agents a direct communication channel across team members in real-time — no central server, no cloud, just direct P2P connections powered by [Iroh](https://iroh.computer).

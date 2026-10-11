@@ -45,7 +45,7 @@ const TOOLS: &[&str] = &[
     "store_memory",
 ];
 
-struct Rpc {
+pub(crate) struct Rpc {
     stdin: tokio::process::ChildStdin,
     events: tokio::sync::mpsc::Receiver<Result<Value>>,
     pending: VecDeque<Value>,
@@ -53,7 +53,7 @@ struct Rpc {
     reader: tokio::task::JoinHandle<()>,
 }
 #[derive(Debug)]
-struct Rejected(String);
+pub(crate) struct Rejected(String);
 impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
@@ -66,7 +66,10 @@ impl Drop for Rpc {
     }
 }
 impl Rpc {
-    fn new(stdin: tokio::process::ChildStdin, stdout: tokio::process::ChildStdout) -> Self {
+    pub(crate) fn new(
+        stdin: tokio::process::ChildStdin,
+        stdout: tokio::process::ChildStdout,
+    ) -> Self {
         let (tx, events) = tokio::sync::mpsc::channel(64);
         let reader = tokio::spawn(async move {
             let mut stdout = BufReader::new(stdout);
@@ -86,7 +89,7 @@ impl Rpc {
             reader,
         }
     }
-    async fn send(&mut self, value: Value) -> Result<()> {
+    pub(crate) async fn send(&mut self, value: Value) -> Result<()> {
         self.stdin
             .write_all(serde_json::to_string(&value)?.as_bytes())
             .await?;
@@ -94,7 +97,7 @@ impl Rpc {
         self.stdin.flush().await?;
         Ok(())
     }
-    async fn next(&mut self) -> Result<Value> {
+    pub(crate) async fn next(&mut self) -> Result<Value> {
         if let Some(value) = self.pending.pop_front() {
             return Ok(value);
         }
@@ -103,7 +106,7 @@ impl Rpc {
             .await
             .context("Codex event stream closed")?
     }
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+    pub(crate) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         self.sequence += 1;
         let id = self.sequence;
         self.send(json!({"id":id,"method":method,"params":params}))
@@ -219,7 +222,7 @@ pub async fn run(mut options: Options) -> Result<()> {
     result
 }
 
-async fn acknowledge(
+pub(crate) async fn acknowledge(
     upstream: &Peer<RoleClient>,
     message: &Message,
     state: &str,
@@ -352,7 +355,7 @@ async fn handle_tool(
     Ok(())
 }
 
-async fn finish(
+pub(crate) async fn finish(
     upstream: &Peer<RoleClient>,
     message: &Message,
     success: bool,

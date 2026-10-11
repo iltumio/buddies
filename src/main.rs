@@ -8,6 +8,7 @@ mod local;
 mod memory;
 mod monitor;
 mod node;
+mod orchestrator;
 mod pending;
 mod protocol;
 mod resilience;
@@ -59,6 +60,8 @@ enum Command {
     Channel(channel::Options),
     /// Run an automatic Codex executor for one room and repository.
     Worker(worker::Options),
+    /// Coordinate a goal with persistent assignments and isolated Codex specialists.
+    Orchestrator(orchestrator::Options),
     /// Monitor a running buddies HTTP server without opening its database.
     Monitor {
         /// Server URL (the /mcp suffix is also accepted).
@@ -78,6 +81,7 @@ async fn main() -> Result<()> {
         Some(Command::Channel(options)) => return channel::run(options).await,
         Some(Command::Monitor { url, once }) => return monitor::run(&url, once).await,
         Some(Command::Worker(options)) => return worker::run(options).await,
+        Some(Command::Orchestrator(options)) => return orchestrator::run(options).await,
         None => {}
     }
     tracing_subscriber::fmt()

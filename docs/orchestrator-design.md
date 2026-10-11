@@ -1,5 +1,12 @@
 # A room orchestrator
 
+The next implementation increment described here is now available through
+`buddies orchestrator`. See [usage, assignment protocol and recovery](orchestrator.md).
+The baseline implementation section below describes the primitives on which the
+command was built. A deterministic producer/consumer experiment covers the
+runtime protocol; a real-model comparison with direct peer coordination remains
+an opt-in experiment.
+
 ## Recommendation
 
 Use one opt-in, persistent orchestrator per room. It owns the goal, dependencies,
