@@ -164,6 +164,11 @@ Or just tell OpenClaw in natural language: *"Add buddies as a local MCP stdio se
 | **list_memories** | List local memories with optional filters. |
 | **notify_peers** | Broadcast a status update ("I just finished the auth module"). |
 | **get_room_status** | See who's in the room and what they're working on. |
+| **register_participant** | Register a stable conversation name, reception mode and whether you accept tasks. |
+| **send_message** | Send a durable question, answer, request or update to a named participant on this service. |
+| **poll_messages** | Read your inbox without marking messages handled. |
+| **get_conversation** | Read your conversation history and receipt states. |
+| **acknowledge_message** | Explicitly mark a received message read, handled or failed. |
 | **list_rooms** | List all rooms you've joined. |
 | **delegate_task** | Send a task to peer agents and block until one completes it. |
 | **poll_pending_tasks** | Check for tasks delegated to you by peers (supports long-polling). |
@@ -298,7 +303,18 @@ When running with `BUDDIES_TRANSPORT=http`, buddies automatically pushes real-ti
 - **Method**: `notifications/buddies/taskArrived`
 - **Params**: `{ task_id, source_peer, room, description, timestamp, timeout_secs }`
 
-This means the receiving agent learns about new tasks instantly — no polling required. The existing `poll_pending_tasks` tool still works as a fallback for stdio transport or clients that don't handle custom notifications.
+The MCP client receives the notification, but must explicitly deliver it to the
+model and start or continue an agent turn. A successful transport write does not
+prove the model read it. `poll_pending_tasks` remains available for clients that
+do not handle custom notifications. Local participants must explicitly declare
+`accepts_tasks: true` through `register_participant` before receiving delegations.
+
+For ongoing Claude Code/Codex conversations, see
+[Interactive collaboration](docs/collaboration.md). `buddies channel` bridges
+the shared HTTP service into Claude Code Channels; `buddies agent` runs a managed
+Codex conversation that retains its thread across messages and can accept updates
+during an active turn. Both are opt-in commands; starting the MCP service alone
+does not launch a model.
 
 ## Repo awareness
 
@@ -436,8 +452,11 @@ information; it cannot make an offline external process reachable.
 
 `notify_peers` updates the sender's local status and sends
 `notifications/buddies/status` to other local members. `delegate_task` assigns
-one other local member when available, excluding the sender; otherwise it uses
-P2P delegation. The assignee receives `notifications/buddies/taskArrived` and
+one other local member that explicitly accepts tasks, excluding the sender;
+otherwise it uses P2P delegation when no other local members are connected.
+Connected local members without an executor declaration produce an immediate
+error rather than a silent assignment to an idle session.
+The assignee receives `notifications/buddies/taskArrived` and
 can also use `poll_pending_tasks`. Results are checked against assignee, room
 and source agent; late or duplicate local results are rejected. Local tasks
 are cancelled on timeout, departure, disconnection or request cancellation.

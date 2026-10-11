@@ -26,6 +26,12 @@ def main():
         assert result["serverInfo"]["name"] == package["name"], result
         assert result["serverInfo"]["version"] == package["version"], result
 
+    def check_tools(result):
+        names = [tool["name"] for tool in result["tools"]]
+        assert len(names) == len(set(names)), 'duplicate tool names'
+        assert {"join_room", "delegate_task", "watch_repo", "register_participant",
+                "send_message", "poll_messages", "get_conversation", "acknowledge_message"}.issubset(names)
+
     with tempfile.TemporaryDirectory(prefix="buddies-smoke-") as temp:
         root = Path(temp)
         repo = root / "repo"
@@ -93,7 +99,7 @@ def main():
                                "clientInfo": {"name": "smoke-test", "version": "1"}})
             headers["MCP-Protocol-Version"] = "2025-03-26"
             rpc("notifications/initialized", {}, notification=True)
-            assert len(rpc("tools/list", {})["tools"]) == 23
+            check_tools(rpc("tools/list", {}))
             rpc("tools/call", {"name": "join_room", "arguments": {"room": "smoke"}})
             rpc("tools/call", {"name": "watch_repo", "arguments": {
                 "room": "smoke", "repo_path": str(repo), "repo_name": "fixture"}})
@@ -189,7 +195,7 @@ def main():
                         assert result["id"] == msg["id"] and "result" in result, result
                         if msg["method"] == "initialize":
                             check_server_info(result["result"])
-                assert len(result["result"]["tools"]) == 23
+                check_tools(result["result"])
                 process.stdin.close()
                 assert process.wait(timeout=10) == 0
                 print("stdio initialize/tools/EOF: OK")

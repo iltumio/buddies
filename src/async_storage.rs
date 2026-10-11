@@ -53,6 +53,13 @@ impl AsyncStorage {
     pub async fn endpoint_secret(&self) -> Result<iroh::SecretKey> {
         self.run(Storage::endpoint_secret).await
     }
+    pub async fn conversations<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut crate::conversation::Conversations) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.run(move |storage| storage.conversations(operation))
+            .await
+    }
     pub async fn room_ticket(&self, room: &str) -> Result<Option<crate::ticket::RoomTicket>> {
         let room = room.to_owned();
         self.run(move |storage| storage.room_ticket(&room)).await

@@ -88,6 +88,31 @@ impl Storage {
         Ok(result)
     }
 
+    /// Commit a conversation/inbox operation atomically.
+    pub fn conversations<T>(
+        &self,
+        operation: impl FnOnce(&mut crate::conversation::Conversations) -> Result<T>,
+    ) -> Result<T> {
+        const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("conversations");
+        let tx = self.db.begin_write()?;
+        let result = {
+            let mut table = tx.open_table(TABLE)?;
+            let previous = table.get("state")?.map(|v| v.value().to_vec());
+            let mut conversations = match &previous {
+                Some(bytes) => serde_json::from_slice(bytes)?,
+                None => crate::conversation::Conversations::default(),
+            };
+            let result = operation(&mut conversations)?;
+            let bytes = serde_json::to_vec(&conversations)?;
+            if previous.as_deref() != Some(bytes.as_slice()) {
+                table.insert("state", bytes.as_slice())?;
+            }
+            result
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Create the transport identity once, atomically with its persistence.
     pub fn endpoint_secret(&self) -> Result<iroh::SecretKey> {
         let tx = self.db.begin_write()?;

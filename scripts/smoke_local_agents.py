@@ -48,8 +48,8 @@ class Client:
         assert 'error' not in msg, msg
         return msg['result']
 
-    def call(self, name, **arguments):
-        result = self.rpc('tools/call', {'name': name, 'arguments': arguments})
+    def call(self, tool_name, **arguments):
+        result = self.rpc('tools/call', {'name': tool_name, 'arguments': arguments})
         assert not result.get('isError'), result
         return json.loads(result['content'][0]['text'])
 
@@ -78,6 +78,7 @@ def main():
             ja = a.call('join_room', room='shared')
             jb = b.call('join_room', room='shared')
             outsider.call('join_room', room='elsewhere')
+            b.call('register_participant', room='shared', name='local-executor', delivery='poll', accepts_tasks=True)
             peers = a.call('get_room_status', room='shared')['peers']
             assert len(peers) == 1, f'Expected other local participant, got {peers}'
             assert ja['agent_id'] != jb['agent_id']
@@ -129,6 +130,7 @@ def main():
                 assert pending.result(timeout=4)['status'] == 'error'
             b = Client(url)
             assert b.call('join_room', room='shared')['agent_id'] != jb['agent_id']
+            b.call('register_participant', room='shared', name='local-executor', delivery='poll', accepts_tasks=True)
             assert a.call('delegate_task', room='shared', description='timeout task', timeout_secs=1)['status'] == 'error'
             assert b.call('poll_pending_tasks', room='shared', wait_secs=0)['tasks'] == []
             b.call('leave_room', room='shared')

@@ -1,5 +1,8 @@
 mod activity;
+mod agent;
 mod async_storage;
+mod channel;
+mod conversation;
 mod identity;
 mod local;
 mod memory;
@@ -50,6 +53,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run a managed, persistent Codex conversation for addressed room messages.
+    Agent(agent::Options),
+    /// Expose a Claude Code stdio Channel backed by the shared HTTP service.
+    Channel(channel::Options),
     /// Run an automatic Codex executor for one room and repository.
     Worker(worker::Options),
     /// Monitor a running buddies HTTP server without opening its database.
@@ -67,6 +74,8 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Some(Command::Agent(options)) => return agent::run(options).await,
+        Some(Command::Channel(options)) => return channel::run(options).await,
         Some(Command::Monitor { url, once }) => return monitor::run(&url, once).await,
         Some(Command::Worker(options)) => return worker::run(options).await,
         None => {}

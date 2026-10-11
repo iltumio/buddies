@@ -3253,6 +3253,7 @@ dependencies = [
  "pastey",
  "pin-project-lite",
  "rand",
+ "reqwest",
  "rmcp-macros",
  "schemars",
  "serde",

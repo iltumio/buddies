@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -185,6 +186,54 @@ pub struct NotifyPeersRequest {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetRoomStatusRequest {
     pub room: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RegisterParticipantRequest {
+    pub room: String,
+    pub name: String,
+    #[schemars(
+        description = "poll for manual check-ins, channel for Claude Channels, managed for an automatic conversation runtime"
+    )]
+    #[serde(default = "poll_delivery")]
+    pub delivery: String,
+    #[serde(default)]
+    pub accepts_tasks: bool,
+}
+fn poll_delivery() -> String {
+    "poll".into()
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SendMessageRequest {
+    pub room: String,
+    pub to: String,
+    pub content: String,
+    #[schemars(description = "question, answer, request or update")]
+    pub kind: String,
+    #[schemars(with = "Option<String>")]
+    pub in_reply_to: Option<Uuid>,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MessageInboxRequest {
+    pub room: String,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ConversationRequest {
+    pub room: String,
+    #[schemars(with = "String")]
+    pub conversation_id: Uuid,
+}
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AcknowledgeMessageRequest {
+    pub room: String,
+    #[schemars(with = "String")]
+    pub message_id: Uuid,
+    #[schemars(
+        description = "read, handled or failed; sending to the transport does not prove the agent read it"
+    )]
+    pub state: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -690,6 +739,7 @@ impl BuddiesServer {
             .map_err(|e| err(e.to_string()))?;
         ok_json(&serde_json::json!({
             "workers": workers,
+            "participants": self.node.clients.participants(&req.room),
             "self": crate::local::agent_id(self.session_id),
             "room": req.room,
             "peers": peer_list,
@@ -704,6 +754,143 @@ impl BuddiesServer {
     async fn list_rooms(&self) -> Result<CallToolResult, McpError> {
         let rooms = self.node.clients.rooms(self.session_id);
         ok_json(&serde_json::json!({ "rooms": rooms }))
+    }
+
+    #[tool(
+        name = "register_participant",
+        description = "After joining, register a stable name for addressed conversations. Declare how you receive messages and whether you actively accept delegated tasks. A normal MCP connection does not wake an idle agent. Names are unique among live sessions in a room."
+    )]
+    async fn register_participant(
+        &self,
+        Parameters(req): Parameters<RegisterParticipantRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let info = crate::local::ParticipantInfo {
+            name: req.name.clone(),
+            delivery: req.delivery,
+            accepts_tasks: req.accepts_tasks,
+        };
+        // Serialize registration with membership changes to prevent competing aliases.
+        let _membership = self.node.local_membership.lock().await;
+        self.node
+            .clients
+            .require_member(self.session_id, &req.room)
+            .map_err(err)?;
+        crate::conversation::validate_name(&req.name).map_err(err)?;
+        let room = req.room.clone();
+        let name = req.name.clone();
+        self.node
+            .storage
+            .conversations(move |c| c.register(&room, &name))
+            .await
+            .map_err(err)?;
+        self.node
+            .clients
+            .register_participant(self.session_id, &req.room, info.clone())
+            .map_err(err)?;
+        ok_json(&info)
+    }
+
+    #[tool(
+        name = "send_message",
+        description = "Send an addressed, durable question, answer, request or update to a registered participant on this buddies service. Use in_reply_to to continue the same conversation. Offline recipients can read it after reconnecting with their stable name. Queued is not read or handled."
+    )]
+    async fn send_message(
+        &self,
+        Parameters(req): Parameters<SendMessageRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let from = self
+            .node
+            .clients
+            .participant_name(self.session_id, &req.room)
+            .map_err(err)?;
+        let message = crate::conversation::Message {
+            id: Uuid::new_v4(),
+            conversation_id: Uuid::nil(),
+            in_reply_to: req.in_reply_to,
+            room: req.room,
+            from,
+            to: req.to,
+            kind: req.kind,
+            content: req.content,
+            timestamp: now_ts(),
+            state: "pending".into(),
+            detail: None,
+        };
+        let message = self
+            .node
+            .storage
+            .conversations(move |c| c.send(message, now_ts()))
+            .await
+            .map_err(err)?;
+        ok_json(&message)
+    }
+
+    #[tool(
+        name = "poll_messages",
+        description = "Read your durable inbox after registering a participant. Reading the inbox does not acknowledge messages. Call acknowledge_message when you read or handle each message; inspect get_conversation for earlier context. Check before work, at dependency changes, and before finishing."
+    )]
+    async fn poll_messages(
+        &self,
+        Parameters(req): Parameters<MessageInboxRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = self
+            .node
+            .clients
+            .participant_name(self.session_id, &req.room)
+            .map_err(err)?;
+        let messages = self
+            .node
+            .storage
+            .conversations(move |c| Ok(c.inbox(&req.room, &name, now_ts())))
+            .await
+            .map_err(err)?;
+        ok_json(&serde_json::json!({"messages": messages}))
+    }
+
+    #[tool(
+        name = "get_conversation",
+        description = "Read the messages and receipt states in a conversation in which you participate. Use this to understand a reply or check whether your request has been read, handled or failed."
+    )]
+    async fn get_conversation(
+        &self,
+        Parameters(req): Parameters<ConversationRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = self
+            .node
+            .clients
+            .participant_name(self.session_id, &req.room)
+            .map_err(err)?;
+        let messages = self
+            .node
+            .storage
+            .conversations(move |c| Ok(c.history(&req.room, &name, req.conversation_id, now_ts())))
+            .await
+            .map_err(err)?;
+        ok_json(&serde_json::json!({"messages": messages}))
+    }
+
+    #[tool(
+        name = "acknowledge_message",
+        description = "Explicitly acknowledge a message addressed to you: read, handled or failed. Explain a blocker in detail. Terminal receipts cannot be reversed. An answer must be sent separately with send_message and in_reply_to."
+    )]
+    async fn acknowledge_message(
+        &self,
+        Parameters(req): Parameters<AcknowledgeMessageRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = self
+            .node
+            .clients
+            .participant_name(self.session_id, &req.room)
+            .map_err(err)?;
+        let message = self
+            .node
+            .storage
+            .conversations(move |c| {
+                c.acknowledge(&req.room, &name, req.message_id, &req.state, req.detail)
+            })
+            .await
+            .map_err(err)?;
+        ok_json(&message)
     }
 
     #[tool(
@@ -1277,8 +1464,16 @@ impl BuddiesServer {
     }
 }
 
+/// Newest protocol served. 2026-07-28 drops sessions (SEP-2567), so its
+/// requests never reach `on_initialized` and can't register a participant.
+const MAX_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for BuddiesServer {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(ProtocolVersion::known_up_to(&MAX_PROTOCOL_VERSION))
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
@@ -1290,6 +1485,12 @@ impl ServerHandler for BuddiesServer {
                  1) Execute the task described in the 'description' field using the available tools. \
                  2) Call 'submit_task_result' with the task_id, room, source_peer, success=true/false, and your output. \
                  This completes the task delegation loop so the requesting agent gets your result. \
+                 For ongoing collaboration, register_participant with a stable name after joining. \
+                 Use send_message for addressed questions and answers, with in_reply_to for replies. \
+                 Check poll_messages before work, when dependencies change, and before finishing; \
+                 acknowledge_message as read, handled or failed. Read get_conversation before acting on replies. \
+                 State your responsibility, consult peers before changing shared contracts, and report blockers. \
+                 Updates are context; answer questions and requests but do not reply to every status update. \
                  To collaborate on a shared git repo, call 'watch_repo' with the repo path and room; \
                  then call 'check_file_activity' before editing files to see what peers changed, and \
                  'get_peer_diff' to read a peer's change. When you receive a \
@@ -1325,6 +1526,13 @@ impl ServerHandler for BuddiesServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_versions_exclude_sessionless_revisions() {
+        let versions = ProtocolVersion::known_up_to(&MAX_PROTOCOL_VERSION);
+        assert!(versions.contains(&ProtocolVersion::V_2025_11_25));
+        assert!(!versions.contains(&ProtocolVersion::V_2026_07_28));
+    }
     use crate::activity::{ConflictEvent, FileActivityEntry, FileChangeKind};
 
     fn activity(author: &str, branch: &str, diff: &str, timestamp: u64) -> FileActivityEntry {

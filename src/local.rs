@@ -17,6 +17,13 @@ use uuid::Uuid;
 struct Participant {
     peer: Peer<RoleServer>,
     rooms: HashMap<String, Option<String>>,
+    registrations: HashMap<String, ParticipantInfo>,
+}
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParticipantInfo {
+    pub name: String,
+    pub delivery: String,
+    pub accepts_tasks: bool,
 }
 struct Task {
     request: PendingTask,
@@ -74,6 +81,7 @@ impl Clients {
         state.participants.entry(id).or_insert(Participant {
             peer,
             rooms: HashMap::new(),
+            registrations: HashMap::new(),
         });
     }
     pub fn prune(&self) {
@@ -96,6 +104,54 @@ impl Clients {
         );
         Ok(())
     }
+    pub fn register_participant(&self, id: Uuid, room: &str, info: ParticipantInfo) -> Result<()> {
+        crate::conversation::validate_name(&info.name)?;
+        ensure!(
+            ["poll", "channel", "managed"].contains(&info.delivery.as_str()),
+            "delivery must be poll, channel or managed"
+        );
+        let mut state = self.0.lock().unwrap();
+        state.prune();
+        ensure!(state.member(id, room), "join this room first");
+        ensure!(
+            !state.participants.iter().any(|(other, p)| *other != id
+                && p.registrations
+                    .get(room)
+                    .is_some_and(|r| r.name == info.name)),
+            "participant name already active in this room"
+        );
+        let p = state.participants.get_mut(&id).unwrap();
+        ensure!(
+            p.registrations
+                .get(room)
+                .is_none_or(|old| old.name == info.name),
+            "leave the room before changing your participant name"
+        );
+        p.registrations.insert(room.into(), info);
+        Ok(())
+    }
+    pub fn participant_name(&self, id: Uuid, room: &str) -> Result<String> {
+        self.require_member(id, room)?;
+        self.0
+            .lock()
+            .unwrap()
+            .participants
+            .get(&id)
+            .and_then(|p| p.registrations.get(room))
+            .map(|r| r.name.clone())
+            .ok_or_else(|| anyhow!("call register_participant with a stable name first"))
+    }
+    pub fn participants(&self, room: &str) -> Vec<ParticipantInfo> {
+        let mut state = self.0.lock().unwrap();
+        state.prune();
+        let mut result: Vec<_> = state
+            .participants
+            .values()
+            .filter_map(|p| p.registrations.get(room).cloned())
+            .collect();
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        result
+    }
     pub fn rooms(&self, id: Uuid) -> Vec<String> {
         let mut state = self.0.lock().unwrap();
         state.prune();
@@ -111,6 +167,7 @@ impl Clients {
         let mut state = self.0.lock().unwrap();
         if let Some(p) = state.participants.get_mut(&id) {
             p.rooms.remove(room);
+            p.registrations.remove(room);
         }
         state.prune();
         state
@@ -211,10 +268,24 @@ impl Clients {
             let Some(target) = state
                 .participants
                 .keys()
-                .filter(|target| **target != id && state.member(**target, room))
+                .filter(|target| {
+                    **target != id
+                        && state.member(**target, room)
+                        && state.participants[target]
+                            .registrations
+                            .get(room)
+                            .is_some_and(|r| r.accepts_tasks)
+                })
                 .min()
                 .copied()
             else {
+                ensure!(
+                    !state
+                        .participants
+                        .keys()
+                        .any(|other| *other != id && state.member(*other, room)),
+                    "local participants are connected but none accepts tasks; register an executor or use send_message"
+                );
                 return Ok(None);
             };
             ensure!(state.tasks.len() < 128, "too many pending local tasks");

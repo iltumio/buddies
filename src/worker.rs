@@ -409,7 +409,7 @@ async fn execute(
     let _ = child.wait().await;
     result
 }
-struct ProcessGroup(Option<u32>);
+pub(crate) struct ProcessGroup(pub(crate) Option<u32>);
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         #[cfg(unix)]
