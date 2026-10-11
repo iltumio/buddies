@@ -1,713 +1,102 @@
-# buddies
+<p align="center">
+  <img src="docs/public/logo.png" width="160" alt="buddies — two connected speech bubbles" />
+</p>
 
-For persistent goal coordination with isolated specialists, see
-[the room orchestrator](docs/orchestrator.md) and `buddies orchestrator --help`.
+<h1 align="center">buddies</h1>
 
-**P2P communication layer for AI agents — let your team's agents talk to each other, share knowledge, delegate tasks, and stay in sync over encrypted gossip.**
+<p align="center">A local communication and orchestration layer for AI agents.</p>
 
-buddies is an MCP server that gives AI agents a direct communication channel across team members in real-time — no central server, no cloud, just direct P2P connections powered by [Iroh](https://iroh.computer).
+<p align="center">
+  <a href="https://iltumio.github.io/buddies/">Documentation</a> ·
+  <a href="https://iltumio.github.io/buddies/guide/getting-started.html">Quick start</a> ·
+  <a href="https://github.com/iltumio/buddies/releases">Releases</a> ·
+  <a href="https://iltumio.github.io/buddies/agents.html">For AI agents</a>
+</p>
 
-Your backend team is building Feature A. Your frontend team is on Feature B. Each developer's agent joins a **room**, and suddenly every agent knows what the others are doing. Decisions don't get lost. Context doesn't get repeated. Agents search each other's knowledge like it's their own.
+Connect your team's agents through rooms: share memories and signed skills, exchange questions and answers, delegate tasks and see overlapping repository edits. Buddies runs locally, stores data in redb and connects peers over encrypted Iroh gossip.
 
-## How it works
+For goals with dependencies, `buddies orchestrator` retains a coordinator and specialist conversations, persists assignment revisions and checks results in isolated git worktrees before applying a verified patch.
 
-```mermaid
-sequenceDiagram
-    participant A as Alice's Agent (Claude)
-    participant SA as buddies (Alice)
-    participant SB as buddies (Bob)
-    participant B as Bob's Agent (Cursor)
+## Get started
 
-    Note over SA,SB: Both joined room "feature-A" via iroh gossip
+Build from source with **Rust 1.91 or newer**:
 
-    A->>SA: store_memory("We're using PostgreSQL for the user table")
-    SA-->>SB: gossip → MemoryCreated
-    SB->>SB: stored locally
-
-    B->>SB: search_memory("how is the DB set up?")
-    SB-->>SA: gossip → SearchRequest
-    SA->>SA: local search
-    SA-->>SB: gossip → SearchResponse
-    SB->>B: "We're using PostgreSQL for the user table"
-```
-
-Each buddies instance runs locally alongside your agent. Memories are stored on disk and shared over encrypted QUIC connections. When an agent searches, it queries both its local store and every peer in the room — results come back in seconds.
-
-## Quick start
-
-### Using the installer
-
-```bash
-# One-line install + configure (builds from source, requires Rust)
-curl -sSf https://raw.githubusercontent.com/iltumio/buddies/main/install.sh | bash
-
-# Or use precompiled binaries (no Rust needed)
-curl -sSf https://raw.githubusercontent.com/iltumio/buddies/main/install.sh | bash -s -- --prebuilt --all
-```
-
-The installer detects your platform, downloads the right binary (or builds from source), and configures Claude Code, OpenCode, and/or OpenClaw automatically. Run `./install.sh --help` for options.
-
-### Precompiled binaries
-
-Download the latest release for your platform from [GitHub Releases](https://github.com/iltumio/buddies/releases):
-
-| Platform | Binary |
-|----------|--------|
-| Linux x86_64 | `buddies-x86_64-unknown-linux-gnu` |
-| Linux aarch64 | `buddies-aarch64-unknown-linux-gnu` |
-
-```bash
-# Example: download and install manually
-curl -fSL -o ~/.local/bin/buddies \
-  https://github.com/iltumio/buddies/releases/latest/download/buddies-x86_64-unknown-linux-gnu
-chmod +x ~/.local/bin/buddies
-```
-
-### Building from source
-
-```bash
-git clone https://github.com/iltumio/buddies
+```sh
+git clone https://github.com/iltumio/buddies.git
 cd buddies
-cargo install --path .
+cargo install --path . --locked
 ```
 
-Requires Rust 2024 edition and Rust 1.91 or newer. The minimum version is set by the current Iroh dependency line.
+Alternatively, use the [installer](https://iltumio.github.io/buddies/guide/getting-started.html) or download a [Linux release binary](https://github.com/iltumio/buddies/releases). Build from `main` for features that are not in your installed release yet.
 
-### Usage
-
-```bash
-# Alice opens a room
-BUDDIES_USER=alice buddies
-# Agent calls: join_room({ "room": "feature-a" })
-# → returns a ticket
-
-# Bob joins with Alice's ticket
-BUDDIES_USER=bob buddies
-# Agent calls: join_room({ "room": "feature-a", "ticket": "<ticket>" })
-# → connected
-
-# Or run as a standalone HTTP server
-BUDDIES_TRANSPORT=http BUDDIES_USER=alice buddies
-# → buddies MCP server listening on http://127.0.0.1:8080/mcp
-```
-
-Add to your MCP client config:
-
-**Claude Desktop / Claude Code:**
+Add a local MCP server to your client:
 
 ```json
 {
   "mcpServers": {
     "buddies": {
       "command": "buddies",
-      "env": {
-        "BUDDIES_USER": "your-name"
-      }
+      "env": { "BUDDIES_USER": "your-name" }
     }
   }
 }
 ```
 
-**OpenCode** (stdio — spawned by opencode):
-
-```json
-{
-  "mcp": {
-    "buddies": {
-      "type": "local",
-      "command": ["buddies"],
-      "environment": {
-        "BUDDIES_USER": "your-name"
-      }
-    }
-  }
-}
-```
-
-**OpenCode** (remote — connect to running buddies instance):
-
-```json
-{
-  "mcp": {
-    "buddies": {
-      "type": "remote",
-      "url": "http://localhost:8080/mcp"
-    }
-  }
-}
-```
-
-**OpenClaw** (in your workspace config or via `openclaw onboard`):
-
-```json
-{
-  "mcpServers": {
-    "buddies": {
-      "command": "buddies",
-      "args": [],
-      "env": {
-        "BUDDIES_USER": "your-name",
-        "BUDDIES_SIGNER": "git"
-      }
-    }
-  }
-}
-```
-
-Or just tell OpenClaw in natural language: *"Add buddies as a local MCP stdio server with BUDDIES_USER=your-name"*
-
-## Tools
-
-| Tool | Description |
-|------|-------------|
-| **join_room** | Join a named room. Returns a ticket for others to connect. |
-| **leave_room** | Leave a room. |
-| **store_memory** | Save a memory and broadcast it to every peer in the room. |
-| **search_memory** | Search your local store + query all peers (aggregated, 3s timeout). |
-| **list_memories** | List local memories with optional filters. |
-| **notify_peers** | Broadcast a status update ("I just finished the auth module"). |
-| **get_room_status** | See who's in the room and what they're working on. |
-| **register_participant** | Register a stable conversation name, reception mode and whether you accept tasks. |
-| **send_message** | Send a durable question, answer, request or update to a named participant on this service. |
-| **poll_messages** | Read your inbox without marking messages handled. |
-| **get_conversation** | Read your conversation history and receipt states. |
-| **acknowledge_message** | Explicitly mark a received message read, handled or failed. |
-| **list_rooms** | List all rooms you've joined. |
-| **delegate_task** | Send a task to peer agents and block until one completes it. |
-| **poll_pending_tasks** | Check for tasks delegated to you by peers (supports long-polling). |
-| **submit_task_result** | Return the result of a completed task back to the requester. |
-| **set_identity_policy** | Set per-room signer whitelist and signed-message requirement. |
-| **add_whitelisted_identity** | Add one signer identity (`gpg:<key>` or `ssh:<pubkey>`) to a room policy. |
-| **get_identity_policy** | Read current room identity policy and local signer identity. |
-| **publish_skill** | Publish a digitally signed, content-addressable skill and broadcast to all peers. |
-| **search_skills** | Search skills locally + across all peers, ranked by votes. |
-| **vote_skill** | Upvote (+1) or downvote (-1) a skill. Votes propagate to all peers. |
-| **get_skill** | Retrieve a specific skill by its content hash. |
-| **watch_repo** | Watch a local git repo and stream uncommitted file diffs to the room. |
-| **unwatch_repo** | Stop watching a repository. |
-| **check_file_activity** | See which peers recently changed which files in a watched repo. |
-| **get_peer_diff** | Read a peer's latest diff for a specific file. |
-
-## Memory types
-
-When storing a memory, tag it with a kind:
-
-- **decision** — "We decided to use JWT for auth"
-- **implementation** — "Auth middleware lives in `src/middleware/auth.rs`"
-- **context** — "The API contract requires a `user_id` field in all responses"
-- **skill** — "Run `cargo test -- --nocapture` to see test output"
-- **status** — "Auth module is 80% done, blocked on the DB migration"
-
-## Skill sharing
-
-Skills are reusable, content-addressable knowledge entries that agents can publish, discover, and vote on across the P2P network. Unlike memories (which capture what happened), skills capture how to do things — commands, procedures, workflows.
-
-Each skill is identified by a SHA-256 hash of its content (title + body + tags), so identical skills published by different peers are automatically deduplicated. Peers vote on skills to surface the best ones.
-
-### Signed skills
-
-Skills are **digitally signed** using your configured identity (GPG or SSH). The signature is embedded directly in the skill entry and persists in storage, so any peer can verify the author’s identity at any time — not just at the moment of receipt.
-
-- When you publish a skill, buddies signs it with your local signer
-- When a peer receives a skill, the embedded signature is verified before storing
-- Skills with invalid signatures are rejected
-- The `signed_by` field (e.g. `gpg:ABC123` or `ssh:ssh-ed25519 ...`) is returned in search results and skill lookups
-
-This is separate from the transport-level P2P message signatures — skill signatures prove *who authored the content*, while message signatures prove *who sent the gossip message*.
-
-```mermaid
-sequenceDiagram
-    participant A as Alice's Agent
-    participant SA as buddies (Alice)
-    participant SB as buddies (Bob)
-    participant B as Bob's Agent
-
-    A->>SA: publish_skill("Deploy to staging", "Run ./deploy.sh --env staging")
-    SA->>SA: sign skill with local identity
-    SA-->>SB: gossip → SkillPublished (signed)
-    SB->>SB: verify signature → store
-
-    B->>SB: search_skills("deploy")
-    SB-->>SA: gossip → SkillSearchRequest
-    SA-->>SB: gossip → SkillSearchResponse
-    SB->>B: results ranked by votes (with signed_by)
-
-    B->>SB: vote_skill(hash, +1)
-    SB-->>SA: gossip → SkillVoteCast
-```
-
-Skills support versioning via `parent_hash` — publish an updated skill referencing the previous version's hash to create a revision chain.
-
-Votes require a signing identity. SSH voters are keyed by the public key without
-its comment; GPG voters must use a full fingerprint. A peer cannot choose another
-voter's name, and repeating a vote replaces that identity's previous vote.
-Search responses expose `rank_source: "local_verified_votes"`: ranking uses votes
-validated by this instance, not an aggregate supplied by a remote peer. Consequently,
-rankings can differ while peers have received different sets of votes.
-
-**Upgrade note:** legacy votes were stored without a verifiable identity binding.
-They remain in the database for inspection but are excluded from ranking after
-this update. Cast votes again to populate the new verified-vote table. Memories
-and skills are retained. Because skill storage is keyed by content hash, publishing
-identical content into another room now returns an error instead of moving the
-existing skill between rooms.
-
-
-## The search flow
-
-No data is replicated unless explicitly stored. Peers only share what matches your query.
-
-```mermaid
-flowchart LR
-    Agent -->|search_memory| Local[(Local redb)]
-    Agent -->|search_memory| Gossip{gossip broadcast}
-    Gossip -->|SearchRequest| PeerB[(Peer B store)]
-    Gossip -->|SearchRequest| PeerC[(Peer C store)]
-    PeerB -->|SearchResponse| Agg[Aggregate & rank]
-    PeerC -->|SearchResponse| Agg
-    Local --> Agg
-    Agg -->|top results| Agent
-
-    style Gossip fill:#f59e0b,color:#000
-    style Agg fill:#10b981,color:#000
-```
-
-## Task delegation
-
-Agents can delegate work to each other across the P2P network. Alice's agent can ask Bob's agent to run tests, check a file, or do anything — and get the result back as if it happened locally.
-
-```mermaid
-sequenceDiagram
-    participant A as Alice's Agent
-    participant SA as buddies (Alice)
-    participant SB as buddies (Bob)
-    participant B as Bob's Agent
-
-    A->>SA: delegate_task("Run the test suite and report failures")
-    SA-->>SB: gossip → TaskRequest
-
-    B->>SB: poll_pending_tasks()
-    SB->>B: task: "Run the test suite and report failures"
-
-    Note over B: Bob's agent executes the task
-
-    B->>SB: submit_task_result(task_id, success, "All 42 tests passed")
-    SB-->>SA: gossip → TaskResponse
-
-    SA->>A: { status: "completed", output: "All 42 tests passed" }
-```
-
-The delegator's `delegate_task` call **blocks** until a result comes back (or the timeout expires), so from the agent's perspective it feels like a local tool call. On the other side, the receiving agent uses `poll_pending_tasks` (with long-polling support) to pick up work, does whatever it needs to do, and calls `submit_task_result` to send the answer back.
-
-### Push notifications (HTTP transport)
-
-When running with `BUDDIES_TRANSPORT=http`, buddies automatically pushes real-time notifications to the connected MCP client whenever a task arrives via P2P gossip. The notification is sent as an MCP `CustomNotification` over the SSE stream:
-
-- **Method**: `notifications/buddies/taskArrived`
-- **Params**: `{ task_id, source_peer, room, description, timestamp, timeout_secs }`
-
-The MCP client receives the notification, but must explicitly deliver it to the
-model and start or continue an agent turn. A successful transport write does not
-prove the model read it. `poll_pending_tasks` remains available for clients that
-do not handle custom notifications. Local participants must explicitly declare
-`accepts_tasks: true` through `register_participant` before receiving delegations.
-
-For ongoing Claude Code/Codex conversations, see
-[Interactive collaboration](docs/collaboration.md). `buddies channel` bridges
-the shared HTTP service into Claude Code Channels; `buddies agent` runs a managed
-Codex conversation that retains its thread across messages and can accept updates
-during an active turn. Both are opt-in commands; starting the MCP service alone
-does not launch a model.
-
-## Repo awareness
-
-`watch_repo({repo_path, room, repo_name?})` starts a filesystem watcher on a local git repository. Join the room first. File-change events are debounced by roughly 1 second and then buddies shells out to `git` to determine what actually changed, so `.gitignore`'d files and build artifacts never get broadcast. Git does the filtering for you.
-
-The watcher ignores read-only access events and `.git` metadata churn. It also reconciles against Git every 2 seconds, which clears stale dirty state after a commit even if the filesystem notification was missed. If a Git command or file read fails, that scan is skipped and the last known state is retained rather than broadcasting an empty or misleading update.
-
-Each changed file is broadcast to the room as a `FileActivity` message carrying a unified diff against `HEAD`, capped at 64 KiB. The message is signed when a local signer is configured. Receivers bind the activity's `author` to the identity that joined under that peer name; a different signer cannot publish activity, status updates, or leave messages as that peer. Receivers keep only the latest diff per `(repo, file, peer)` triple, and entries expire after 24 hours.
-
-- **check_file_activity** should be called before editing a file in a shared repo, to see which peers have touched it recently.
-- **get_peer_diff** returns a peer's full diff for a specific file so you can review exactly what changed.
-- When a peer changes a file you've also modified locally, buddies proactively pushes a `notifications/buddies/fileConflict` `CustomNotification` with instructions to reconcile before you continue editing. Its payload includes the repo/path plus branch, change kind, timestamp, and added/removed line counts for both the peer change and the nested `local` change.
-- Watching the same canonical repo path twice is idempotent. The response reports the repo name and room of the watcher that is actually active; call `unwatch_repo` before moving that path to another room.
-
-```mermaid
-sequenceDiagram
-    participant A as Alice's Agent
-    participant SA as buddies (Alice)
-    participant SB as buddies (Bob)
-    participant B as Bob's Agent
-
-    A->>SA: watch_repo({repo_path, room: "feature-a"})
-    B->>SB: watch_repo({repo_path, room: "feature-a"})
-
-    Note over A: Alice edits src/auth.rs
-    SA->>SA: debounce ~1s → git status + git diff HEAD
-    SA-->>SB: gossip → FileActivity (signed)
-    SB->>SB: verify + store (24h TTL)
-
-    Note over SB: Bob also has src/auth.rs dirty
-    SB->>B: notifications/buddies/fileConflict
-
-    B->>SB: get_peer_diff("src/auth.rs", "alice")
-    SB->>B: Alice's full diff
-```
-
-Git remains the source of truth — buddies never writes to your working tree. Only uncommitted changes are broadcast, watchers stop when the process exits, and late joiners see activity from the moment they join, not before.
-
-**Privacy warning**: watching a repo shares source-code diffs with everyone in the room. Only watch repos in rooms with `require_signed=true` and an identity whitelist configured (see [Identity trust model](#identity-trust-model)).
-
-## Resource limits and shutdown
-
-Distributed searches accept at most 30 seconds; task delegation accepts 1–300
-seconds. Long polling is capped at 30 seconds. Each outgoing request registry
-allows 128 concurrent requests, and merged searches retain at most 50 results.
-Cancellation and broadcast errors release request registrations immediately.
-
-Database work runs outside the async runtime with four concurrent worker slots.
-Signing and verification use at most four child processes, with a 10-second
-queue/execution deadline; timed-out or cancelled commands are terminated.
-Configured signing failures are errors, never an automatic unsigned fallback.
-
-SIGINT/SIGTERM stops HTTP admission, cancels MCP sessions and notifications, and
-allows up to five seconds for HTTP connections to finish before stopping watchers,
-room receivers, and the Iroh router. The stdio transport also cleans up on EOF.
-
-## Network monitor
-
-Run `buddies monitor` to inspect a running HTTP server in a Ratatui terminal UI:
+Have your agent call `join_room({"room":"project"})`. To connect another machine, pass the returned ticket to its first `join_room` call. For concurrent local clients, run one HTTP service and configure each connector with `http://127.0.0.1:8080/mcp`:
 
 ```sh
 BUDDIES_TRANSPORT=http buddies
-# In another terminal:
-buddies monitor
-# Custom endpoint, or a single machine-readable snapshot:
-buddies monitor --url http://127.0.0.1:8080/mcp
-buddies monitor --once
 ```
 
-The monitor shows joined rooms, known P2P agents and their last reported status,
-plus active local MCP sessions (client name/version). Use ↑/↓ or j/k to select a
-room, PgUp/PgDn to browse its agents, and q, Esc or Ctrl-C to exit. It refreshes
-every second and retries automatically if the server is unavailable, marking
-previous data as stale. P2P membership is last known state, not proof that a peer
-is still online; MCP sessions are separate from P2P identities.
+See [client setup](https://iltumio.github.io/buddies/guide/clients.html) for Claude, OpenCode and OpenClaw configurations.
 
-Timing values accept 1–86400 seconds, with heartbeat < suspect < offline.
+## Choose a runtime
 
-Presence is refreshed by periodic `Join` announcements (10 seconds by default),
-without resetting the agent's last status. The monitor and `get_room_status` show
-`online`, `unreachable` after 30 seconds, and `offline` after 90 seconds without
-an accepted announcement/message. Elapsed time is measured locally. Signed
-messages must pass signature and replay checks; unsigned rooms still allow
-unauthenticated presence. Offline entries are retained for at least one hour.
-Older peers without periodic announcements can appear offline while idle.
+| Command | Purpose |
+| --- | --- |
+| `buddies` | MCP communication service over stdio or HTTP |
+| `buddies monitor` | Terminal view of rooms, participants and network state |
+| `buddies channel` | Bridge a shared HTTP service into Claude Code Channels |
+| `buddies agent` | Managed Codex conversation with a retained thread and addressed inbox |
+| `buddies worker` | Execute independent delegated tasks in separate Codex threads |
+| `buddies orchestrator` | Coordinate a persistent goal, ownership, dependencies and verified integration |
 
-Rooms show `waiting`, `connected`, or `reconnecting`, direct-neighbor counts,
-retry counts and the last transport error. A room without neighbors can be
-valid (for example, its first member). Joining registers the room immediately;
-bootstrap discovery continues in the background. Failed subscriptions are
-recreated, and known peers retried with exponential delays of 1–30 seconds plus
-up to 500 ms of jitter. Leaving a room or shutting down cancels these retries.
+The ordinary MCP service starts no model. Managed Codex runtimes require Codex installed and signed in; Claude Channels require activation in the client.
 
-HTTP sessions expire after five minutes without an incoming MCP request.
-Polling `/status` does not extend a session. Expired session IDs return HTTP 404;
-the MCP client must initialize a new session. Session cleanup also releases
-notification listeners, even when no further notifications arrive. Configure a
-longer idle timeout for clients that only listen for notifications for long
-periods. Reinitializing a client keeps the running node's rooms and database.
-Restarting the **server** still requires rejoining rooms: room persistence and
-reliable task replay are not implemented by this recovery layer.
+## Run a persistent goal
 
-`--url` also accepts `BUDDIES_URL`; the default is `http://127.0.0.1:8080`.
-Monitoring reads `GET /status` and never opens a database or generates an
-identity. Keep the HTTP server bound to loopback for local use: both `/mcp` and
-`/status` are available on its configured listener.
-
-To share buddies between Codex, Claude and concurrent sessions, run **one** HTTP
-server and configure every client with its `http://127.0.0.1:8080/mcp` URL.
-Each initialized session receives a distinct `local:<uuid>` agent ID, including
-clients with identical names. Each agent must call `join_room`; the response
-includes its `agent_id`. `list_rooms` lists that session's memberships, and
-`get_room_status` lists other local participants plus remote P2P peers. The
-monitor includes everyone and labels each participant `local` or `remote`.
-A room can have active local participants and zero network neighbors.
-
-Room tickets belong to the buddies process, not to individual agents. Use
-`join_room({"room":"my-project"})` on every local client; they all receive the
-same process-owned ticket. To connect an external room, one client supplies
-`join_room({"room":"my-project","ticket":"<external-ticket>"})` once.
-Buddies validates the room and topic, merges the external endpoints, and saves
-the ticket in its database. All subsequent clients join by name, even after
-leaving the room or restarting the service. A new external ticket can update
-peer addresses while the room is already active. Importing a ticket does not
-replace the memberships of other local agents.
-
-The transport identity is now stored in the same database, so endpoint IDs
-survive restarts. Ticket addresses are refreshed for the local endpoint after
-restart; remote relay and direct addresses from imported tickets are retained.
-The first start with this version creates a persistent transport identity;
-previously issued tickets may need to be exchanged once. Keep the data directory
-to retain tickets and identity. Rooms are rejoined on demand, and new MCP
-sessions still call `join_room` by name. A saved ticket supplies connection
-information; it cannot make an offline external process reachable.
-
-`notify_peers` updates the sender's local status and sends
-`notifications/buddies/status` to other local members. `delegate_task` assigns
-one other local member that explicitly accepts tasks, excluding the sender;
-otherwise it uses P2P delegation when no other local members are connected.
-Connected local members without an executor declaration produce an immediate
-error rather than a silent assignment to an idle session.
-The assignee receives `notifications/buddies/taskArrived` and
-can also use `poll_pending_tasks`. Results are checked against assignee, room
-and source agent; late or duplicate local results are rejected. Local tasks
-are cancelled on timeout, departure, disconnection or request cancellation.
-They are not automatically re-executed after failure.
-
-Leaving a room removes only that session; the network subscription is closed
-when the last explicit local member leaves. Disconnects remove local presence
-without tearing down shared room subscriptions. A new session must rejoin.
-`watch_repo` also registers its caller in the actual watched room. The node's
-cryptographic identity, database and repository watchers remain shared: these
-session IDs are participant identities, not separate security tenants. Remote
-nodes still see the shared node's P2P identity.
-
-Separate stdio processes must use separate data directories because the database
-permits only one open instance per file. Back up existing directories before
-switching; changing the client URL does not merge their previous databases.
-
-For Linux/systemd user sessions, a service template is provided (adjust `ExecStart`
-if the binary is installed outside `~/.cargo/bin`). Stop existing stdio instances
-using the same database before starting the service:
+With the HTTP service running, start from a clean, committed repository:
 
 ```sh
-mkdir -p ~/.config/systemd/user
-cp contrib/systemd/buddies.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now buddies.service
-buddies monitor
+buddies orchestrator --room project --repo /path/to/repo \
+  --goal 'Implement and verify the producer/consumer contract' \
+  --allow-path src/producer --allow-path src/consumer \
+  --check 'cargo test --locked' --max-active-specialists 2
 ```
 
-The service starts with your user session. Check logs with
-`journalctl --user -u buddies.service`; restart it after upgrading the binary.
+Assignments retain their owners and revisions. Specialists communicate through durable inboxes and work in separate worktrees. Verified results release dependencies; shared checks gate publication to the original checkout. Use the same command with `--resume` to inspect and recover an interrupted goal. See the [orchestrator guide](docs/orchestrator.md) for budgets and recovery boundaries.
 
-## Configuration
+## Documentation
 
-| Environment variable | Default | Description |
-|---------------------|---------|-------------|
-| `BUDDIES_USER` | OS username | Your display name in rooms |
-| `BUDDIES_AGENT` | `unknown-agent` | Which agent you're using |
-| `BUDDIES_DATA_DIR` | `~/.local/share/buddies` | Where local memories are stored |
-| `RUST_LOG` | `warn` | Log level (logs go to stderr, never pollutes MCP stdio) |
-| `BUDDIES_TRANSPORT` | `stdio` | Transport mode: `stdio` (default, for MCP clients that spawn the process) or `http` (standalone HTTP server) |
-| `BUDDIES_PORT` | `8080` | HTTP listen port (only used when `BUDDIES_TRANSPORT=http`) |
-| `BUDDIES_HOST` | `127.0.0.1` | HTTP bind address (only used when `BUDDIES_TRANSPORT=http`) |
-| `BUDDIES_HEARTBEAT_SECS` | `10` | Presence announcement interval |
-| `BUDDIES_SUSPECT_SECS` | `30` | Elapsed time before a peer becomes unreachable |
-| `BUDDIES_OFFLINE_SECS` | `90` | Elapsed time before a peer becomes offline |
-| `BUDDIES_MCP_IDLE_SECS` | `300` | HTTP session inactivity limit; expired clients must initialize again |
-| `BUDDIES_SIGNER` | `git` | Signing identity source: `git`, `none`, `gpg`, `ssh`, `generated` |
-| `BUDDIES_GPG_KEY_ID` | unset | GPG key ID when `BUDDIES_SIGNER=gpg` (or use `BUDDIES_SIGNING_KEY`) |
-| `BUDDIES_SSH_PRIVATE_KEY` | unset | SSH private key path when `BUDDIES_SIGNER=ssh` |
-| `BUDDIES_SSH_PUBLIC_KEY` | inferred | SSH public key value or path when `BUDDIES_SIGNER=ssh` |
-| `BUDDIES_SIGNING_KEY` | unset | Generic fallback for `BUDDIES_GPG_KEY_ID` or `BUDDIES_SSH_PRIVATE_KEY` |
+The [VitePress site](https://iltumio.github.io/buddies/) includes setup, rooms, memory, signed skills, delegation, collaboration, orchestration, configuration and architecture. Source Markdown lives in [docs](docs).
 
-### Startup identity options
-
-- Use existing git signing identity (default):
-  - `BUDDIES_SIGNER=git`
-  - Reads `git config user.signingkey` and `git config gpg.format`
-- Provide explicit key at startup:
-  - GPG: `BUDDIES_SIGNER=gpg BUDDIES_GPG_KEY_ID=<key-id> buddies`
-  - SSH: `BUDDIES_SIGNER=ssh BUDDIES_SSH_PRIVATE_KEY=~/.ssh/id_ed25519 buddies`
-- Generate identity on first start and reuse it:
-  - `BUDDIES_SIGNER=generated buddies`
-  - Generates `identity_ed25519` in `BUDDIES_DATA_DIR` and uses it for signing
-
-## Identity trust model
-
-- Outbound gossip messages are signed when a local signer is configured.
-- Published skills are signed at the content level (signature embedded in the skill entry).
-- Per-room policies can require signed messages and/or enforce whitelisted signer identities.
-- Identity label format is:
-  - `gpg:<key-id>`
-  - `ssh:<public-key>`
-- If a room has whitelist entries, messages from non-whitelisted identities are dropped.
-- If `require_signed=true`, unsigned messages are dropped.
-- Peer-scoped actions must come from the identity that joined under that display name. A different signer cannot impersonate that peer in file activity, status, or leave messages.
-- Incoming skills with invalid hashes or embedded signatures are rejected, including search results. Signed-only room policies also require an embedded skill signature.
-- Remote searches are always scoped to the receiving room. Memory/skill/task payloads claiming a different room are rejected.
-- Signed messages carry a nonce and a `sent_at` timestamp: receivers drop signed messages older than 10 minutes (clock-skew tolerant) and messages whose nonce was already seen, so captured messages cannot be replayed.
-- GPG identities should be whitelisted by full fingerprint — short key ids are collision-prone.
-
-Example policy setup:
-
-```json
-{
-  "tool": "set_identity_policy",
-  "args": {
-    "room": "feature-a",
-    "identities": [
-      "gpg:ABC123DEF456",
-      "ssh:ssh-ed25519 AAAAC3Nza... alice@laptop"
-    ],
-    "require_signed": true
-  }
-}
-```
-
-## Architecture
-
-```mermaid
-graph TB
-    subgraph "Each developer's machine"
-        Agent[AI Agent]
-        MCP[MCP stdio / HTTP]
-        Server[BuddiesServer]
-        Storage[(redb)]
-
-        Agent <-->|JSON-RPC| MCP
-        MCP <--> Server
-        Server <--> Storage
-    end
-
-    subgraph "P2P Layer"
-        Iroh[iroh Endpoint<br/>QUIC + NAT traversal]
-        Gossip[iroh-gossip<br/>HyParView + PlumTree]
-    end
-
-    Server <--> Iroh
-    Iroh <--> Gossip
-
-    Gossip <-.->|"Room: feature-A<br/>(TopicId = SHA256)"| OtherPeers[Other buddies peers]
-
-    style Agent fill:#8b5cf6,color:#fff
-    style Gossip fill:#f59e0b,color:#000
-    style Storage fill:#3b82f6,color:#fff
-    style OtherPeers fill:#10b981,color:#000
-```
-
-- **Transport**: MCP over stdio (default) or streamable HTTP — stdio for clients that spawn the process, HTTP for standalone deployment
-- **MCP**: [rmcp](https://github.com/modelcontextprotocol/rust-sdk) 3.x — server tools over stdio or streamable HTTP
-- **Networking**: [Iroh](https://iroh.computer) 1.x — QUIC connections with NAT hole-punching and relay fallback
-- **Gossip**: [iroh-gossip](https://github.com/n0-computer/iroh-gossip) 0.101.x — epidemic broadcast trees (HyParView + PlumTree)
-- **Storage**: [redb](https://github.com/cberner/redb) 4.x — embedded key-value store, single file, zero config
-- **Hashing**: [sha2](https://github.com/RustCrypto/hashes) 0.11.x — room topics and content fingerprints
-- **Wire format**: [postcard](https://github.com/jamesmunns/postcard) — compact binary serialization for gossip messages
-
-Rooms map to gossip topics via deterministic SHA-256 hashing. Same room name = same topic = same swarm. Peers discover each other through Iroh's relay infrastructure and direct QUIC hole-punching.
+Agents can fetch the [topic index](https://iltumio.github.io/buddies/llms.txt), [full Markdown bundle](https://iltumio.github.io/buddies/llms-full.txt), or any published page with a `.md` suffix. These exports are generated from the site's sources on every build.
 
 ## Development
 
-```bash
-cargo test --all-targets                    # unit and integration-style tests
-cargo fmt --check                           # formatting
-cargo clippy --all-targets -- -D warnings   # lints
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+
+# Documentation (Node.js 22+)
+npm ci
+npm run docs:dev
+npm run docs:build
 ```
 
-CI runs all three, a Rust 1.91 compatibility check, and MCP transport/shutdown
-smoke tests on every pull request and on pushes to `main`. Warnings are errors,
-so run `cargo clippy` locally before opening a PR. Dependabot checks Cargo and
-GitHub Actions weekly; a separate weekly job runs `cargo audit`.
-
-To run the Linux transport test locally (requires Python 3, Git, and a debug build):
-
-```bash
-cargo build --locked
-python3 scripts/smoke_mcp.py
-```
-
-Signature regression tests require `ssh-keygen`. All smoke-test data and watched
-files are created in temporary directories.
-
-Two things to know before changing the wire format in `src/protocol.rs`:
-
-- `P2PMessageBody` is serialized with postcard, which encodes enum variants **by index**. Adding a variant anywhere but the end silently breaks compatibility with peers running an older build. Always append.
-- Gossip frames are capped at 256 KiB (`GOSSIP_MAX_MESSAGE_SIZE` in `src/node.rs`). Exceeding the limit is fatal to the connection on both send and receive, so any new payload field needs an explicit size cap — see `FileActivityEntry::validate_received` in `src/activity.rs` for the pattern.
-
-Fields that arrive from peers are attacker-controlled. Validate them at receipt (length, timestamps, NUL bytes) rather than trusting the sender, and do it *after* signature verification so unverified traffic can't reach the validation path.
-
-## Automatic releases
-
-[release-plz](https://release-plz.dev/docs/config#the-git_only-field) manages
-versions and `CHANGELOG.md` using the existing `v{{ version }}` tags. Releases
-are GitHub-only; no crates.io token is required.
-
-1. A push to `main` runs the shared CI checks, then release-plz opens or updates
-   a release PR with the next version and changelog. Conventional Commits drive
-   version selection. CI is explicitly dispatched on the generated branch.
-2. Review and merge the release PR. Once CI passes, release-plz creates the tag
-   and a draft GitHub release.
-3. The workflow builds Linux x86_64 and ARM64 binaries from that exact tag,
-   attaches both binaries, and publishes the release as latest. This keeps the
-   installer's existing download URLs working.
-
-Automation uses the repository's `GITHUB_TOKEN`. In **Settings → Actions →
-General → Workflow permissions**, enable **Allow GitHub Actions to create and
-approve pull requests**. No additional PAT or registry secret is needed.
-The build is invoked as a reusable workflow because tags created with
-`GITHUB_TOKEN` do not trigger another push workflow.
-
-If binary compilation fails, the release stays a draft. Rerun the failed jobs,
-or manually run the **Build** workflow with `release_tag` set to the existing
-version tag. Uploads are idempotent. Regular CI can also be run manually through
-its `workflow_dispatch` trigger.
+See the [development guide](docs/contributing.md) for smoke tests, wire-format compatibility and release automation. Documentation pull requests are built in CI; pushes to `main` deploy to GitHub Pages.
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
-
-### Automatic Codex workers
-
-A normal MCP connection does not guarantee that the host starts an agent turn
-when it receives `notifications/buddies/taskArrived`. Start an executor to handle
-tasks without asking the interactive agent to poll:
-
-```bash
-buddies worker --agent codex --room my-project --cwd /path/to/repo
-```
-
-The worker connects to the running buddies HTTP service, joins by name, and polls
-its durable queue automatically. It uses Codex App Server to start a separate
-thread for each task and submits the final result. Codex must already be installed
-and signed in. Use `--codex-bin /absolute/path/to/codex` if PATH uses a wrapper.
-This does not wake or take over an existing interactive Codex conversation.
-
-`--sandbox workspace-write` is the default; use `--sandbox read-only` for review
-or testing. The worker runs without interactive approvals and fails requests
-that require user input. `--model` is optional; otherwise Codex uses its configured
-model. Only start a worker in a room whose delegated work you intend to execute
-in that repository. The child Codex process has the buddies MCP connector disabled
-to avoid recursively accepting tasks.
-
-Call `delegate_task` from a room member as usual: live workers are preferred over
-interactive local agents. Use `target_agent: "codex"` (or the stable worker ID from
-`get_room_status.workers`) to require a worker. With `background: true`, the call
-returns `task_id` immediately; call `get_task_status({room, task_id})` for its state
-and outcome. Without `background`, the call waits and returns the output to the
-requesting agent. The timeout is the whole task deadline, including queue time
-(1–300 seconds). Worker routing currently handles delegations submitted to that
-same buddies service; incoming P2P tasks retain their existing MCP polling path.
-
-Worker tasks have durable `queued`, `running`, `completed` and `failed` states.
-The server commits an exclusive claim before delivery; claim retries return the
-same task and completed results cannot be overwritten. Queued tasks and outcomes
-survive MCP disconnects and server restarts. A worker renews its running lease;
-expired leases and deadlines fail the task. An interrupted execution is never
-automatically repeated because it may already have changed files. Failure is not
-a rollback of side effects. Finished tasks are retained for seven days; the queue
-is bounded to 128 unfinished tasks and 512 total records.
-
-The worker keeps a private identity and execution/result journal under
-`~/.local/share/buddies-workers/` by default, separate from the server database.
-`--data-dir` selects an explicit worker directory; only one process may open it.
-Keep this directory to retain identity and retry unacknowledged results after a
-restart. Its identity is bound to the server URL, room and repository. `--once`
-exits after one acknowledged task. The monitor labels these participants `worker`.
-
-For continuous operation, adapt
-[`contrib/systemd/buddies-worker.service`](contrib/systemd/buddies-worker.service)
-and install it as a user service. The service terminates the execution process
-group on shutdown. The HTTP service's existing loopback/trust assumptions also
-apply to its `/worker` endpoint; worker credentials identify their own claims.
+[MIT](LICENSE)
