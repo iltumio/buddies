@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/iltumio/buddies/compare/v0.1.9...v0.1.10) - 2026-10-11
+
+### Added
+
+- *(orchestrator)* coordinate persistent room assignments
+- *(collaboration)* add durable conversations and client adapters
+- execute durable delegated tasks with automatic Codex workers
+
+### Other
+
+- publish VitePress site with branding and agent exports
+
 ## [0.1.9](https://github.com/iltumio/buddies/compare/v0.1.8...v0.1.9) - 2026-09-27
 
 ### Fixed
