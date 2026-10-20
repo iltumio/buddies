@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/iltumio/buddies/compare/v0.1.10...v0.3.0) - 2026-10-20
+
+### Added
+
+- *(workers)* load specialist groups from TOML with shared defaults, configuration validation and supervised tmux terminals for Codex and Claude
+- *(workers)* coordinate persistent resource specialists across repositories, with optional orchestration, ownership scopes and acceptance checks
+- *(linear)* reuse Claude Code's existing Linear MCP or CLI access with team declarations and exact session resume
+- *(monitor)* inspect retained room messages, receipts and decoded orchestrator events
+
+### Fixed
+
+- *(workers)* validate coordinator ownership and assignment revisions, preserve read-only policies, and restrict host checks to user-configured commands
+- *(connectors)* lock persistent workspaces, track resource-specific Git heads, preflight publication conflicts and retain recovery state
+- *(monitor)* reject incompatible server snapshots and preserve completed worker events
+
+## [0.2.3](https://github.com/iltumio/buddies/compare/v0.2.2...v0.2.3) - 2026-10-16
+
+### Added
+
+- *(worker)* launch persistent Claude Code Linear workers with existing MCP/CLI access, team declarations and exact session resume
+- *(channel)* expose live Linear resources and instructions in existing Claude sessions without replacing their tool configuration
+
+## [0.2.2](https://github.com/iltumio/buddies/compare/v0.2.1...v0.2.2) - 2026-10-16
+
+### Fixed
+
+- *(monitor)* detect incompatible server snapshots and display completed worker events reliably
+- *(worker)* validate coordinator ownership, assignment revisions, resource boundaries, and configured checks
+- *(orchestrator)* isolate resource heads and lock persistent workspaces before resuming
+- *(connectors)* validate prepared snapshots, preflight publication conflicts, and preserve recovery state
+
+## [0.2.1](https://github.com/iltumio/buddies/compare/v0.2.0...v0.2.1) - 2026-10-16
+
+### Added
+
+- *(monitor)* display live room messages, decoded wire events, and full message detail inspector
+
+
+## [0.2.0](https://github.com/iltumio/buddies/compare/v0.1.10...v0.2.0) - 2026-10-16
+
+### Added
+
+- *(worker)* support single-specialist workers (`--resource`, `--allow-scope`, `--check`) and optional `--orchestrator` role with strict boundary enforcement and both orchestrated and peer-to-peer coordination
+- *(orchestrator)* add multi-resource and stateful non-Git connector engine (`git`, `linear`, `gdrive`, `fs`)
+
+
 ## [0.1.10](https://github.com/iltumio/buddies/compare/v0.1.9...v0.1.10) - 2026-10-11
 
 ### Added

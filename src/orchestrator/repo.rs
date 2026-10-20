@@ -127,6 +127,7 @@ impl Repository {
         names.extend(git(cwd, &["ls-files", "--others", "--exclude-standard", "-z"]).await?);
         for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
             let name = std::str::from_utf8(name).context("non-UTF8 changed path")?;
+            super::state::validate_path(name)?;
             ensure!(
                 paths.iter().any(|p| contains(p, name)),
                 "write outside assignment ownership: {name}"
@@ -202,8 +203,15 @@ impl Repository {
         let base = a.base.as_deref().context("missing assignment base")?;
         Self::validate_changes(cwd, base, &a.paths).await?;
         let evidence = a.pending_result.as_ref().context("missing result")?;
-        self.checks(cwd, &evidence.checks, config.check_timeout_secs)
-            .await?;
+        // Shared checks can depend on later assignments. Only run the reported
+        // subset explicitly authorized by the user here; run ALL at publication.
+        let checks: Vec<_> = config
+            .checks
+            .iter()
+            .filter(|check| evidence.checks.contains(check))
+            .cloned()
+            .collect();
+        self.checks(cwd, &checks, config.check_timeout_secs).await?;
         let patch = Self::patch(cwd, base, &a.paths).await?;
         std::fs::write(
             self.root.join(format!("{}-r{}.patch", a.id, a.revision)),
@@ -409,6 +417,8 @@ mod tests {
                     owner: "specialist-a".into(),
                     description: "edit file".into(),
                     paths: vec!["src/file".into()],
+                    resource: None,
+                    resources: vec![],
                     dependencies: vec![],
                     deadline_secs: 60,
                 },

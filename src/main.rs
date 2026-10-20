@@ -2,8 +2,10 @@ mod activity;
 mod agent;
 mod async_storage;
 mod channel;
+mod claude_worker;
 mod conversation;
 mod identity;
+mod launch;
 mod local;
 mod memory;
 mod monitor;
@@ -57,9 +59,11 @@ enum Command {
     /// Run a managed, persistent Codex conversation for addressed room messages.
     Agent(agent::Options),
     /// Expose a Claude Code stdio Channel backed by the shared HTTP service.
-    Channel(channel::Options),
-    /// Run an automatic Codex executor for one room and repository.
+    Channel(channel::RunOptions),
+    /// Run a Codex executor or a Claude Code worker connected to a room.
     Worker(worker::Options),
+    /// Start all specialists from a TOML file in supervised tmux windows.
+    Up(launch::Options),
     /// Coordinate a goal with persistent assignments and isolated Codex specialists.
     Orchestrator(orchestrator::Options),
     /// Monitor a running buddies HTTP server without opening its database.
@@ -81,6 +85,7 @@ async fn main() -> Result<()> {
         Some(Command::Channel(options)) => return channel::run(options).await,
         Some(Command::Monitor { url, once }) => return monitor::run(&url, once).await,
         Some(Command::Worker(options)) => return worker::run(options).await,
+        Some(Command::Up(options)) => return launch::run(options).await,
         Some(Command::Orchestrator(options)) => return orchestrator::run(options).await,
         None => {}
     }

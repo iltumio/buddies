@@ -102,6 +102,14 @@ impl Conversations {
         Ok(message)
     }
 
+    pub fn all_messages(&self, now: u64) -> Vec<Message> {
+        self.messages
+            .iter()
+            .filter(|m| now.saturating_sub(m.timestamp) < RETENTION_SECS)
+            .cloned()
+            .collect()
+    }
+
     pub fn inbox(&self, room: &str, name: &str, now: u64) -> Vec<Message> {
         self.messages
             .iter()

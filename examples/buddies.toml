@@ -1,0 +1,26 @@
+# Paths are relative to this file. Replace them with your project paths.
+room = "my-project"
+url = "http://127.0.0.1:8080"
+
+[defaults]
+codex-bin = "codex"
+# Enable only after all workers have saved sessions:
+# resume = true
+
+[[specialists]]
+name = "backend"
+resource = ["git:backend=../../backend"]
+check = ["cargo test"]
+
+[[specialists]]
+name = "frontend"
+resource = ["git:frontend=../../frontend"]
+check = ["pnpm test"]
+
+[[specialists]]
+name = "linear"
+agent = "claude"
+cwd = "../../backend"
+linear-team = ["ENG"]
+linear-access = "auto"
+# claude-bin = "/absolute/path/to/claude"

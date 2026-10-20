@@ -11,12 +11,19 @@ buddies monitor --url http://127.0.0.1:8080/mcp
 buddies monitor --once
 ```
 
-The monitor shows joined rooms, known P2P agents and their last reported status,
-plus active local MCP sessions (client name/version). Use ↑/↓ or j/k to select a
-room, PgUp/PgDn to browse its agents, and q, Esc or Ctrl-C to exit. It refreshes
+The monitor shows rooms, participants, active local MCP sessions, and retained
+addressed messages, including decoded orchestrator events and receipt details.
+Use Tab to switch panels, ↑/↓ or j/k to navigate, n/p to browse messages,
+f to follow new messages, w to include heartbeats, and q, Esc or Ctrl-C to exit. It refreshes
 every second and retries automatically if the server is unavailable, marking
 previous data as stale. P2P membership is last known state, not proof that a peer
 is still online; MCP sessions are separate from P2P identities.
+
+Updating the executable does not update an already-running HTTP server. If the
+monitor reports that the server does not expose room messages, restart the
+updated service (for example, `systemctl --user restart buddies.service`). This
+disconnects existing MCP sessions; clients must reconnect and rejoin their rooms.
+Specialist workers can be restarted with their original options and `--resume`.
 
 Timing values accept 1–86400 seconds, with heartbeat < suspect < offline.
 

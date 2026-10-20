@@ -1,5 +1,6 @@
 //! Participants in a shared node. IDs and room membership belong to MCP sessions.
 use crate::{
+    orchestrator::connector::ResourceDescriptor,
     protocol::TaskResult,
     resilience::Presence,
     room::PendingTask,
@@ -19,11 +20,17 @@ struct Participant {
     rooms: HashMap<String, Option<String>>,
     registrations: HashMap<String, ParticipantInfo>,
 }
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParticipantInfo {
     pub name: String,
     pub delivery: String,
     pub accepts_tasks: bool,
+    #[serde(default)]
+    pub orchestrator: bool,
+    #[serde(default)]
+    pub specialist: bool,
+    #[serde(default)]
+    pub resources: Vec<ResourceDescriptor>,
 }
 struct Task {
     request: PendingTask,
@@ -216,6 +223,7 @@ impl Clients {
                 scope: "local".into(),
                 presence: Presence::Online,
                 last_seen_secs: 0,
+                participant: p.registrations.get(room).cloned(),
             })
             .collect();
         result.sort_by(|a, b| a.name.cmp(&b.name));
