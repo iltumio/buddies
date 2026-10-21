@@ -504,7 +504,7 @@ impl BuddiesServer {
         let result = serde_json::json!({
             "room": req.room,
             "ticket": ticket.to_string(),
-            "endpoint_id": self.node.endpoint.id().to_string(),
+            "endpoint_id": self.node.node_id().to_string(),
             "agent_id": crate::local::agent_id(self.session_id),
             "connection": self.node.room_manager.room_health(&req.room).await,
         });

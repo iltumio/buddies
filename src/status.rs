@@ -109,7 +109,7 @@ pub async fn snapshot(State(node): State<Arc<BuddiesNode>>) -> Json<Snapshot> {
         });
     }
     Json(Snapshot {
-        node_id: node.endpoint.id().to_string(),
+        node_id: node.node_id().to_string(),
         signer: node.room_manager.signer_identity_label(),
         clients: node.clients.snapshot(),
         rooms,

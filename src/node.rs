@@ -2,33 +2,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use iroh::protocol::Router;
-use iroh::{Endpoint, endpoint::presets};
-use iroh_gossip::net::Gossip;
+use iroh::EndpointId;
 
 use crate::activity::DirtySet;
 use crate::async_storage::AsyncStorage;
 use crate::identity::LocalSigner;
 use crate::room::RoomManager;
+use crate::transport::{RoomTransport, TransportBackend};
 use crate::watcher::WatcherManager;
 
-/// Maximum gossip frame size. Must comfortably exceed the largest message
-/// we broadcast: a FileActivity diff capped at
-/// [`crate::activity::MAX_DIFF_BYTES`] (64 KiB) plus the postcard envelope
-/// and signature. iroh-gossip's default (4096 bytes) kills peer connections
-/// on larger frames; 256 KiB gives ample headroom. All peers must use the
-/// same limit (same wire-compat posture as the message format itself).
-pub(crate) const GOSSIP_MAX_MESSAGE_SIZE: usize = 256 * 1024;
+pub use crate::transport::GOSSIP_MAX_MESSAGE_SIZE;
 
 pub struct BuddiesNode {
     ticket_operation: tokio::sync::Mutex<()>,
-    ticket_addresses: iroh::address_lookup::memory::MemoryLookup,
     room_tickets: tokio::sync::Mutex<std::collections::HashMap<String, crate::ticket::RoomTicket>>,
     pub local_membership: tokio::sync::Mutex<()>,
     pub clients: crate::status::Clients,
     pub shutdown_token: tokio_util::sync::CancellationToken,
-    pub endpoint: Endpoint,
-    pub router: Router,
+    pub transport: Arc<dyn RoomTransport>,
     pub room_manager: Arc<RoomManager>,
     pub storage: Arc<AsyncStorage>,
     pub watcher_manager: Arc<WatcherManager>,
@@ -40,31 +31,19 @@ pub struct BuddiesNodeConfig {
     pub agent_name: String,
     pub data_dir: Option<PathBuf>,
     pub signer: Option<LocalSigner>,
+    pub transport: TransportBackend,
 }
 
 impl BuddiesNode {
     pub async fn new(config: BuddiesNodeConfig) -> Result<Self> {
         let storage = Arc::new(AsyncStorage::open(config.data_dir).await?);
-        let ticket_addresses = iroh::address_lookup::memory::MemoryLookup::new();
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(storage.endpoint_secret().await?)
-            .address_lookup(ticket_addresses.clone())
-            .bind()
-            .await?;
-
-        let gossip = Gossip::builder()
-            .max_message_size(GOSSIP_MAX_MESSAGE_SIZE)
-            .spawn(endpoint.clone());
-
-        let router = Router::builder(endpoint.clone())
-            .accept(iroh_gossip::ALPN, gossip.clone())
-            .spawn();
+        let transport = config.transport.build(&storage).await?;
 
         let dirty = Arc::new(DirtySet::new());
         let author = config.user_name.clone();
 
         let room_manager = RoomManager::new(
-            gossip,
+            Arc::clone(&transport),
             config.user_name,
             config.agent_name,
             Arc::clone(&storage),
@@ -77,17 +56,19 @@ impl BuddiesNode {
 
         Ok(Self {
             ticket_operation: tokio::sync::Mutex::new(()),
-            ticket_addresses,
             room_tickets: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             local_membership: tokio::sync::Mutex::new(()),
             clients: crate::status::Clients::default(),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
-            endpoint,
-            router,
+            transport,
             room_manager,
             storage,
             watcher_manager,
         })
+    }
+
+    pub fn node_id(&self) -> EndpointId {
+        self.transport.node_id()
     }
 
     /// The process owns room tickets; sessions only choose the room name.
@@ -108,6 +89,8 @@ impl BuddiesNode {
                 "external ticket has no endpoints"
             );
         }
+        let node_id = self.transport.node_id();
+        let node_addr = self.transport.endpoint_addr();
         let cached = self.room_tickets.lock().await.get(room).cloned();
         let mut ticket = match cached {
             Some(ticket) => ticket,
@@ -122,16 +105,14 @@ impl BuddiesNode {
                     "invalid stored room ticket"
                 );
                 // The identity is stable; addresses may change when the process restarts.
-                ticket
-                    .endpoints
-                    .retain(|addr| addr.id != self.endpoint.id());
-                ticket.endpoints.push(self.endpoint.addr());
+                ticket.endpoints.retain(|addr| addr.id != node_id);
+                ticket.endpoints.push(node_addr);
                 ticket
             }
         };
         if let Some(imported) = imported {
             for addr in imported.endpoints {
-                if addr.id == self.endpoint.id() {
+                if addr.id == node_id {
                     continue;
                 }
                 ticket.endpoints.retain(|existing| existing.id != addr.id);
@@ -145,9 +126,9 @@ impl BuddiesNode {
         let bootstrap = ticket
             .endpoints
             .iter()
-            .filter(|addr| addr.id != self.endpoint.id())
+            .filter(|addr| addr.id != node_id)
             .map(|addr| {
-                self.ticket_addresses.add_endpoint_info(addr.clone());
+                self.transport.register_peer_addr(addr.clone());
                 addr.id
             })
             .collect();
@@ -177,7 +158,7 @@ impl BuddiesNode {
         self.shutdown_token.cancel();
         self.watcher_manager.shutdown().await;
         self.room_manager.shutdown().await;
-        self.router.shutdown().await?;
+        self.transport.shutdown().await?;
         Ok(())
     }
 }

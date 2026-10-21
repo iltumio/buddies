@@ -387,6 +387,7 @@ async fn scan_and_broadcast(
 mod tests {
     use super::*;
     use crate::node::{BuddiesNode, BuddiesNodeConfig};
+    use crate::transport::{LocalHub, TransportBackend};
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -550,6 +551,7 @@ mod tests {
             agent_name: "codex".into(),
             data_dir: None,
             signer: None,
+            transport: TransportBackend::Local(LocalHub::new()),
         })
         .await
         .expect("create local node");
@@ -593,6 +595,7 @@ mod tests {
             agent_name: "codex".into(),
             data_dir: None,
             signer: None,
+            transport: TransportBackend::Local(LocalHub::new()),
         })
         .await
         .expect("create local node");
@@ -655,6 +658,7 @@ mod tests {
             agent_name: "codex".into(),
             data_dir: None,
             signer: None,
+            transport: TransportBackend::Local(LocalHub::new()),
         })
         .await
         .expect("create local node");
@@ -738,6 +742,7 @@ mod tests {
             agent_name: "test".into(),
             data_dir: None,
             signer: None,
+            transport: TransportBackend::Local(LocalHub::new()),
         })
         .await
         .unwrap();

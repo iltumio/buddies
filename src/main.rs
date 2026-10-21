@@ -19,6 +19,7 @@ mod skill;
 mod status;
 mod storage;
 mod ticket;
+mod transport;
 mod validation;
 mod watcher;
 mod worker;
@@ -38,6 +39,7 @@ use std::time::Duration;
 use crate::identity::discover_startup_identity;
 use crate::node::{BuddiesNode, BuddiesNodeConfig};
 use crate::server::BuddiesServer;
+use crate::transport::TransportBackend;
 
 fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
@@ -125,6 +127,7 @@ async fn main() -> Result<()> {
             signer,
             data_dir: data_path,
             presence: resilience::PresenceConfig::from_env()?,
+            transport: TransportBackend::from_env()?,
         })
         .await?,
     );

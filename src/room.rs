@@ -6,8 +6,6 @@ use tokio::time::Instant;
 
 use anyhow::Result;
 use bytes::Bytes;
-use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
-use iroh_gossip::net::Gossip;
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -21,6 +19,7 @@ use crate::protocol::{
     P2PMessage, P2PMessageBody, SignerIdentity, TaskResult, TopicId, room_to_topic,
 };
 use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult, SkillVote};
+use crate::transport::{RoomReceiver, RoomSender, RoomTransport, TransportEvent};
 
 const MAX_PENDING_TASKS: usize = 100;
 const MAX_SEARCH_SECONDS: u64 = 30;
@@ -149,7 +148,7 @@ impl Default for RoomHealth {
 
 struct RoomInner {
     bootstrap: Vec<iroh::EndpointId>,
-    sender: Option<GossipSender>,
+    sender: Option<Arc<dyn RoomSender>>,
     health: Arc<RwLock<RoomHealth>>,
     _receiver_handle: tokio::task::JoinHandle<()>,
 }
@@ -169,7 +168,7 @@ struct SkillSearch {
 }
 
 pub struct RoomManager {
-    gossip: Gossip,
+    transport: Arc<dyn RoomTransport>,
     lifecycle: Mutex<()>,
     pub presence: PresenceConfig,
     closing: std::sync::atomic::AtomicBool,
@@ -194,7 +193,7 @@ pub struct RoomManager {
 
 impl RoomManager {
     pub fn new(
-        gossip: Gossip,
+        transport: Arc<dyn RoomTransport>,
         user_name: String,
         agent_name: String,
         storage: Arc<AsyncStorage>,
@@ -203,7 +202,7 @@ impl RoomManager {
         presence: PresenceConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
-            gossip,
+            transport,
             lifecycle: Mutex::new(()),
             presence,
             closing: std::sync::atomic::AtomicBool::new(false),
@@ -227,7 +226,7 @@ impl RoomManager {
     }
 
     /// Subscribe to task arrival events. Each new `PendingTask` received via
-    /// gossip will be sent on the returned channel.
+    /// room transport will be sent on the returned channel.
     pub fn subscribe_task_events(&self) -> tokio::sync::broadcast::Receiver<PendingTask> {
         self.task_broadcast.subscribe()
     }
@@ -358,12 +357,11 @@ impl RoomManager {
             }
         }
         // Subscription must not wait indefinitely for an unreachable bootstrap peer.
-        let topic = tokio::time::timeout(
+        let (sender, receiver) = tokio::time::timeout(
             Duration::from_secs(5),
-            self.gossip.subscribe(topic_id, bootstrap_peers.clone()),
+            self.transport.subscribe(topic_id, bootstrap_peers.clone()),
         )
         .await??;
-        let (sender, receiver) = topic.split();
         let health = Arc::new(RwLock::new(RoomHealth::default()));
         let name = room_name.to_owned();
         let manager = Arc::clone(self);
@@ -699,15 +697,15 @@ impl RoomManager {
         &self,
         room: &str,
         bootstrap: Vec<iroh::EndpointId>,
-        sender: GossipSender,
-        receiver: GossipReceiver,
+        sender: Arc<dyn RoomSender>,
+        receiver: Box<dyn RoomReceiver>,
         health: Arc<RwLock<RoomHealth>>,
     ) {
         let mut known: HashSet<_> = bootstrap.into_iter().take(128).collect();
-        let mut transport = Some((sender, receiver));
+        let mut subscription = Some((sender, receiver));
         let mut backoff = Backoff::default();
         loop {
-            if let Some((sender, receiver)) = transport.take() {
+            if let Some((sender, receiver)) = subscription.take() {
                 let started = Instant::now();
                 let result = self
                     .receive_loop(room, &sender, receiver, &mut known, &health)
@@ -738,13 +736,12 @@ impl RoomManager {
             }
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
-                self.gossip
+                self.transport
                     .subscribe(room_to_topic(room), known.iter().copied().collect()),
             )
             .await;
             match result {
-                Ok(Ok(topic)) => {
-                    let (sender, receiver) = topic.split();
+                Ok(Ok((sender, receiver))) => {
                     if let Some(entry) = self.rooms.write().await.get_mut(room) {
                         entry.sender = Some(sender.clone());
                     } else {
@@ -752,10 +749,15 @@ impl RoomManager {
                     }
                     // Reset only after a useful connection, not a subscription that
                     // can immediately fail again. The inner loop tracks peer retries.
-                    transport = Some((sender, receiver));
+                    subscription = Some((sender, receiver));
                 }
                 error => {
-                    health.write().await.last_error = Some(format!("resubscribe failed: {error:?}"))
+                    let msg = match error {
+                        Ok(Err(e)) => format!("resubscribe failed: {e}"),
+                        Err(_) => "resubscribe timed out".into(),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
+                    health.write().await.last_error = Some(msg);
                 }
             }
         }
@@ -764,12 +766,11 @@ impl RoomManager {
     async fn receive_loop(
         &self,
         room: &str,
-        sender: &GossipSender,
-        mut receiver: GossipReceiver,
+        sender: &Arc<dyn RoomSender>,
+        mut receiver: Box<dyn RoomReceiver>,
         known: &mut HashSet<iroh::EndpointId>,
         health: &RwLock<RoomHealth>,
     ) -> Result<()> {
-        use n0_future::TryStreamExt;
         let mut heartbeat = tokio::time::interval(self.presence.heartbeat);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut neighbors = HashSet::new();
@@ -777,9 +778,9 @@ impl RoomManager {
         let mut retry_at = Instant::now() + retry.next();
         loop {
             tokio::select! {
-                event = receiver.try_next() => match event? {
-                    Some(Event::Received(msg)) => self.handle_message(room, &msg.content).await,
-                    Some(Event::NeighborUp(id)) => {
+                event = receiver.next_event() => match event? {
+                    Some(TransportEvent::Received(content)) => self.handle_message(room, &content).await,
+                    Some(TransportEvent::NeighborUp(id)) => {
                         neighbors.insert(id);
                         if known.len() < 128 { known.insert(id); }
                         retry.reset();
@@ -790,7 +791,7 @@ impl RoomManager {
                         // Advertise immediately to newly reachable peers.
                         heartbeat.reset_immediately();
                     }
-                    Some(Event::NeighborDown(id)) => {
+                    Some(TransportEvent::NeighborDown(id)) => {
                         neighbors.remove(&id);
                         let mut state = health.write().await;
                         state.neighbors = neighbors.len();
@@ -801,7 +802,7 @@ impl RoomManager {
                             retry_at = Instant::now() + retry.next();
                         }
                     }
-                    Some(Event::Lagged) => anyhow::bail!("gossip event stream lagged; resynchronizing presence"),
+                    Some(TransportEvent::Lagged) => anyhow::bail!("gossip event stream lagged; resynchronizing presence"),
                     None => return Ok(()),
                 },
                 _ = heartbeat.tick() => {
@@ -1222,6 +1223,7 @@ mod tests {
     use crate::activity::FileActivityEntry;
     use crate::memory::MemoryKind;
     use crate::node::{BuddiesNode, BuddiesNodeConfig};
+    use crate::transport::{IrohTransport, LocalHub, TransportBackend};
 
     fn nonce(n: u8) -> [u8; 16] {
         [n; 16]
@@ -1369,6 +1371,7 @@ mod tests {
             agent_name: "codex".into(),
             data_dir: None,
             signer: None,
+            transport: TransportBackend::Local(LocalHub::new()),
         })
         .await
         .expect("create in-memory node");
@@ -1586,6 +1589,7 @@ mod tests {
             agent_name: "test".into(),
             data_dir: None,
             signer: None,
+            transport: TransportBackend::Local(LocalHub::new()),
         })
         .await
         .unwrap()
@@ -2002,7 +2006,7 @@ mod tests {
         let node = regression_node().await;
         let manager = &node.room_manager;
         manager.join_room("failure", vec![]).await.unwrap();
-        manager.gossip.shutdown().await.unwrap();
+        manager.transport.shutdown().await.unwrap();
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 let health = manager.room_health("failure").await.unwrap();
@@ -2042,6 +2046,7 @@ mod tests {
         use iroh::{
             Endpoint, address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router,
         };
+        use iroh_gossip::net::Gossip;
         let lookup = MemoryLookup::new();
         let a = Endpoint::builder(presets::Minimal)
             .bind_addr("127.0.0.1:0")
@@ -2067,6 +2072,10 @@ mod tests {
         let rb = Router::builder(b.clone())
             .accept(iroh_gossip::ALPN, gb.clone())
             .spawn();
+        let ta: Arc<dyn RoomTransport> =
+            Arc::new(IrohTransport::from_parts(a.clone(), ga, ra, lookup.clone()));
+        let tb: Arc<dyn RoomTransport> =
+            Arc::new(IrohTransport::from_parts(b.clone(), gb, rb, lookup));
         let config = PresenceConfig {
             heartbeat: Duration::from_millis(100),
             suspect_after: Duration::from_millis(400),
@@ -2074,7 +2083,7 @@ mod tests {
         };
         let storage = Arc::new(AsyncStorage::open(None).await.unwrap());
         let ma = RoomManager::new(
-            ga,
+            Arc::clone(&ta),
             "alice".into(),
             "test".into(),
             storage.clone(),
@@ -2083,7 +2092,7 @@ mod tests {
             config,
         );
         let mb = RoomManager::new(
-            gb.clone(),
+            Arc::clone(&tb),
             "bob".into(),
             "test".into(),
             storage.clone(),
@@ -2116,7 +2125,7 @@ mod tests {
         .await
         .unwrap();
         let returned = RoomManager::new(
-            gb,
+            Arc::clone(&tb),
             "bob".into(),
             "test".into(),
             storage,
@@ -2138,7 +2147,7 @@ mod tests {
         assert_eq!(ma.room_health("test").await.unwrap().state, "connected");
         ma.shutdown().await;
         returned.shutdown().await;
-        ra.shutdown().await.unwrap();
-        rb.shutdown().await.unwrap();
+        ta.shutdown().await.unwrap();
+        tb.shutdown().await.unwrap();
     }
 }
