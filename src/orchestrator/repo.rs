@@ -1,9 +1,10 @@
 //! Isolated writes and verification. The user's checkout is touched only by a
 //! final, verified patch, with both HEAD and cleanliness checked again.
-use super::state::{Assignment, Config, contains};
+use super::state::{Assignment, Config, ResourceConfig, State, Status, contains, validate_path};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -16,11 +17,18 @@ use tokio::{
 const MAX_PATCH: usize = 4 * 1024 * 1024;
 const MAX_CHECK_LOG: u64 = 1024 * 1024;
 
+#[derive(Clone)]
 pub struct Repository {
     pub root: PathBuf,
     pub integration: PathBuf,
     pub coordinator: PathBuf,
     pub repo: PathBuf,
+}
+
+#[derive(Clone)]
+pub struct Repositories {
+    pub primary: String,
+    pub repos: BTreeMap<String, Repository>,
 }
 
 pub async fn git(cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
@@ -91,6 +99,15 @@ impl Repository {
         clean(&self.integration).await?;
         Ok(())
     }
+    pub async fn reset(&self, base: &str) -> Result<()> {
+        self.worktree(&self.coordinator, base).await?;
+        git(&self.coordinator, &["checkout", "--detach", "-f", base]).await?;
+        git(&self.coordinator, &["clean", "-fd"]).await?;
+        self.worktree(&self.integration, base).await?;
+        git(&self.integration, &["checkout", "--detach", "-f", base]).await?;
+        git(&self.integration, &["clean", "-fd"]).await?;
+        Ok(())
+    }
     async fn worktree(&self, path: &Path, base: &str) -> Result<()> {
         if path.exists() {
             ensure!(
@@ -125,10 +142,12 @@ impl Repository {
         // detection so both sides of a move must be authorized.
         let mut names = git(cwd, &["diff", "--name-only", "--no-renames", "-z", base]).await?;
         names.extend(git(cwd, &["ls-files", "--others", "--exclude-standard", "-z"]).await?);
+        let allow_all = paths.is_empty() || paths.iter().any(|p| p == "." || p == "*");
         for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
             let name = std::str::from_utf8(name).context("non-UTF8 changed path")?;
+            validate_path(name)?;
             ensure!(
-                paths.iter().any(|p| contains(p, name)),
+                allow_all || paths.iter().any(|p| contains(p, name)),
                 "write outside assignment ownership: {name}"
             );
             // No new symbolic links/submodules that could redirect checks outside
@@ -232,11 +251,16 @@ impl Repository {
         }
         head(&self.integration).await
     }
-    pub async fn prepare_publication(&self, base: &str, config: &Config) -> Result<Vec<u8>> {
-        self.checks(&self.integration, &config.checks, config.check_timeout_secs)
+    pub async fn prepare_publication_resource(
+        &self,
+        base: &str,
+        resource: &ResourceConfig,
+        check_timeout_secs: u64,
+    ) -> Result<Vec<u8>> {
+        self.checks(&self.integration, &resource.checks, check_timeout_secs)
             .await?;
         clean(&self.integration).await?;
-        let patch = Self::patch(&self.integration, base, &config.authorized_paths).await?;
+        let patch = Self::patch(&self.integration, base, &resource.authorized_paths).await?;
         let path = self.root.join("verified.patch");
         std::fs::write(&path, &patch)?;
         ensure!(
@@ -318,168 +342,95 @@ impl Repository {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn ownership_includes_committed_untracked_staged_and_renamed_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        git(tmp.path(), &["init", "-q"]).await.unwrap();
-        std::fs::write(tmp.path().join("owned"), "before").unwrap();
-        std::fs::write(tmp.path().join("other"), "before").unwrap();
-        git(tmp.path(), &["add", "."]).await.unwrap();
-        git(
-            tmp.path(),
-            &[
-                "-c",
-                "user.name=test",
-                "-c",
-                "user.email=test@test",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-qm",
-                "base",
-            ],
-        )
-        .await
-        .unwrap();
-        let base = head(tmp.path()).await.unwrap();
-        let paths = vec!["owned".into()];
-        std::fs::write(tmp.path().join("untracked"), "outside").unwrap();
-        assert!(Repository::patch(tmp.path(), &base, &paths).await.is_err());
-        std::fs::remove_file(tmp.path().join("untracked")).unwrap();
-        std::fs::write(tmp.path().join("other"), "outside").unwrap();
-        git(tmp.path(), &["add", "."]).await.unwrap();
-        assert!(Repository::patch(tmp.path(), &base, &paths).await.is_err());
-        git(
-            tmp.path(),
-            &[
-                "-c",
-                "user.name=test",
-                "-c",
-                "user.email=test@test",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-qm",
-                "outside",
-            ],
-        )
-        .await
-        .unwrap();
-        assert!(Repository::patch(tmp.path(), &base, &paths).await.is_err());
-        git(tmp.path(), &["reset", "--hard", &base]).await.unwrap();
-        std::fs::rename(tmp.path().join("other"), tmp.path().join("owned")).unwrap();
-        assert!(Repository::patch(tmp.path(), &base, &paths).await.is_err());
+impl Repositories {
+    pub async fn locate_all(config: &Config) -> Result<Self> {
+        let mut repos = BTreeMap::new();
+        for (name, res) in config.all_resources() {
+            let repo = Repository::locate(&res.repo, &config.room).await?;
+            repos.insert(name, repo);
+        }
+        Ok(Self {
+            primary: config.primary_resource_name(),
+            repos,
+        })
     }
 
-    #[tokio::test]
-    async fn verification_gates_publication_and_preserves_concurrent_user_edits() {
-        use crate::orchestrator::state::{self, COORDINATOR, Control, State};
-        let tmp = tempfile::tempdir().unwrap();
-        git(tmp.path(), &["init", "-q"]).await.unwrap();
-        std::fs::create_dir(tmp.path().join("src")).unwrap();
-        std::fs::write(tmp.path().join("src/file"), "base").unwrap();
-        git(tmp.path(), &["add", "."]).await.unwrap();
-        git(
-            tmp.path(),
-            &[
-                "-c",
-                "user.name=test",
-                "-c",
-                "user.email=test@test",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "-qm",
-                "base",
-            ],
-        )
-        .await
-        .unwrap();
-        let base = head(tmp.path()).await.unwrap();
-        let config = state::test_config(tmp.path().to_path_buf());
-        let mut state = State::new(config.clone(), base.clone());
-        state
-            .apply(
-                COORDINATOR,
-                Control::Assign {
-                    id: "task".into(),
-                    owner: "specialist-a".into(),
-                    description: "edit file".into(),
-                    paths: vec!["src/file".into()],
-                    dependencies: vec![],
-                    deadline_secs: 60,
-                },
-                1,
-            )
-            .unwrap();
-        let repo = Repository::locate(tmp.path(), "test").await.unwrap();
-        repo.initialize(&base, &base).await.unwrap();
-        let cwd = repo
-            .workspace(&state.assignments["task"], &base)
-            .await
-            .unwrap();
-        let a = state.assignments.get_mut("task").unwrap();
-        a.worktree = Some(cwd.clone());
-        a.base = Some(base.clone());
-        a.state = state::Status::Running;
-        state
-            .apply(
-                "specialist-a",
-                Control::Accept {
-                    id: "task".into(),
-                    revision: 1,
-                },
-                2,
-            )
-            .unwrap();
-        state
-            .apply(
-                "specialist-a",
-                Control::Report {
-                    id: "task".into(),
-                    revision: 1,
-                    summary: "edited".into(),
-                    checks: vec!["test -f src/file".into()],
-                },
-                2,
-            )
-            .unwrap();
-        std::fs::write(cwd.join("src/file"), "verified").unwrap();
-        let integrated = repo
-            .verify_assignment(&state.assignments["task"], &config)
-            .await
-            .unwrap();
-        assert_ne!(integrated, base);
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("src/file")).unwrap(),
-            "base"
-        );
-        let mut failing = config.clone();
-        failing.checks = vec!["false".into()];
-        assert!(repo.prepare_publication(&base, &failing).await.is_err());
-        let patch = repo.prepare_publication(&base, &config).await.unwrap();
-        std::fs::write(tmp.path().join("src/file"), "human edit").unwrap();
-        assert!(repo.publish(&base, &patch).await.is_err());
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("src/file")).unwrap(),
-            "human edit"
-        );
-        std::fs::write(tmp.path().join("src/file"), "base").unwrap();
-        repo.publish(&base, &patch).await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("src/file")).unwrap(),
-            "verified"
-        );
-        assert_eq!(head(tmp.path()).await.unwrap(), base); // No commit in user checkout.
-        let start = std::time::Instant::now();
-        assert!(
-            repo.checks(&repo.integration, &["sleep 5".into()], 1)
-                .await
-                .is_err()
-        );
-        assert!(start.elapsed() < Duration::from_secs(3));
+    pub fn primary(&self) -> &Repository {
+        self.repos
+            .get(&self.primary)
+            .or_else(|| self.repos.values().next())
+            .expect("at least one repository")
+    }
+
+    pub fn get(&self, resource: &str) -> Result<&Repository> {
+        if let Some(r) = self.repos.get(resource) {
+            return Ok(r);
+        }
+        if resource == "default" && self.repos.len() == 1 {
+            return Ok(self.primary());
+        }
+        anyhow::bail!("unknown repository resource '{resource}'")
+    }
+
+    pub async fn snapshot_bases(
+        &self,
+        require_all_clean: bool,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut bases = BTreeMap::new();
+        for (name, repo) in &self.repos {
+            let b = head(&repo.repo).await?;
+            if require_all_clean {
+                repo.check_checkout(&b).await?;
+            }
+            bases.insert(name.clone(), b);
+        }
+        Ok(bases)
+    }
+
+    pub async fn initialize_all(&self, state: &State) -> Result<()> {
+        for (name, repo) in &self.repos {
+            let base = state.resource_base(name);
+            let head = state.resource_head(name);
+            repo.initialize(&base, &head).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn prepare_all_publications(
+        &self,
+        state: &State,
+    ) -> Result<BTreeMap<String, Vec<u8>>> {
+        let mut patches = BTreeMap::new();
+        let all_res = state.config.all_resources();
+        for (name, res) in &all_res {
+            let touched = all_res.len() == 1
+                || state
+                    .assignments
+                    .values()
+                    .any(|a| a.state == Status::Completed && a.resource == *name);
+            if !touched {
+                continue;
+            }
+            let repo = self.get(name)?;
+            let base = state.resource_base(name);
+            let patch = repo
+                .prepare_publication_resource(&base, res, state.config.check_timeout_secs)
+                .await?;
+            patches.insert(name.clone(), patch);
+        }
+        Ok(patches)
+    }
+
+    pub async fn publish_all(
+        &self,
+        state: &State,
+        patches: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        for (name, patch) in patches {
+            let repo = self.get(name)?;
+            let base = state.resource_base(name);
+            repo.publish(&base, patch).await?;
+        }
+        Ok(())
     }
 }

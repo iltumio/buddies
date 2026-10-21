@@ -179,7 +179,9 @@ impl Queue {
         let id = worker_id(&req.secret);
         if let Action::Register { room, agent } = req.action {
             ensure!(
-                !room.trim().is_empty() && room.len() <= 256 && agent == "codex",
+                !room.trim().is_empty()
+                    && room.len() <= 256
+                    && matches!(agent.as_str(), "codex" | "orchestrator"),
                 "invalid room or worker agent"
             );
             if let Some(existing) = self.workers.get(&id) {

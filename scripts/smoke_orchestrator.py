@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Real transport/worktrees with a deterministic multi-thread App Server fixture.
 
-No model usage. Exercises the design's producer/consumer experiment, then restart
-recovery while a specialist has unintegrated effects.
+No model usage. Exercises the design's producer/consumer experiment, restart
+recovery while a specialist has unintegrated effects, and autonomous machine
+service mode with TOML resource configuration and dynamic specialist creation.
 """
 import json
 import os
@@ -136,6 +137,80 @@ for line in sys.stdin:
         a=data['assignment']; assert a['id']=='consumer' and a['revision']==1
         control(tid,{'action':'checkpoint','id':'consumer','revision':1,'detail':'Retained legacy effects before material update'},lambda _:final(tid,'Checkpoint ready.'))
     elif method=='turn/interrupt': final(tid,'Interrupted.','interrupted')
+'''
+
+
+FAKE_SERVICE = r'''#!/usr/bin/env python3
+import json, os, re, sys
+from pathlib import Path
+threads = {}
+pending = {}
+sequence = 20000
+log = Path(os.environ['BUDDIES_FIXTURE_LOG'])
+def record(**value):
+    with log.open('a') as f: f.write(json.dumps(value)+'\n')
+def emit(value): print(json.dumps(value), flush=True)
+def final(tid, text, status='completed'):
+    emit({'method':'item/completed','params':{'threadId':tid,'item':{'type':'agentMessage','text':text}}})
+    emit({'method':'turn/completed','params':{'threadId':tid,'turn':{'id':threads[tid]['turn'],'status':status}}})
+def control(tid, arguments, done):
+    global sequence
+    sequence += 1
+    pending[sequence] = done
+    record(event='tool', thread=tid, name='orchestrator_control', arguments=arguments)
+    emit({'id':sequence,'method':'item/tool/call','params':{'threadId':tid,'turnId':threads[tid]['turn'],'tool':'orchestrator_control','arguments':arguments}})
+def coordinator(tid, data):
+    g = data['graph']; assignments = g['assignments']
+    if not assignments:
+        control(tid, {'action':'create_specialist','name':'api-specialist','role':'Backend API specialist','resources':['backend'],'allowed_paths':['src/api']}, lambda _:
+            control(tid, {'action':'create_specialist','name':'ui-specialist','role':'Frontend UI specialist','resources':['frontend'],'allowed_paths':['src/ui']}, lambda _:
+                control(tid, {'action':'assign','id':'backend-contract','owner':'api-specialist','description':'Publish backend schema','resource':'backend','paths':['src/api/schema.json'],'dependencies':[],'deadline_secs':90}, lambda _:
+                    control(tid, {'action':'assign','id':'frontend-view','owner':'ui-specialist','description':'Render frontend view','resource':'frontend','paths':['src/ui/view.txt'],'dependencies':['backend-contract'],'deadline_secs':90}, lambda _:
+                        final(tid, 'Created specialists and assigned multi-resource work.')))))
+    elif all(a['state']=='completed' for a in assignments.values()):
+        control(tid, {'action':'complete','summary':'Autonomous multi-resource task completed.'}, lambda _: final(tid, 'Done.'))
+    else:
+        final(tid, 'Waiting for specialists.')
+def specialist(tid, data):
+    t = threads[tid]; a = data['assignment']; cwd = Path(t['cwd'])
+    def implement():
+        if t['name'] == 'api-specialist':
+            (cwd/'src/api').mkdir(parents=True, exist_ok=True)
+            (cwd/'src/api/schema.json').write_text(json.dumps({'version': 2}))
+        elif t['name'] == 'ui-specialist':
+            (cwd/'src/ui').mkdir(parents=True, exist_ok=True)
+            (cwd/'src/ui/view.txt').write_text('rendered-v2')
+        control(tid, {'action':'report','id':a['id'],'revision':a['revision'],'summary':'Done '+a['id'],'checks':['test -f '+a['paths'][0]]}, lambda _:
+            final(tid, 'Reported '+a['id']))
+    control(tid, {'action':'accept','id':a['id'],'revision':a['revision']}, lambda _: implement())
+for line in sys.stdin:
+    msg = json.loads(line)
+    if 'method' not in msg:
+        assert msg['result']['success'], msg
+        value = json.loads(msg['result']['contentItems'][0]['text'])
+        pending.pop(msg['id'])(value)
+        continue
+    if 'id' not in msg: continue
+    method = msg['method']; p = msg['params']; tid = p.get('threadId')
+    record(event='rpc', method=method, thread=tid)
+    if method == 'initialize':
+        result = {}
+    elif method in ('thread/start', 'thread/resume'):
+        name = re.search(r'Stable participant: (\S+)\. Goal:', p['developerInstructions']).group(1)
+        tid = tid or 'thread-' + name
+        threads[tid] = {'name': name, 'cwd': p['cwd'], 'turns': 0}
+        result = {'thread': {'id': tid}}
+    elif method == 'turn/start':
+        t = threads[tid]; t['turns'] += 1; t['turn'] = 'turn-' + tid + '-' + str(t['turns'])
+        t['cwd'] = p['cwd']
+        data = json.loads(p['input'][0]['text'])
+        result = {'turn': {'id': t['turn']}}
+    else:
+        result = {}
+    emit({'id': msg['id'], 'result': result})
+    if method == 'turn/start':
+        if threads[tid]['name'] == 'orchestrator': coordinator(tid, data)
+        else: specialist(tid, data)
 '''
 
 
@@ -274,6 +349,100 @@ def experiment(binary, root, recovery=False):
             server.stop()
 
 
+def seed_resource(repo, rel_path, initial_content):
+    repo.mkdir(parents=True)
+    target = repo / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(initial_content)
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(repo), '-c', 'user.name=test', '-c', 'user.email=test@test',
+                    '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'base'], check=True)
+
+
+def service_experiment(binary, root):
+    backend = root / 'backend'
+    frontend = root / 'frontend'
+    seed_resource(backend, 'src/api/schema.json', '{"version": 1}')
+    seed_resource(frontend, 'src/ui/view.txt', 'rendered-v1')
+    fake = root / 'codex-service-fixture'
+    fake.write_text(FAKE_SERVICE)
+    fake.chmod(0o755)
+    log = root / 'service-rpc.jsonl'
+    server = Server(binary, str(root / 'service'), 'service')
+    config_path = root / 'orchestrator.toml'
+    config_path.write_text(f"""
+room = "machine-room"
+url = "{server.url}"
+codex_bin = "{fake}"
+debounce_ms = 50
+max_active_specialists = 2
+max_model_calls = 32
+max_elapsed_secs = 120
+check_timeout_secs = 5
+
+[[resources]]
+name = "backend"
+repo = "{backend}"
+description = "Backend API repository"
+allow_paths = ["src/api"]
+checks = ["test -f src/api/schema.json"]
+
+[[resources]]
+name = "frontend"
+repo = "{frontend}"
+description = "Frontend UI repository"
+allow_paths = ["src/ui"]
+checks = ["test -f src/ui/view.txt"]
+""")
+    client = None
+    proc = None
+    with (root / 'service-stderr.log').open('w') as stderr:
+        try:
+            client = Client(server.url)
+            client.call('join_room', room='machine-room')
+            client.call('register_participant', room='machine-room', name='delegator')
+            proc = subprocess.Popen(
+                [str(binary), 'orchestrator', '--config', str(config_path), '--once'],
+                env={**os.environ, 'BUDDIES_FIXTURE_LOG': str(log)},
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                text=True,
+            )
+            eventually(lambda: client.call('get_room_status', room='machine-room').get('workers'), timeout=15)
+            delegated = client.call(
+                'delegate_task',
+                room='machine-room',
+                description='Coordinate backend schema v2 and frontend view v2 across repositories',
+                background=True,
+            )
+            task_id = delegated['task_id']
+            out, _ = proc.communicate(timeout=30)
+            assert proc.returncode == 0, (out, (root / 'service-stderr.log').read_text())
+            proc = None
+            status = client.call('get_task_status', room='machine-room', task_id=task_id)
+            assert status['state'] == 'completed', status
+            assert json.loads((backend / 'src/api/schema.json').read_text())['version'] == 2
+            assert (frontend / 'src/ui/view.txt').read_text() == 'rendered-v2'
+            state = snapshot(backend)
+            assert state['completed'], state
+            assert set(state['specialists'].keys()) == {'api-specialist', 'ui-specialist'}, state['specialists']
+            assert state['specialists']['api-specialist']['resources'] == ['backend']
+            assert state['specialists']['ui-specialist']['resources'] == ['frontend']
+            print("orchestrator machine service: autonomous specialist creation and multi-resource publication verified")
+        except Exception:
+            stderr.flush()
+            print((root / 'service-stderr.log').read_text())
+            print(events(log)[-12:])
+            raise
+        finally:
+            if proc is not None:
+                stop(proc)
+            if client is not None:
+                client.close()
+            server.stop()
+
+
 def main():
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--locked', '--format-version', '1']))
     binary = Path(metadata['target_directory'])/'debug/buddies'
@@ -282,7 +451,9 @@ def main():
         for name, recovery in [('acceptance', False), ('recovery', True)]:
             (root/name).mkdir()
             experiment(binary, root/name, recovery)
-    print('orchestrator smoke: acceptance and interrupted recovery passed')
+        (root/'machine-service').mkdir()
+        service_experiment(binary, root/'machine-service')
+    print('orchestrator smoke: acceptance, interrupted recovery, and machine service passed')
 
 
 if __name__ == '__main__':

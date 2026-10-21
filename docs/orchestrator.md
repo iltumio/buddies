@@ -28,18 +28,74 @@ responsibilities, with at most 16 registered roles. The service rejects live
 duplicate names. All participants use addressed inboxes on the same HTTP service;
 this command does not replicate assignments across P2P nodes.
 
+## Machine configuration and autonomous service mode
+
+To configure a machine as an autonomous orchestrator that accepts delegated tasks
+and creates specialists with scoped access to local machine resources, pass
+`--config <path>` (see [`contrib/orchestrator.toml`](../contrib/orchestrator.toml)):
+
+```toml
+room = "Machine-Orchestrator"
+url = "http://127.0.0.1:8080"
+max_active_specialists = 4
+max_model_calls = 128
+
+[[resources]]
+name = "backend"
+repo = "/srv/repos/backend"
+description = "Rust backend API and storage engine"
+allow_paths = ["src", "tests", "Cargo.toml"]
+checks = ["cargo test --locked"]
+
+[[resources]]
+name = "frontend"
+repo = "/srv/repos/frontend"
+description = "Web UI application"
+allow_paths = ["src", "package.json"]
+checks = ["npm test"]
+```
+
+Start the machine orchestrator in listening service mode (when `--goal` is omitted):
+
+```sh
+buddies orchestrator --config ~/.config/buddies/orchestrator.toml
+```
+
+Or install it as a user `systemd` service using
+[`contrib/systemd/buddies-orchestrator.service`](../contrib/systemd/buddies-orchestrator.service):
+
+```sh
+mkdir -p ~/.config/systemd/user ~/.config/buddies
+cp contrib/orchestrator.toml ~/.config/buddies/orchestrator.toml
+cp contrib/systemd/buddies-orchestrator.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now buddies-orchestrator.service
+```
+
+In service mode, the orchestrator:
+1. Joins `room` as `orchestrator` and registers on the local durable `/worker` queue.
+2. Accepts delegated tasks from:
+   - `delegate_task` (`wait: false` durable queue or `wait: true` synchronous/P2P delegation),
+   - addressed `request` messages sent to `orchestrator` in the room (`send_message` with `to: "orchestrator"` and `kind: "request"`).
+3. For each delegated task, autonomously creates specialist roles via `orchestrator_control` (`action: "create_specialist"`) and grants each specialist access to specific machine `resources` and `allowed_paths`.
+4. Dispatches each assignment in an isolated git worktree of the target resource (`resource: "<name>"`), verifies acceptance checks, and publishes verified patches to the touched repositories.
+
+Pass `--once` with `--config` to process a single delegated task and exit.
+
 ## Assignment protocol
 
 The dynamic `orchestrator_control` tool proposes state transitions. The scheduler
 validates actor identity, ownership, dependencies and revisions before accepting
-them. The coordinator can `assign`, `revise`, `cancel`, `recover`, `inspect` and
-`complete`. Specialists can `accept`, `checkpoint`, `report`, `fail` and
-`heartbeat` their own assignments. `inspect` is available to every role.
+them. The coordinator can `create_specialist`, `assign`, `revise`, `cancel`,
+`recover`, `inspect` and `complete`. Specialists can `accept`, `checkpoint`,
+`report`, `fail` and `heartbeat` their own assignments. `inspect` is available to
+every role.
 
-Each assignment stores an ID, owner, revision, owned paths, dependencies,
-deadline, acceptance, worktree, baseline and result evidence. Dependencies must
-already exist, so the graph remains acyclic. Shared paths have one explicit
-owner. Reuse that assignment through revisions when its contract changes.
+Each assignment stores an ID, owner, revision, target resource, owned paths,
+dependencies, deadline, acceptance, worktree, baseline and result evidence.
+Dependencies must already exist, so the graph remains acyclic. Shared paths within
+the same resource have one explicit owner. Reuse that assignment through revisions
+when its contract changes.
 
 The states are `queued`, `running`, `waiting_for_input`, `completed`, `failed`
 and `cancelled`. A report does not complete an assignment: the runtime waits for
@@ -65,15 +121,16 @@ activity without requesting a coordinator decision.
 ## Integration and recovery
 
 State lives under the repository's common git directory:
-`buddies-orchestrator/<room-hash>/state.redb`. A transactional database lock
-prevents two local coordinators from owning that state. `state.json` is an atomic,
-reviewable snapshot, not an editable configuration. This directory also retains
-specialist worktrees, per-revision patches, acceptance logs and the integration
-worktree. Internal commits occur only in the detached integration worktree;
-repository hooks are disabled for the runtime's git operations.
+`buddies-orchestrator/<room-hash>/state.redb` (or `--state-dir` when configured).
+A transactional database lock prevents two local coordinators from owning that
+state. `state.json` is an atomic, reviewable snapshot, not an editable
+configuration. This directory also retains specialist worktrees, per-revision
+patches, acceptance logs and the integration worktree. Internal commits occur
+only in the detached integration worktree; repository hooks are disabled for the
+runtime's git operations.
 
 The coordinator completes the goal only after every required assignment is
-verified and specialists are idle. The runtime then runs the user's `--check`
+verified and specialists are idle. The runtime then runs the resource's `checks`
 commands on the combined changes, validates the authorized scope again, and
 applies `verified.patch` to the original checkout. It does not commit that
 checkout. Its HEAD and cleanliness must still match the starting repository;

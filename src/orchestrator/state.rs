@@ -12,10 +12,38 @@ use std::{
 pub const COORDINATOR: &str = "orchestrator";
 const TABLE: TableDefinition<&str, &str> = TableDefinition::new("orchestrator_state");
 
+fn default_resource_name() -> String {
+    "default".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResourceConfig {
+    pub name: String,
+    pub repo: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub authorized_paths: Vec<String>,
+    #[serde(default)]
+    pub checks: Vec<String>,
+}
+
+impl ResourceConfig {
+    pub fn allows_path(&self, path: &str) -> bool {
+        self.authorized_paths.is_empty()
+            || self
+                .authorized_paths
+                .iter()
+                .any(|p| p == "*" || p == "." || contains(p, path))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub room: String,
     pub repo: PathBuf,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resources: BTreeMap<String, ResourceConfig>,
     pub model: Option<String>,
     pub goal: String,
     pub authorized_paths: Vec<String>,
@@ -26,6 +54,66 @@ pub struct Config {
     pub max_elapsed_secs: u64,
     pub max_depth: usize,
     pub check_timeout_secs: u64,
+}
+
+impl Config {
+    pub fn primary_resource_name(&self) -> String {
+        if self.resources.is_empty() || self.resources.contains_key("default") {
+            "default".into()
+        } else {
+            self.resources
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "default".into())
+        }
+    }
+
+    pub fn all_resources(&self) -> BTreeMap<String, ResourceConfig> {
+        if self.resources.is_empty() {
+            let mut map = BTreeMap::new();
+            map.insert(
+                "default".into(),
+                ResourceConfig {
+                    name: "default".into(),
+                    repo: self.repo.clone(),
+                    description: None,
+                    authorized_paths: self.authorized_paths.clone(),
+                    checks: self.checks.clone(),
+                },
+            );
+            map
+        } else {
+            self.resources.clone()
+        }
+    }
+
+    pub fn resource(&self, name: Option<&str>) -> Result<ResourceConfig> {
+        let all = self.all_resources();
+        match name {
+            Some(requested) => {
+                if let Some(res) = all.get(requested) {
+                    return Ok(res.clone());
+                }
+                if requested == "default" && all.len() == 1 {
+                    return Ok(all.into_values().next().unwrap());
+                }
+                anyhow::bail!("unknown machine resource '{requested}'")
+            }
+            None => {
+                if all.len() == 1 {
+                    return Ok(all.into_values().next().unwrap());
+                }
+                if let Some(res) = all.get("default") {
+                    return Ok(res.clone());
+                }
+                anyhow::bail!(
+                    "multiple resources configured ({:?}); specify a resource name",
+                    all.keys().collect::<Vec<_>>()
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -54,6 +142,8 @@ pub struct Assignment {
     pub owner: String,
     pub revision: u64,
     pub description: String,
+    #[serde(default = "default_resource_name")]
+    pub resource: String,
     pub paths: Vec<String>,
     pub dependencies: Vec<String>,
     pub deadline: u64,
@@ -71,10 +161,16 @@ pub struct Assignment {
     pub pending_result: Option<Evidence>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Specialist {
     pub thread: Option<String>,
     pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +179,10 @@ pub struct State {
     pub config: Config,
     pub base: String,
     pub integration_head: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resource_bases: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resource_heads: BTreeMap<String, String>,
     pub coordinator_thread: Option<String>,
     pub specialists: BTreeMap<String, Specialist>,
     pub assignments: BTreeMap<String, Assignment>,
@@ -102,10 +202,21 @@ pub struct State {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Control {
     Inspect,
+    /// Create or update a specialist role and grant it access to machine resources and paths.
+    CreateSpecialist {
+        name: String,
+        role: String,
+        #[serde(default)]
+        resources: Vec<String>,
+        #[serde(default)]
+        allowed_paths: Vec<String>,
+    },
     Assign {
         id: String,
         owner: String,
         description: String,
+        #[serde(default)]
+        resource: Option<String>,
         paths: Vec<String>,
         dependencies: Vec<String>,
         deadline_secs: u64,
@@ -193,17 +304,42 @@ pub fn text(value: &str) -> Result<()> {
 }
 
 impl State {
+    #[cfg(test)]
     pub fn new(config: Config, base: String) -> Self {
+        let mut bases = BTreeMap::new();
+        bases.insert(config.primary_resource_name(), base);
+        let specialists = ["specialist-a", "specialist-b"]
+            .into_iter()
+            .map(|s| (s.into(), Specialist::default()))
+            .collect();
+        Self::with_resources(config, bases, specialists)
+    }
+
+    pub fn with_resources(
+        config: Config,
+        bases: BTreeMap<String, String>,
+        specialists: BTreeMap<String, Specialist>,
+    ) -> Self {
+        let primary = config.primary_resource_name();
+        let base = bases
+            .get(&primary)
+            .or_else(|| bases.values().next())
+            .cloned()
+            .unwrap_or_default();
+        let (resource_bases, resource_heads) = if config.resources.is_empty() && bases.len() <= 1 {
+            (BTreeMap::new(), BTreeMap::new())
+        } else {
+            (bases.clone(), bases)
+        };
         Self {
             version: 1,
             config,
             integration_head: base.clone(),
             base,
+            resource_bases,
+            resource_heads,
             coordinator_thread: None,
-            specialists: ["specialist-a", "specialist-b"]
-                .into_iter()
-                .map(|s| (s.into(), Specialist::default()))
-                .collect(),
+            specialists,
             assignments: BTreeMap::new(),
             inflight: BTreeMap::new(),
             decisions: Vec::new(),
@@ -216,6 +352,30 @@ impl State {
             publishing: false,
         }
     }
+
+    pub fn resource_base(&self, resource: &str) -> String {
+        self.resource_bases
+            .get(resource)
+            .cloned()
+            .unwrap_or_else(|| self.base.clone())
+    }
+
+    pub fn resource_head(&self, resource: &str) -> String {
+        self.resource_heads
+            .get(resource)
+            .cloned()
+            .unwrap_or_else(|| self.integration_head.clone())
+    }
+
+    pub fn set_resource_head(&mut self, resource: &str, head: String) {
+        if resource == self.config.primary_resource_name() {
+            self.integration_head = head.clone();
+        }
+        if !self.resource_heads.is_empty() || !self.config.resources.is_empty() {
+            self.resource_heads.insert(resource.into(), head);
+        }
+    }
+
     pub fn decision(&mut self, value: String) {
         // Bounded summaries; the full inbox/evidence remains in durable storage.
         if self.decisions.len() == 64 {
@@ -298,10 +458,71 @@ impl State {
         ensure!(!self.completed, "goal already completed");
         match control {
             Control::Inspect | Control::Complete { .. } => anyhow::bail!("runtime-only action"),
+            Control::CreateSpecialist {
+                name,
+                role,
+                resources,
+                allowed_paths,
+            } => {
+                ensure!(
+                    actor == COORDINATOR,
+                    "only orchestrator may create or configure specialists"
+                );
+                crate::conversation::validate_name(&name)?;
+                ensure!(name != COORDINATOR, "orchestrator cannot be a specialist");
+                text(&role)?;
+                ensure!(role.len() <= 4096, "specialist role description too large");
+                ensure!(
+                    self.specialists.contains_key(&name) || self.specialists.len() < 16,
+                    "specialist registry full; reuse existing roles"
+                );
+                ensure!(
+                    !self.inflight.contains_key(&name) && self.current(&name).is_none(),
+                    "cannot reconfigure an active specialist"
+                );
+                let granted_resources = if resources.is_empty() {
+                    let default_res = self.config.resource(None)?;
+                    vec![default_res.name]
+                } else {
+                    ensure!(resources.len() <= 16, "too many resources for specialist");
+                    let mut list = Vec::new();
+                    for r in resources {
+                        let rc = self.config.resource(Some(&r))?;
+                        if !list.contains(&rc.name) {
+                            list.push(rc.name);
+                        }
+                    }
+                    list
+                };
+                ensure!(
+                    allowed_paths.len() <= 32,
+                    "too many allowed paths for specialist"
+                );
+                for path in &allowed_paths {
+                    validate_path(path)?;
+                    ensure!(
+                        granted_resources.iter().any(|r| {
+                            self.config
+                                .resource(Some(r))
+                                .is_ok_and(|rc| rc.allows_path(path))
+                        }),
+                        "path '{}' outside granted resource scope",
+                        path
+                    );
+                }
+                let entry = self.specialists.entry(name.clone()).or_default();
+                entry.role = Some(role);
+                entry.resources = granted_resources.clone();
+                entry.allowed_paths = allowed_paths;
+                self.decision(format!(
+                    "Configured specialist {name} with resources {granted_resources:?}"
+                ));
+            }
             Control::Assign {
                 id,
                 owner,
                 description,
+                resource,
                 paths,
                 dependencies,
                 deadline_secs,
@@ -327,19 +548,49 @@ impl State {
                     !paths.is_empty() && paths.len() <= 32,
                     "explicit path ownership required"
                 );
+                let target_res = if let Some(r) = resource.as_deref() {
+                    self.config.resource(Some(r))?
+                } else if let Some(s) = self
+                    .specialists
+                    .get(&owner)
+                    .filter(|s| s.resources.len() == 1)
+                {
+                    self.config.resource(Some(&s.resources[0]))?
+                } else {
+                    self.config.resource(None)?
+                };
+                if let Some(s) = self.specialists.get(&owner) {
+                    if !s.resources.is_empty() {
+                        ensure!(
+                            s.resources.contains(&target_res.name),
+                            "specialist '{}' does not have access to resource '{}'; grant it with create_specialist",
+                            owner,
+                            target_res.name
+                        );
+                    }
+                    if !s.allowed_paths.is_empty() {
+                        for path in &paths {
+                            ensure!(
+                                s.allowed_paths
+                                    .iter()
+                                    .any(|allowed| contains(allowed, path)),
+                                "path '{}' outside specialist '{}' granted allowed_paths",
+                                path,
+                                owner
+                            );
+                        }
+                    }
+                }
                 for path in &paths {
                     validate_path(path)?;
                     ensure!(
-                        self.config
-                            .authorized_paths
-                            .iter()
-                            .any(|p| contains(p, path)),
+                        target_res.allows_path(path),
                         "path outside authorized scope"
                     );
                     for a in self
                         .assignments
                         .values()
-                        .filter(|a| a.state != Status::Cancelled)
+                        .filter(|a| a.state != Status::Cancelled && a.resource == target_res.name)
                     {
                         ensure!(
                             !a.paths.iter().any(|p| overlaps(p, path)),
@@ -370,7 +621,12 @@ impl State {
                     self.specialists.contains_key(&owner) || self.specialists.len() < 16,
                     "specialist registry full; reuse existing roles"
                 );
-                self.specialists.entry(owner.clone()).or_default();
+                let specialist = self.specialists.entry(owner.clone()).or_default();
+                if !self.config.resources.is_empty()
+                    && !specialist.resources.contains(&target_res.name)
+                {
+                    specialist.resources.push(target_res.name.clone());
+                }
                 self.assignments.insert(
                     id.clone(),
                     Assignment {
@@ -378,6 +634,7 @@ impl State {
                         owner,
                         revision: 1,
                         description,
+                        resource: target_res.name,
                         paths,
                         dependencies,
                         deadline: now.saturating_add(deadline_secs),
@@ -619,15 +876,27 @@ impl State {
 pub struct Store {
     db: Database,
     pub path: PathBuf,
+    pub mirror_paths: Vec<PathBuf>,
 }
 impl Store {
+    #[cfg(test)]
     pub fn open(path: PathBuf) -> Result<Self> {
+        Self::open_with_mirrors(path, Vec::new())
+    }
+    pub fn open_with_mirrors(path: PathBuf, mirror_paths: Vec<PathBuf>) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let db = Database::create(&path)
             .context("open orchestrator state (another orchestrator may own this room)")?;
         let tx = db.begin_write()?;
         tx.open_table(TABLE)?;
         tx.commit()?;
-        Ok(Self { db, path })
+        Ok(Self {
+            db,
+            path,
+            mirror_paths,
+        })
     }
     pub fn load(&self) -> Result<Option<State>> {
         let tx = self.db.begin_read()?;
@@ -647,6 +916,17 @@ impl Store {
         std::io::Write::write_all(&mut file, value.as_bytes())?;
         file.as_file().sync_all()?;
         file.persist(self.path.with_extension("json"))?;
+        for mirror in &self.mirror_paths {
+            if let Some(parent) = mirror.parent() {
+                let _ = std::fs::create_dir_all(parent);
+                if let Ok(mut m) = tempfile::NamedTempFile::new_in(parent)
+                    && std::io::Write::write_all(&mut m, value.as_bytes()).is_ok()
+                {
+                    let _ = m.as_file().sync_all();
+                    let _ = m.persist(mirror);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -656,6 +936,7 @@ pub fn test_config(repo: PathBuf) -> Config {
     Config {
         room: "test".into(),
         repo,
+        resources: BTreeMap::new(),
         model: None,
         goal: "Producer/consumer".into(),
         authorized_paths: vec!["src".into()],
@@ -688,6 +969,7 @@ mod tests {
                 id: id.into(),
                 owner: owner.into(),
                 description: id.into(),
+                resource: None,
                 paths: vec![path.into()],
                 dependencies: dependencies.iter().map(|d| (*d).into()).collect(),
                 deadline_secs: 60,
@@ -927,5 +1209,126 @@ mod tests {
         .unwrap();
         assert!(s.decisions.is_empty());
         assert_eq!(s.assignments["producer"].last_heartbeat, 10);
+    }
+    #[test]
+    fn autonomous_specialist_creation_and_resource_access_enforcement() {
+        let mut cfg = test_config(PathBuf::from("/backend"));
+        cfg.resources.insert(
+            "backend".into(),
+            ResourceConfig {
+                name: "backend".into(),
+                repo: PathBuf::from("/backend"),
+                description: Some("Backend API".into()),
+                authorized_paths: vec!["src".into()],
+                checks: vec!["true".into()],
+            },
+        );
+        cfg.resources.insert(
+            "frontend".into(),
+            ResourceConfig {
+                name: "frontend".into(),
+                repo: PathBuf::from("/frontend"),
+                description: Some("Frontend UI".into()),
+                authorized_paths: vec!["src".into()],
+                checks: vec!["true".into()],
+            },
+        );
+        let mut bases = BTreeMap::new();
+        bases.insert("backend".into(), "base-be".into());
+        bases.insert("frontend".into(), "base-fe".into());
+        let mut s = State::with_resources(cfg, bases, BTreeMap::new());
+
+        // Coordinator creates two specialists with scoped resource access.
+        s.apply(
+            COORDINATOR,
+            Control::CreateSpecialist {
+                name: "api-specialist".into(),
+                role: "Owns backend API".into(),
+                resources: vec!["backend".into()],
+                allowed_paths: vec!["src/api".into()],
+            },
+            1,
+        )
+        .unwrap();
+        s.apply(
+            COORDINATOR,
+            Control::CreateSpecialist {
+                name: "ui-specialist".into(),
+                role: "Owns frontend UI".into(),
+                resources: vec!["frontend".into()],
+                allowed_paths: vec!["src/components".into()],
+            },
+            1,
+        )
+        .unwrap();
+
+        // Cannot assign frontend resource to api-specialist (not granted).
+        assert!(
+            s.apply(
+                COORDINATOR,
+                Control::Assign {
+                    id: "bad-resource".into(),
+                    owner: "api-specialist".into(),
+                    description: "Touch frontend".into(),
+                    resource: Some("frontend".into()),
+                    paths: vec!["src/api".into()],
+                    dependencies: vec![],
+                    deadline_secs: 60,
+                },
+                1,
+            )
+            .is_err()
+        );
+
+        // Cannot assign path outside specialist's allowed_paths.
+        assert!(
+            s.apply(
+                COORDINATOR,
+                Control::Assign {
+                    id: "bad-path".into(),
+                    owner: "api-specialist".into(),
+                    description: "Touch db".into(),
+                    resource: Some("backend".into()),
+                    paths: vec!["src/db".into()],
+                    dependencies: vec![],
+                    deadline_secs: 60,
+                },
+                1,
+            )
+            .is_err()
+        );
+
+        // Valid assignments across different resources (even if relative paths would overlap, resources differ).
+        s.apply(
+            COORDINATOR,
+            Control::Assign {
+                id: "api-task".into(),
+                owner: "api-specialist".into(),
+                description: "Implement endpoint".into(),
+                resource: None, // inferred from api-specialist's single granted resource
+                paths: vec!["src/api/users.rs".into()],
+                dependencies: vec![],
+                deadline_secs: 60,
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(s.assignments["api-task"].resource, "backend");
+
+        s.apply(
+            COORDINATOR,
+            Control::Assign {
+                id: "ui-task".into(),
+                owner: "ui-specialist".into(),
+                description: "Consume endpoint".into(),
+                resource: None, // inferred from ui-specialist's single granted resource
+                paths: vec!["src/components/users.tsx".into()],
+                dependencies: vec!["api-task".into()],
+                deadline_secs: 60,
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(s.assignments["ui-task"].resource, "frontend");
     }
 }

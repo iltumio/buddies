@@ -1,0 +1,17 @@
+[Unit]
+Description=Buddies autonomous machine orchestrator daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/buddies orchestrator --config %h/.config/buddies/orchestrator.toml
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

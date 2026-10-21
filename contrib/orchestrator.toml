@@ -1,0 +1,45 @@
+# Example machine-level configuration for `buddies orchestrator --config`.
+#
+# When `goal` is omitted, the orchestrator starts in autonomous service mode:
+# it joins `room` as `orchestrator`, registers on the local durable queue
+# (`/worker`), listens for `delegate_task` requests (both local and remote P2P),
+# and accepts addressed `request` messages to `orchestrator` in the room.
+#
+# For every delegated task, the coordinator autonomously creates specialist
+# roles (`create_specialist`), grants them scoped access to the machine's
+# configured `[[resources]]`, schedules their isolated worktrees, verifies
+# their patches and acceptance checks, and publishes the verified changes.
+
+room = "Machine-Orchestrator"
+url = "http://127.0.0.1:8080"
+max_active_specialists = 4
+max_model_calls = 128
+max_output_bytes = 2097152
+max_elapsed_secs = 3600
+max_depth = 8
+check_timeout_secs = 120
+debounce_ms = 1000
+
+# Catalog of machine resources (repositories/directories) available for
+# specialists created by the orchestrator.
+[[resources]]
+name = "backend"
+repo = "/srv/repos/backend"
+description = "Rust backend API and storage engine"
+allow_paths = ["src", "tests", "Cargo.toml"]
+checks = ["cargo test --locked"]
+
+[[resources]]
+name = "frontend"
+repo = "/srv/repos/frontend"
+description = "Web UI application"
+allow_paths = ["src", "package.json"]
+checks = ["npm test"]
+
+# Optional pre-configured specialist roles. The orchestrator can also create
+# or reconfigure specialist roles dynamically at runtime via `create_specialist`.
+# [[specialists]]
+# name = "api-specialist"
+# role = "Backend API and protocol specialist"
+# resources = ["backend"]
+# allowed_paths = ["src"]
