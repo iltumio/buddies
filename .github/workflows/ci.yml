@@ -31,6 +31,9 @@ jobs:
       - name: Test
         run: cargo test --locked --all-targets
 
+      - name: Install tmux for worker group smoke test
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
       - name: MCP transport and shutdown smoke test
         run: |
           cargo build --locked
@@ -39,7 +42,12 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/smoke_room_tickets.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/smoke_worker.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/smoke_collaboration.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/smoke_linear_worker.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/smoke_worker_config.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/smoke_orchestrator.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/smoke_worker_specialists.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/smoke_multi_orchestrator_specialists.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/smoke_specialist_controls.py
 
   msrv:
     runs-on: ubuntu-latest

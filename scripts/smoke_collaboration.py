@@ -16,8 +16,8 @@ from smoke_room_tickets import Server
 
 
 class Channel:
-    def __init__(self, binary, url, name='claude'):
-        self.proc = subprocess.Popen([str(binary), 'channel', '--url', url, '--room', 'shared', '--name', name],
+    def __init__(self, binary, url, name='claude', extra_args=()):
+        self.proc = subprocess.Popen([str(binary), 'channel', '--url', url, '--room', 'shared', '--name', name, *extra_args],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.received = queue.Queue()
         self.events = deque()
@@ -32,6 +32,7 @@ class Channel:
                         'clientInfo': {'name': 'claude-code-fixture', 'version': '1'}})
         assert info['capabilities']['experimental']['claude/channel'] == {}, info
         assert info['protocolVersion'] == '2025-11-25', info
+        self.info = info
         self.send({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
 
     def send(self, message):

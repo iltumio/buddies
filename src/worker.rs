@@ -15,13 +15,45 @@ use uuid::Uuid;
 
 #[derive(Args)]
 pub struct Options {
-    #[arg(long, default_value="codex", value_parser=["codex"])]
+    #[arg(long, default_value="codex", value_parser=["codex", "claude"])]
     pub agent: String,
+    /// Claude Code executable (used with --agent claude).
+    #[arg(long, default_value = "claude")]
+    pub claude_bin: PathBuf,
+    /// Live Linear team key; repeat for multiple teams. Requires --agent claude.
+    #[arg(long)]
+    pub linear_team: Vec<String>,
+    /// Reuse Claude's Linear MCP tools or authenticated linear CLI.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "mcp", "cli"])]
+    pub linear_access: String,
     #[arg(long)]
     pub room: String,
-    /// Repository in which delegated tasks may run.
+    /// Stable specialist participant name in the room (e.g. specialist-a, worker-backend, worker-linear).
     #[arg(long)]
-    pub cwd: PathBuf,
+    pub name: Option<String>,
+    /// Repository in which delegated tasks may run. Optional when `--resource` is given.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+    /// Resource or connector exposed by this specialist worker (`[<kind>:]<id>=<path>` or `<path>`). Repeat as needed.
+    #[arg(long = "resource")]
+    pub resources: Vec<String>,
+    /// Authorized scopes within exposed resources (`<scope>` or `<resource_id>:<scope>`). Repeat as needed.
+    #[arg(long = "allow-scope", alias = "allow-path")]
+    pub authorized_scopes: Vec<String>,
+    /// Resource-level acceptance command executed before final publication. Repeat as needed.
+    #[arg(long = "check")]
+    pub checks: Vec<String>,
+    #[arg(long, default_value_t = 120)]
+    pub check_timeout_secs: u64,
+    /// Optional goal context for specialist instructions.
+    #[arg(long)]
+    pub goal: Option<String>,
+    /// Debounce addressed messages before starting a specialist turn.
+    #[arg(long, default_value_t = 250)]
+    pub debounce_ms: u64,
+    /// Resume saved specialist worker thread and state.
+    #[arg(long)]
+    pub resume: bool,
     #[arg(long, env = "BUDDIES_URL", default_value = "http://127.0.0.1:8080")]
     pub url: String,
     /// Private worker identity and execution journal (must not be the server data directory).
@@ -34,9 +66,22 @@ pub struct Options {
     pub model: Option<String>,
     #[arg(long, default_value="workspace-write", value_parser=["read-only", "workspace-write"])]
     pub sandbox: String,
-    /// Exit after one task has been acknowledged by the server.
+    /// Exit after one task/goal has been acknowledged or published.
     #[arg(long)]
     pub once: bool,
+    /// Designate this worker as the room orchestrator (coordinating specialist workers in the room).
+    #[arg(long)]
+    pub orchestrator: bool,
+    #[arg(long, default_value_t = 4)]
+    pub max_active_specialists: usize,
+    #[arg(long, default_value_t = 64)]
+    pub max_model_calls: u64,
+    #[arg(long, default_value_t = 1800)]
+    pub max_elapsed_secs: u64,
+    #[arg(long, default_value_t = 1048576)]
+    pub max_output_bytes: u64,
+    #[arg(long, default_value_t = 8)]
+    pub max_depth: usize,
 }
 #[derive(Serialize, Deserialize)]
 struct Journal {
@@ -134,11 +179,54 @@ fn failure(message: impl Into<String>) -> Outcome {
 }
 
 pub async fn run(mut options: Options) -> Result<()> {
-    options.cwd = options
+    if options.agent == "claude" {
+        return crate::claude_worker::run(options).await;
+    }
+    ensure!(
+        options.linear_team.is_empty() && options.linear_access == "auto",
+        "live Linear options require --agent claude"
+    );
+    if options.orchestrator {
+        let name = options.name.unwrap_or_else(|| "orchestrator".into());
+        return crate::orchestrator::run_goal(crate::orchestrator::GoalOptions {
+            room: options.room,
+            name,
+            repo: options.cwd,
+            resources: options.resources,
+            specialists: Vec::new(),
+            state_dir: options.data_dir,
+            goal: options.goal.unwrap_or_else(|| {
+                "Coordinate room specialists to fulfill the room's requests".into()
+            }),
+            authorized_paths: options.authorized_scopes,
+            checks: options.checks,
+            check_timeout_secs: options.check_timeout_secs,
+            max_active_specialists: options.max_active_specialists,
+            max_model_calls: options.max_model_calls,
+            max_elapsed_secs: options.max_elapsed_secs,
+            max_output_bytes: options.max_output_bytes,
+            max_depth: options.max_depth,
+            debounce_ms: options.debounce_ms,
+            resume: options.resume,
+            url: options.url,
+            codex_bin: options.codex_bin,
+            model: options.model,
+        })
+        .await;
+    }
+    if options.name.is_some() || !options.resources.is_empty() {
+        return crate::orchestrator::specialist_worker::run(options).await;
+    }
+    let cwd = options
         .cwd
+        .take()
+        .context(
+            "worker --cwd is required unless running in specialist mode (--name / --resource)",
+        )?
         .canonicalize()
         .context("worker cwd does not exist")?;
-    ensure!(options.cwd.is_dir(), "worker cwd must be a directory");
+    ensure!(cwd.is_dir(), "worker cwd must be a directory");
+    options.cwd = Some(cwd.clone());
     let base = options.url.trim_end_matches('/').trim_end_matches("/mcp");
     let mut url = reqwest::Url::parse(base)?;
     ensure!(
@@ -153,7 +241,7 @@ pub async fn run(mut options: Options) -> Result<()> {
         url,
         options.room,
         options.agent,
-        options.cwd.display()
+        cwd.display()
     );
     let data_dir = options.data_dir.clone().unwrap_or_else(|| {
         crate::default_data_dir()
@@ -185,7 +273,7 @@ pub async fn run(mut options: Options) -> Result<()> {
         "buddies worker {} room={} cwd={} journal={}",
         worker_id(&journal.secret),
         options.room,
-        options.cwd.display(),
+        cwd.display(),
         data_dir.display()
     );
     let result = work_loop(&options, &api, &file, &mut journal, &stop).await;
@@ -215,7 +303,7 @@ async fn work_loop(
                 tokio::select! { _ = stop.cancelled() => break, result = register => result };
             if let Err(e) = registered {
                 eprintln!("worker reconnecting: {e}");
-                tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(2)) => {} }
+                tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(2)) => {} };
                 continue;
             }
             register_at = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -242,7 +330,7 @@ async fn work_loop(
                 }
                 Err(e) => {
                     eprintln!("result retained for retry: {e}");
-                    tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(2)) => {} }
+                    tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(2)) => {} };
                     continue;
                 }
             }
@@ -279,11 +367,11 @@ async fn work_loop(
                 }
             }
             Ok(_) => {
-                tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(Duration::from_millis(500)) => {} }
+                tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(Duration::from_millis(500)) => {} };
             }
             Err(e) => {
                 eprintln!("worker polling failed: {e}");
-                tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(2)) => {} }
+                tokio::select! { _ = stop.cancelled() => break, _ = tokio::time::sleep(Duration::from_secs(2)) => {} };
             }
         }
     }
@@ -296,13 +384,14 @@ async fn execute(
     api: &Api,
     stop: &tokio_util::sync::CancellationToken,
 ) -> Result<Outcome> {
+    let cwd = options.cwd.as_ref().context("missing worker cwd")?;
     let mut command = tokio::process::Command::new(&options.codex_bin);
     command
         .arg("app-server")
         .arg("--stdio")
         .arg("-c")
         .arg("mcp_servers.buddies.enabled=false")
-        .current_dir(&options.cwd)
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -323,7 +412,7 @@ async fn execute(
         rpc.request("initialize", json!({"clientInfo":{"name":"buddies-worker","version":env!("CARGO_PKG_VERSION")},"capabilities":{}})).await?;
         rpc.send(json!({"method":"initialized","params":{}}))
             .await?;
-        let thread = rpc.request("thread/start", json!({"cwd":options.cwd,"approvalPolicy":"never","sandbox":options.sandbox,"model":options.model,
+        let thread = rpc.request("thread/start", json!({"cwd":cwd,"approvalPolicy":"never","sandbox":options.sandbox,"model":options.model,
             "developerInstructions":"Execute only the delegated task in the configured repository. Do not poll or delegate buddies tasks; the worker handles delivery and submission. If an action needs unavailable approval, report that limitation. Return a concise final result.",
             "ephemeral":true})).await?;
         let thread_id = thread["thread"]["id"]
@@ -481,15 +570,7 @@ impl Rpc {
                 );
                 return Ok(message["result"].clone());
             }
-            if message.get("id").is_some() && message.get("method").is_some() {
-                self.send(json!({"id":message["id"],"error":{"code":-32601,"message":"Interactive requests are unavailable in unattended workers"}})).await?;
-            } else if message.get("method").is_some() {
-                ensure!(
-                    self.pending.len() < 128,
-                    "too many Codex startup notifications"
-                );
-                self.pending.push_back(message);
-            }
+            self.pending.push_back(message);
         }
     }
 }

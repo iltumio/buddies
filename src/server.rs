@@ -199,6 +199,12 @@ pub struct RegisterParticipantRequest {
     pub delivery: String,
     #[serde(default)]
     pub accepts_tasks: bool,
+    #[serde(default)]
+    pub orchestrator: bool,
+    #[serde(default)]
+    pub specialist: bool,
+    #[serde(default)]
+    pub resources: Vec<crate::orchestrator::connector::ResourceDescriptor>,
 }
 fn poll_delivery() -> String {
     "poll".into()
@@ -768,6 +774,9 @@ impl BuddiesServer {
             name: req.name.clone(),
             delivery: req.delivery,
             accepts_tasks: req.accepts_tasks,
+            orchestrator: req.orchestrator,
+            specialist: req.specialist,
+            resources: req.resources,
         };
         // Serialize registration with membership changes to prevent competing aliases.
         let _membership = self.node.local_membership.lock().await;

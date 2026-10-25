@@ -23,10 +23,25 @@ directories, without globs, `.` or parent components. Repeat `--allow-path` and
 `--check` for additional paths and shared checks.
 
 The stable participants are `orchestrator`, `specialist-a`, and `specialist-b`.
-The model may create additional named specialists only for independent
-responsibilities, with at most 16 registered roles. The service rejects live
+In machine configuration mode, the model may create additional named specialists
+for independent responsibilities, with at most 16 registered roles. The service rejects live
 duplicate names. All participants use addressed inboxes on the same HTTP service;
 this command does not replicate assignments across P2P nodes.
+
+## Execution modes
+
+Version 0.3.1 includes both orchestration modes:
+
+- `--config FILE` (with an optional goal override) uses the machine resource catalog,
+  dynamic specialist creation, and the existing machine-service state format.
+  Without a goal, it listens for delegated tasks; `--once` exits after one task.
+- `--goal TEXT` without `--config` supports named coordinators, local specialist
+  boundaries and persistent remote workers through `--name`, `--resource`, and
+  `--specialist`, including non-Git connectors.
+
+The connector CLI flags cannot be combined with machine configuration mode.
+Each mode retains its own recovery state; do not reuse one mode's state directory
+for the other mode.
 
 ## Machine configuration and autonomous service mode
 
@@ -99,8 +114,9 @@ when its contract changes.
 
 The states are `queued`, `running`, `waiting_for_input`, `completed`, `failed`
 and `cancelled`. A report does not complete an assignment: the runtime waits for
-the turn to finish, checks all changed paths, runs its reported acceptance checks
-and integrates the patch. Only verified completion releases dependencies.
+the turn to finish, checks all changed paths, and runs reported checks only when
+they exactly match user-configured `--check` commands, then integrates the patch.
+All configured checks run against the combined result before publication. Only verified completion releases dependencies.
 `handled` inbox receipts still mean that a message was processed.
 
 Specialists must accept each revision before reporting its result. Results from
@@ -151,9 +167,14 @@ before publication leave the checkout unchanged and can be addressed by revising
 the relevant assignments.
 
 These worktrees and scope checks guard integration and coordination; they are not
-a security boundary for hostile code. Reported acceptance commands execute with
-the local user's permissions in an isolated worktree. Use a repository and goals
-you trust, as for the existing managed-agent/worker runtimes.
+a security boundary for hostile code. Only commands configured by the user with
+`--check` execute on the host; commands in model reports are recorded as evidence
+and cannot authorize additional host commands. During assignment verification,
+only reported commands that exactly match configured checks run; the full set is
+mandatory at publication. Configured checks and the scripts they
+invoke run with the local user's permissions, so use repositories, checks and
+goals you trust. A report's `verified` result describes path validation and the
+configured checks, not independent execution of every check claimed by the model.
 
 ## Budgets
 
@@ -193,3 +214,42 @@ This validates the runtime protocol. It does not measure a real model's cost or
 compare completion rates with direct peer coordination. That comparison remains
 an opt-in acceptance experiment using the same models and task described in
 [the design](orchestrator-design.md).
+
+
+## Resource specialists and publication
+
+Use `worker --name backend --resource git:backend=/path/to/repo --allow-scope src`
+for an addressed specialist. Repeat `--resource` to expose more resources; each
+assignment targets one resource. The worker honors `--sandbox read-only` on both
+thread creation and assignment turns. Without an assignment, turns are read-only.
+The assignment boundary constrains which changes may be integrated, while the
+Codex sandbox constrains writes to the assignment workspace.
+
+An initial dispatch must come from a registered orchestrator and name the worker
+as owner. That coordinator owns the worker's session, including after `--resume`;
+other orchestrators cannot dispatch, cancel or publish through it. Dispatches
+while busy are rejected. A revision requires a safe checkpoint and an idle turn.
+Room roles are a coordination contract within the trusted local service, not an
+authentication mechanism for untrusted room members.
+
+Resource locks are held throughout execution. Reopening an existing resource
+without `--resume` fails without clearing integration or assignment workspaces.
+Each Git resource tracks its own head; a local `--repo` head is never substituted
+for another resource's head. Stale state-adapter assignments fail verification
+and require a new revision instead of overwriting newer integrated changes.
+
+The `fs`, `linear` and `gdrive` kinds currently stage **local directory snapshots**.
+The latter two labels do not provide API access or synchronize with Linear or
+Google Drive. They are useful for exported state or a separately managed sync.
+For live Linear operations using existing Claude tools, use
+[`worker --agent claude --linear-team ENG`](guide/workers.md#live-linear-with-claude-code).
+That channel worker uses immediate remote operations, not this staged protocol.
+
+Publication uses preparation followed by sequential publication. It is **not a
+distributed atomic transaction** across resources or workers. A state adapter
+preflights all conflicts before writing, binds publication to the prepared
+snapshot, and attempts rollback on write errors. A retained `publication.json`
+or worker/orchestrator publication flag means the outcome must be inspected;
+resume and retries refuse to replay it automatically. Process crashes, failed
+rollback, concurrent external writers, or a later resource failure can require
+manual recovery. No other resource is silently rolled back after publication.

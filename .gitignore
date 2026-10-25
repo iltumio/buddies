@@ -2,3 +2,7 @@
 /node_modules/
 /docs/.vitepress/cache/
 /docs/.vitepress/dist/
+
+# Python smoke-test bytecode
+__pycache__/
+*.py[cod]

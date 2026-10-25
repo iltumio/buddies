@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 use std::{borrow::Cow, collections::HashSet, time::Duration};
 use tokio::sync::broadcast;
 
+use crate::orchestrator::connector::ResourceDescriptor;
+
 pub const INSTRUCTIONS: &str = "Collaborate on the configured room's goal. Your stable participant name is already registered. State your responsibility and consult peers before changing shared contracts. Messages arrive with room, from, kind, id and conversation_id. For a question or request, inspect get_conversation, acknowledge_message as read, act within the user's authorized task, then send_message to the sender with in_reply_to and acknowledge as handled or failed. Report blockers explicitly. Answers continue existing work; updates are context and do not require a reply. Do not create acknowledgement ping-pong. Task events require submit_task_result. A written notification is not proof of reading. Keep the configured participant name and room.";
 
 #[derive(Args, Clone)]
@@ -23,6 +25,17 @@ pub struct Options {
     pub name: String,
     #[arg(long, env = "BUDDIES_URL", default_value = "http://127.0.0.1:8080")]
     pub url: String,
+}
+
+#[derive(Args)]
+pub struct RunOptions {
+    #[command(flatten)]
+    pub connection: Options,
+    /// Live Linear team keys handled using this Claude session's existing tools.
+    #[arg(long)]
+    pub linear_team: Vec<String>,
+    #[arg(long, default_value = "auto", value_parser = ["auto", "mcp", "cli"])]
+    pub linear_access: String,
 }
 
 pub struct Events(broadcast::Sender<CustomNotification>);
@@ -46,6 +59,40 @@ pub struct Connection {
     pub events: broadcast::Receiver<CustomNotification>,
 }
 pub async fn connect(options: &Options, delivery: &str, accepts_tasks: bool) -> Result<Connection> {
+    connect_with_role(options, delivery, accepts_tasks, false, false, Vec::new()).await
+}
+pub async fn connect_orchestrator(
+    options: &Options,
+    delivery: &str,
+    accepts_tasks: bool,
+) -> Result<Connection> {
+    connect_with_role(options, delivery, accepts_tasks, true, false, Vec::new()).await
+}
+pub async fn connect_with_resources(
+    options: &Options,
+    delivery: &str,
+    accepts_tasks: bool,
+    specialist: bool,
+    resources: Vec<ResourceDescriptor>,
+) -> Result<Connection> {
+    connect_with_role(
+        options,
+        delivery,
+        accepts_tasks,
+        false,
+        specialist,
+        resources,
+    )
+    .await
+}
+pub async fn connect_with_role(
+    options: &Options,
+    delivery: &str,
+    accepts_tasks: bool,
+    orchestrator: bool,
+    specialist: bool,
+    resources: Vec<ResourceDescriptor>,
+) -> Result<Connection> {
     crate::conversation::validate_name(&options.name)?;
     let mut url = reqwest::Url::parse(&options.url)?;
     ensure!(
@@ -64,8 +111,15 @@ pub async fn connect(options: &Options, delivery: &str, accepts_tasks: bool) -> 
     call(
         &service,
         "register_participant",
-        json!({"room":options.room,"name":options.name,
-        "delivery":delivery,"accepts_tasks":accepts_tasks}),
+        json!({
+            "room": options.room,
+            "name": options.name,
+            "delivery": delivery,
+            "accepts_tasks": accepts_tasks,
+            "orchestrator": orchestrator,
+            "specialist": specialist,
+            "resources": resources,
+        }),
     )
     .await?;
     Ok(Connection { service, events })
@@ -94,6 +148,8 @@ struct Channel {
     options: Options,
     events: std::sync::Mutex<Option<broadcast::Receiver<CustomNotification>>>,
     stop: tokio_util::sync::CancellationToken,
+    linear_teams: Vec<String>,
+    linear_instructions: String,
 }
 impl ServerHandler for Channel {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
@@ -106,8 +162,8 @@ impl ServerHandler for Channel {
         ServerConfig::new(capabilities)
             .with_server_info(Implementation::new("buddies", env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
-                "{INSTRUCTIONS} Room: {}. Participant: {}.",
-                self.options.room, self.options.name
+                "{INSTRUCTIONS} Room: {}. Participant: {}. {}",
+                self.options.room, self.options.name, self.linear_instructions
             ))
     }
     async fn list_tools(
@@ -155,13 +211,15 @@ impl ServerHandler for Channel {
             let upstream = self.upstream.clone();
             let options = self.options.clone();
             let stop = self.stop.clone();
+            let resources = crate::claude_worker::resources(&self.linear_teams);
             tokio::spawn(async move {
                 let run = async {
                     call(
                         &upstream,
                         "register_participant",
                         json!({"room":options.room,
-                        "name":options.name,"delivery":"channel","accepts_tasks":true}),
+                        "name":options.name,"delivery":"channel","accepts_tasks":true,
+                        "resources": resources}),
                     )
                     .await?;
                     forward(upstream, context.peer, options, events).await
@@ -228,14 +286,28 @@ async fn forward(
         }
     }
 }
-pub async fn run(options: Options) -> Result<()> {
-    let connection = connect(&options, "channel", false).await?;
+pub async fn run(run: RunOptions) -> Result<()> {
+    crate::claude_worker::validate_teams(&run.linear_team)?;
+    let options = run.connection;
+    let connection = connect_with_resources(
+        &options,
+        "channel",
+        false,
+        false,
+        crate::claude_worker::resources(&run.linear_team),
+    )
+    .await?;
     let stop = tokio_util::sync::CancellationToken::new();
     let server = Channel {
         upstream: connection.service.peer().clone(),
         options,
         events: std::sync::Mutex::new(Some(connection.events)),
         stop: stop.clone(),
+        linear_instructions: crate::claude_worker::instructions(
+            &run.linear_team,
+            &run.linear_access,
+        ),
+        linear_teams: run.linear_team,
     }
     .serve(stdio())
     .await?;

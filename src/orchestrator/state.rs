@@ -1,52 +1,33 @@
 //! The deterministic assignment graph. Model output is a proposal, never authority
 //! to bypass revision, ownership, dependency or budget checks.
+use super::connector::{ResourceClaim, ResourceDescriptor};
 use anyhow::{Context, Result, ensure};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
 };
 
 pub const COORDINATOR: &str = "orchestrator";
 const TABLE: TableDefinition<&str, &str> = TableDefinition::new("orchestrator_state");
 
-fn default_resource_name() -> String {
-    "default".into()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ResourceConfig {
-    pub name: String,
-    pub repo: PathBuf,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub authorized_paths: Vec<String>,
-    #[serde(default)]
-    pub checks: Vec<String>,
-}
-
-impl ResourceConfig {
-    pub fn allows_path(&self, path: &str) -> bool {
-        self.authorized_paths.is_empty()
-            || self
-                .authorized_paths
-                .iter()
-                .any(|p| p == "*" || p == "." || contains(p, path))
-    }
+fn default_coordinator() -> String {
+    COORDINATOR.into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub room: String,
+    #[serde(default = "default_coordinator")]
+    pub coordinator: String,
     pub repo: PathBuf,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub resources: BTreeMap<String, ResourceConfig>,
     pub model: Option<String>,
     pub goal: String,
     pub authorized_paths: Vec<String>,
+    #[serde(default)]
+    pub configured_specialists: BTreeMap<String, Vec<ResourceDescriptor>>,
     pub checks: Vec<String>,
     pub max_active: usize,
     pub max_calls: u64,
@@ -54,66 +35,6 @@ pub struct Config {
     pub max_elapsed_secs: u64,
     pub max_depth: usize,
     pub check_timeout_secs: u64,
-}
-
-impl Config {
-    pub fn primary_resource_name(&self) -> String {
-        if self.resources.is_empty() || self.resources.contains_key("default") {
-            "default".into()
-        } else {
-            self.resources
-                .keys()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| "default".into())
-        }
-    }
-
-    pub fn all_resources(&self) -> BTreeMap<String, ResourceConfig> {
-        if self.resources.is_empty() {
-            let mut map = BTreeMap::new();
-            map.insert(
-                "default".into(),
-                ResourceConfig {
-                    name: "default".into(),
-                    repo: self.repo.clone(),
-                    description: None,
-                    authorized_paths: self.authorized_paths.clone(),
-                    checks: self.checks.clone(),
-                },
-            );
-            map
-        } else {
-            self.resources.clone()
-        }
-    }
-
-    pub fn resource(&self, name: Option<&str>) -> Result<ResourceConfig> {
-        let all = self.all_resources();
-        match name {
-            Some(requested) => {
-                if let Some(res) = all.get(requested) {
-                    return Ok(res.clone());
-                }
-                if requested == "default" && all.len() == 1 {
-                    return Ok(all.into_values().next().unwrap());
-                }
-                anyhow::bail!("unknown machine resource '{requested}'")
-            }
-            None => {
-                if all.len() == 1 {
-                    return Ok(all.into_values().next().unwrap());
-                }
-                if let Some(res) = all.get("default") {
-                    return Ok(res.clone());
-                }
-                anyhow::bail!(
-                    "multiple resources configured ({:?}); specify a resource name",
-                    all.keys().collect::<Vec<_>>()
-                )
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -142,9 +63,9 @@ pub struct Assignment {
     pub owner: String,
     pub revision: u64,
     pub description: String,
-    #[serde(default = "default_resource_name")]
-    pub resource: String,
     pub paths: Vec<String>,
+    #[serde(default)]
+    pub resources: Vec<ResourceClaim>,
     pub dependencies: Vec<String>,
     pub deadline: u64,
     pub timeout_secs: u64,
@@ -161,16 +82,16 @@ pub struct Assignment {
     pub pending_result: Option<Evidence>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Specialist {
     pub thread: Option<String>,
     pub cwd: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub resources: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_paths: Vec<String>,
+    #[serde(default)]
+    pub resources: Vec<ResourceDescriptor>,
+    #[serde(default)]
+    pub online: bool,
+    #[serde(default)]
+    pub remote: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,9 +100,7 @@ pub struct State {
     pub config: Config,
     pub base: String,
     pub integration_head: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub resource_bases: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub resource_heads: BTreeMap<String, String>,
     pub coordinator_thread: Option<String>,
     pub specialists: BTreeMap<String, Specialist>,
@@ -198,25 +117,19 @@ pub struct State {
     pub publishing: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Control {
     Inspect,
-    /// Create or update a specialist role and grant it access to machine resources and paths.
-    CreateSpecialist {
-        name: String,
-        role: String,
-        #[serde(default)]
-        resources: Vec<String>,
-        #[serde(default)]
-        allowed_paths: Vec<String>,
-    },
     Assign {
         id: String,
         owner: String,
         description: String,
         #[serde(default)]
         resource: Option<String>,
+        #[serde(default)]
+        resources: Vec<ResourceClaim>,
+        #[serde(default)]
         paths: Vec<String>,
         dependencies: Vec<String>,
         deadline_secs: u64,
@@ -287,7 +200,8 @@ pub fn validate_path(path: &str) -> Result<()> {
     Ok(())
 }
 pub fn contains(parent: &str, child: &str) -> bool {
-    parent == child
+    parent == "*"
+        || parent == child
         || child
             .strip_prefix(parent)
             .is_some_and(|tail| tail.starts_with('/'))
@@ -304,40 +218,47 @@ pub fn text(value: &str) -> Result<()> {
 }
 
 impl State {
-    #[cfg(test)]
     pub fn new(config: Config, base: String) -> Self {
-        let mut bases = BTreeMap::new();
-        bases.insert(config.primary_resource_name(), base);
-        let specialists = ["specialist-a", "specialist-b"]
-            .into_iter()
-            .map(|s| (s.into(), Specialist::default()))
-            .collect();
-        Self::with_resources(config, bases, specialists)
-    }
-
-    pub fn with_resources(
-        config: Config,
-        bases: BTreeMap<String, String>,
-        specialists: BTreeMap<String, Specialist>,
-    ) -> Self {
-        let primary = config.primary_resource_name();
-        let base = bases
-            .get(&primary)
-            .or_else(|| bases.values().next())
-            .cloned()
-            .unwrap_or_default();
-        let (resource_bases, resource_heads) = if config.resources.is_empty() && bases.len() <= 1 {
-            (BTreeMap::new(), BTreeMap::new())
+        let specialists = if !config.configured_specialists.is_empty() {
+            config
+                .configured_specialists
+                .iter()
+                .map(|(name, resources)| {
+                    (
+                        name.clone(),
+                        Specialist {
+                            thread: None,
+                            cwd: None,
+                            resources: resources.clone(),
+                            online: true,
+                            remote: false,
+                        },
+                    )
+                })
+                .collect()
+        } else if config.authorized_paths.is_empty() {
+            BTreeMap::new()
         } else {
-            (bases.clone(), bases)
+            ["specialist-a", "specialist-b"]
+                .into_iter()
+                .map(|s| {
+                    (
+                        s.into(),
+                        Specialist {
+                            online: true,
+                            remote: false,
+                            ..Specialist::default()
+                        },
+                    )
+                })
+                .collect()
         };
         Self {
             version: 1,
             config,
             integration_head: base.clone(),
             base,
-            resource_bases,
-            resource_heads,
+            resource_heads: BTreeMap::new(),
             coordinator_thread: None,
             specialists,
             assignments: BTreeMap::new(),
@@ -352,36 +273,67 @@ impl State {
             publishing: false,
         }
     }
-
-    pub fn resource_base(&self, resource: &str) -> String {
-        self.resource_bases
-            .get(resource)
-            .cloned()
-            .unwrap_or_else(|| self.base.clone())
-    }
-
-    pub fn resource_head(&self, resource: &str) -> String {
-        self.resource_heads
-            .get(resource)
-            .cloned()
-            .unwrap_or_else(|| self.integration_head.clone())
-    }
-
-    pub fn set_resource_head(&mut self, resource: &str, head: String) {
-        if resource == self.config.primary_resource_name() {
-            self.integration_head = head.clone();
-        }
-        if !self.resource_heads.is_empty() || !self.config.resources.is_empty() {
-            self.resource_heads.insert(resource.into(), head);
-        }
-    }
-
     pub fn decision(&mut self, value: String) {
         // Bounded summaries; the full inbox/evidence remains in durable storage.
         if self.decisions.len() == 64 {
             self.decisions.remove(0);
         }
         self.decisions.push(value);
+    }
+    /// Synchronize the specialist registry with connected worker-specialists in the room.
+    pub fn sync_specialists(&mut self, live: &[(String, Vec<ResourceDescriptor>)]) -> bool {
+        if !self.config.configured_specialists.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let live_names: BTreeSet<&str> = live.iter().map(|(n, _)| n.as_str()).collect();
+        // If connected workers advertise resources, drop unused legacy placeholder entries.
+        if !live.is_empty() && self.config.configured_specialists.is_empty() {
+            let placeholders: Vec<String> = self
+                .specialists
+                .iter()
+                .filter(|(name, spec)| {
+                    !live_names.contains(name.as_str())
+                        && !spec.remote
+                        && spec.resources.is_empty()
+                        && spec.thread.is_none()
+                        && !self.assignments.values().any(|a| &a.owner == *name)
+                })
+                .map(|(n, _)| n.clone())
+                .collect();
+            for name in placeholders {
+                self.specialists.remove(&name);
+                changed = true;
+            }
+        }
+        for (name, spec) in &mut self.specialists {
+            if spec.remote && !live_names.contains(name.as_str()) && spec.online {
+                spec.online = false;
+                changed = true;
+            }
+        }
+        for (name, resources) in live {
+            if name == &self.config.coordinator
+                || (self.specialists.len() >= 32 && !self.specialists.contains_key(name))
+            {
+                continue;
+            }
+            if self
+                .specialists
+                .get(name)
+                .is_some_and(|s| !s.remote && !s.resources.is_empty())
+            {
+                continue;
+            }
+            let entry = self.specialists.entry(name.clone()).or_default();
+            if !entry.online || !entry.remote || &entry.resources != resources {
+                entry.online = true;
+                entry.remote = true;
+                entry.resources = resources.clone();
+                changed = true;
+            }
+        }
+        changed
     }
     pub fn budget(&self) -> Result<()> {
         ensure!(
@@ -426,8 +378,13 @@ impl State {
         self.assignments
             .values()
             .filter(|a| {
+                let owner_ready = self
+                    .specialists
+                    .get(&a.owner)
+                    .is_none_or(|s| s.resources.is_empty() || s.online);
                 a.state == Status::Queued
                     && !a.uncertain
+                    && owner_ready
                     && a.deadline > now
                     && !self.inflight.contains_key(&a.owner)
                     && self.current(&a.owner).is_none()
@@ -439,6 +396,128 @@ impl State {
             .take(self.config.max_active.saturating_sub(occupied))
             .map(|a| a.id.clone())
             .collect()
+    }
+    fn resolve_claims(
+        &self,
+        owner: &str,
+        resource: Option<String>,
+        explicit_claims: Vec<ResourceClaim>,
+        raw_paths: Vec<String>,
+    ) -> Result<(Vec<ResourceClaim>, Vec<String>)> {
+        let spec = self.specialists.get(owner);
+        let worker_resources = spec.map(|s| s.resources.as_slice()).unwrap_or(&[]);
+        let mut by_resource: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut flat_paths = Vec::new();
+
+        for claim in explicit_claims {
+            ensure!(!claim.resource.trim().is_empty(), "empty resource id");
+            ensure!(!claim.scopes.is_empty(), "resource claim requires scopes");
+            for scope in claim.scopes {
+                validate_path(&scope)?;
+                flat_paths.push(scope.clone());
+                by_resource
+                    .entry(claim.resource.clone())
+                    .or_default()
+                    .push(scope);
+            }
+        }
+
+        for raw in raw_paths {
+            let (res_id, scope) = if let Some(explicit_res) = &resource {
+                (explicit_res.clone(), raw)
+            } else if let Some(matched) = worker_resources.iter().find_map(|r| {
+                raw.strip_prefix(&format!("{}:", r.id))
+                    .map(|rest| (r.id.clone(), rest.to_owned()))
+            }) {
+                matched
+            } else if let Some((prefix, rest)) = raw.split_once(':')
+                && let Some((kind, name)) = prefix.split_once('/')
+                && !kind.is_empty()
+                && !name.is_empty()
+            {
+                (format!("{kind}:{name}"), rest.to_owned())
+            } else if let Some(pos) = raw.rfind(':')
+                && raw[..pos].contains(':')
+            {
+                (raw[..pos].to_owned(), raw[pos + 1..].to_owned())
+            } else if worker_resources.len() == 1 {
+                (worker_resources[0].id.clone(), raw)
+            } else if let Some(matching) = worker_resources
+                .iter()
+                .find(|r| r.scopes.iter().any(|s| contains(s, &raw)))
+            {
+                (matching.id.clone(), raw)
+            } else {
+                ("default".into(), raw)
+            };
+            validate_path(&scope)?;
+            flat_paths.push(scope.clone());
+            by_resource.entry(res_id).or_default().push(scope);
+        }
+
+        let claims: Vec<ResourceClaim> = by_resource
+            .into_iter()
+            .map(|(resource, scopes)| ResourceClaim { resource, scopes })
+            .collect();
+
+        ensure!(
+            !claims.is_empty() && !flat_paths.is_empty() && flat_paths.len() <= 32,
+            "explicit path/scope ownership required"
+        );
+        ensure!(
+            claims.len() == 1,
+            "each assignment must target a single resource; create separate assignments per resource"
+        );
+
+        let has_configured_boundaries = !self.config.configured_specialists.is_empty()
+            || self.specialists.values().any(|s| !s.resources.is_empty());
+
+        for claim in &claims {
+            if has_configured_boundaries {
+                ensure!(
+                    !worker_resources.is_empty(),
+                    "unknown or unbounded specialist '{owner}'"
+                );
+                let Some(desc) = worker_resources.iter().find(|r| r.id == claim.resource) else {
+                    anyhow::bail!(
+                        "specialist '{}' boundary does not include resource '{}'",
+                        owner,
+                        claim.resource
+                    );
+                };
+                for scope in &claim.scopes {
+                    ensure!(
+                        desc.scopes.iter().any(|s| contains(s, scope)),
+                        "scope '{}' is outside specialist '{}' boundary ({:?}) on resource '{}'",
+                        scope,
+                        owner,
+                        desc.scopes,
+                        claim.resource
+                    );
+                    if claim.resource == "default" && !self.config.authorized_paths.is_empty() {
+                        ensure!(
+                            self.config
+                                .authorized_paths
+                                .iter()
+                                .any(|p| contains(p, scope)),
+                            "path outside authorized scope"
+                        );
+                    }
+                }
+            } else {
+                for scope in &claim.scopes {
+                    ensure!(
+                        self.config
+                            .authorized_paths
+                            .iter()
+                            .any(|p| contains(p, scope)),
+                        "path outside authorized scope"
+                    );
+                }
+            }
+        }
+
+        Ok((claims, flat_paths))
     }
     fn owned_mut(&mut self, actor: &str, id: &str, revision: u64) -> Result<&mut Assignment> {
         let a = self.assignments.get_mut(id).context("unknown assignment")?;
@@ -458,80 +537,24 @@ impl State {
         ensure!(!self.completed, "goal already completed");
         match control {
             Control::Inspect | Control::Complete { .. } => anyhow::bail!("runtime-only action"),
-            Control::CreateSpecialist {
-                name,
-                role,
-                resources,
-                allowed_paths,
-            } => {
-                ensure!(
-                    actor == COORDINATOR,
-                    "only orchestrator may create or configure specialists"
-                );
-                crate::conversation::validate_name(&name)?;
-                ensure!(name != COORDINATOR, "orchestrator cannot be a specialist");
-                text(&role)?;
-                ensure!(role.len() <= 4096, "specialist role description too large");
-                ensure!(
-                    self.specialists.contains_key(&name) || self.specialists.len() < 16,
-                    "specialist registry full; reuse existing roles"
-                );
-                ensure!(
-                    !self.inflight.contains_key(&name) && self.current(&name).is_none(),
-                    "cannot reconfigure an active specialist"
-                );
-                let granted_resources = if resources.is_empty() {
-                    let default_res = self.config.resource(None)?;
-                    vec![default_res.name]
-                } else {
-                    ensure!(resources.len() <= 16, "too many resources for specialist");
-                    let mut list = Vec::new();
-                    for r in resources {
-                        let rc = self.config.resource(Some(&r))?;
-                        if !list.contains(&rc.name) {
-                            list.push(rc.name);
-                        }
-                    }
-                    list
-                };
-                ensure!(
-                    allowed_paths.len() <= 32,
-                    "too many allowed paths for specialist"
-                );
-                for path in &allowed_paths {
-                    validate_path(path)?;
-                    ensure!(
-                        granted_resources.iter().any(|r| {
-                            self.config
-                                .resource(Some(r))
-                                .is_ok_and(|rc| rc.allows_path(path))
-                        }),
-                        "path '{}' outside granted resource scope",
-                        path
-                    );
-                }
-                let entry = self.specialists.entry(name.clone()).or_default();
-                entry.role = Some(role);
-                entry.resources = granted_resources.clone();
-                entry.allowed_paths = allowed_paths;
-                self.decision(format!(
-                    "Configured specialist {name} with resources {granted_resources:?}"
-                ));
-            }
             Control::Assign {
                 id,
                 owner,
                 description,
                 resource,
+                resources,
                 paths,
                 dependencies,
                 deadline_secs,
             } => {
-                ensure!(actor == COORDINATOR, "only orchestrator may assign work");
+                ensure!(
+                    actor == self.config.coordinator,
+                    "only orchestrator may assign work"
+                );
                 crate::conversation::validate_name(&id)?;
                 crate::conversation::validate_name(&owner)?;
                 ensure!(
-                    owner != COORDINATOR,
+                    owner != self.config.coordinator,
                     "orchestrator cannot own specialist work"
                 );
                 ensure!(
@@ -539,64 +562,40 @@ impl State {
                     "duplicate assignment or graph full"
                 );
                 text(&description)?;
+                let (claims, flat_paths) =
+                    self.resolve_claims(&owner, resource, resources, paths)?;
                 ensure!(
                     description.len() <= 4096
-                        && paths.iter().map(String::len).sum::<usize>() <= 4096,
+                        && flat_paths.iter().map(String::len).sum::<usize>() <= 4096,
                     "assignment context too large"
                 );
-                ensure!(
-                    !paths.is_empty() && paths.len() <= 32,
-                    "explicit path ownership required"
-                );
-                let target_res = if let Some(r) = resource.as_deref() {
-                    self.config.resource(Some(r))?
-                } else if let Some(s) = self
-                    .specialists
-                    .get(&owner)
-                    .filter(|s| s.resources.len() == 1)
-                {
-                    self.config.resource(Some(&s.resources[0]))?
-                } else {
-                    self.config.resource(None)?
-                };
-                if let Some(s) = self.specialists.get(&owner) {
-                    if !s.resources.is_empty() {
-                        ensure!(
-                            s.resources.contains(&target_res.name),
-                            "specialist '{}' does not have access to resource '{}'; grant it with create_specialist",
-                            owner,
-                            target_res.name
-                        );
-                    }
-                    if !s.allowed_paths.is_empty() {
-                        for path in &paths {
-                            ensure!(
-                                s.allowed_paths
-                                    .iter()
-                                    .any(|allowed| contains(allowed, path)),
-                                "path '{}' outside specialist '{}' granted allowed_paths",
-                                path,
-                                owner
-                            );
+                for claim in &claims {
+                    for scope in &claim.scopes {
+                        for a in self
+                            .assignments
+                            .values()
+                            .filter(|a| a.state != Status::Cancelled)
+                        {
+                            if a.resources.is_empty() {
+                                if claim.resource == "default" {
+                                    ensure!(
+                                        !a.paths.iter().any(|p| overlaps(p, scope)),
+                                        "shared contract already owned by {}",
+                                        a.id
+                                    );
+                                }
+                            } else {
+                                for existing in &a.resources {
+                                    if existing.resource == claim.resource {
+                                        ensure!(
+                                            !existing.scopes.iter().any(|p| overlaps(p, scope)),
+                                            "shared contract already owned by {}",
+                                            a.id
+                                        );
+                                    }
+                                }
+                            }
                         }
-                    }
-                }
-                for path in &paths {
-                    validate_path(path)?;
-                    ensure!(
-                        target_res.allows_path(path),
-                        "path outside authorized scope"
-                    );
-                    for a in self
-                        .assignments
-                        .values()
-                        .filter(|a| a.state != Status::Cancelled && a.resource == target_res.name)
-                    {
-                        ensure!(
-                            !a.paths.iter().any(|p| overlaps(p, path)),
-                            "shared contract already owned by {}",
-                            a.id
-                        );
                     }
                 }
                 ensure!(
@@ -618,15 +617,10 @@ impl State {
                     "assignment depth budget exceeded"
                 );
                 ensure!(
-                    self.specialists.contains_key(&owner) || self.specialists.len() < 16,
+                    self.specialists.contains_key(&owner) || self.specialists.len() < 32,
                     "specialist registry full; reuse existing roles"
                 );
-                let specialist = self.specialists.entry(owner.clone()).or_default();
-                if !self.config.resources.is_empty()
-                    && !specialist.resources.contains(&target_res.name)
-                {
-                    specialist.resources.push(target_res.name.clone());
-                }
+                self.specialists.entry(owner.clone()).or_default();
                 self.assignments.insert(
                     id.clone(),
                     Assignment {
@@ -634,8 +628,8 @@ impl State {
                         owner,
                         revision: 1,
                         description,
-                        resource: target_res.name,
-                        paths,
+                        paths: flat_paths,
+                        resources: claims,
                         dependencies,
                         deadline: now.saturating_add(deadline_secs),
                         timeout_secs: deadline_secs,
@@ -654,7 +648,10 @@ impl State {
                 );
             }
             Control::Revise { id, description } => {
-                ensure!(actor == COORDINATOR, "only orchestrator may revise");
+                ensure!(
+                    actor == self.config.coordinator,
+                    "only orchestrator may revise"
+                );
                 text(&description)?;
                 ensure!(description.len() <= 4096, "assignment context too large");
                 let mut affected = vec![id.clone()];
@@ -709,7 +706,10 @@ impl State {
                 }
             }
             Control::Cancel { id, reason } => {
-                ensure!(actor == COORDINATOR, "only orchestrator may cancel");
+                ensure!(
+                    actor == self.config.coordinator,
+                    "only orchestrator may cancel"
+                );
                 text(&reason)?;
                 let a = self.assignments.get(&id).context("unknown assignment")?;
                 ensure!(
@@ -739,7 +739,10 @@ impl State {
                 reviewed_effects,
                 retry,
             } => {
-                ensure!(actor == COORDINATOR, "only orchestrator may recover");
+                ensure!(
+                    actor == self.config.coordinator,
+                    "only orchestrator may recover"
+                );
                 text(&reviewed_effects)?;
                 let a = self
                     .assignments
@@ -850,7 +853,8 @@ impl State {
         for owner in owners {
             for a in self.assignments.values_mut().filter(|a| {
                 a.owner == owner
-                    && a.worktree.is_some()
+                    && (a.worktree.is_some()
+                        || matches!(a.state, Status::Running | Status::WaitingForInput))
                     && a.state != Status::Completed
                     && a.state != Status::Cancelled
             }) {
@@ -876,27 +880,15 @@ impl State {
 pub struct Store {
     db: Database,
     pub path: PathBuf,
-    pub mirror_paths: Vec<PathBuf>,
 }
 impl Store {
-    #[cfg(test)]
     pub fn open(path: PathBuf) -> Result<Self> {
-        Self::open_with_mirrors(path, Vec::new())
-    }
-    pub fn open_with_mirrors(path: PathBuf, mirror_paths: Vec<PathBuf>) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let db = Database::create(&path)
             .context("open orchestrator state (another orchestrator may own this room)")?;
         let tx = db.begin_write()?;
         tx.open_table(TABLE)?;
         tx.commit()?;
-        Ok(Self {
-            db,
-            path,
-            mirror_paths,
-        })
+        Ok(Self { db, path })
     }
     pub fn load(&self) -> Result<Option<State>> {
         let tx = self.db.begin_read()?;
@@ -916,17 +908,6 @@ impl Store {
         std::io::Write::write_all(&mut file, value.as_bytes())?;
         file.as_file().sync_all()?;
         file.persist(self.path.with_extension("json"))?;
-        for mirror in &self.mirror_paths {
-            if let Some(parent) = mirror.parent() {
-                let _ = std::fs::create_dir_all(parent);
-                if let Ok(mut m) = tempfile::NamedTempFile::new_in(parent)
-                    && std::io::Write::write_all(&mut m, value.as_bytes()).is_ok()
-                {
-                    let _ = m.as_file().sync_all();
-                    let _ = m.persist(mirror);
-                }
-            }
-        }
         Ok(())
     }
 }
@@ -935,11 +916,12 @@ impl Store {
 pub fn test_config(repo: PathBuf) -> Config {
     Config {
         room: "test".into(),
+        coordinator: COORDINATOR.into(),
         repo,
-        resources: BTreeMap::new(),
         model: None,
         goal: "Producer/consumer".into(),
         authorized_paths: vec!["src".into()],
+        configured_specialists: BTreeMap::new(),
         checks: vec!["true".into()],
         max_active: 2,
         max_calls: 8,
@@ -970,6 +952,7 @@ mod tests {
                 owner: owner.into(),
                 description: id.into(),
                 resource: None,
+                resources: Vec::new(),
                 paths: vec![path.into()],
                 dependencies: dependencies.iter().map(|d| (*d).into()).collect(),
                 deadline_secs: 60,
@@ -1211,124 +1194,115 @@ mod tests {
         assert_eq!(s.assignments["producer"].last_heartbeat, 10);
     }
     #[test]
-    fn autonomous_specialist_creation_and_resource_access_enforcement() {
-        let mut cfg = test_config(PathBuf::from("/backend"));
-        cfg.resources.insert(
-            "backend".into(),
-            ResourceConfig {
-                name: "backend".into(),
-                repo: PathBuf::from("/backend"),
-                description: Some("Backend API".into()),
-                authorized_paths: vec!["src".into()],
-                checks: vec!["true".into()],
-            },
-        );
-        cfg.resources.insert(
-            "frontend".into(),
-            ResourceConfig {
-                name: "frontend".into(),
-                repo: PathBuf::from("/frontend"),
-                description: Some("Frontend UI".into()),
-                authorized_paths: vec!["src".into()],
-                checks: vec!["true".into()],
-            },
-        );
-        let mut bases = BTreeMap::new();
-        bases.insert("backend".into(), "base-be".into());
-        bases.insert("frontend".into(), "base-fe".into());
-        let mut s = State::with_resources(cfg, bases, BTreeMap::new());
+    fn worker_specialists_and_multi_resource_ownership_are_enforced() {
+        let mut cfg = test_config(PathBuf::from("/none"));
+        cfg.authorized_paths.clear();
+        cfg.max_active = 4;
+        let mut s = State::new(cfg, "none".into());
+        // Pure orchestrator starts with zero internal specialists.
+        assert!(s.specialists.is_empty());
+        assert!(assign(&mut s, "early", "worker-a", "src/api.rs", &[]).is_err());
 
-        // Coordinator creates two specialists with scoped resource access.
-        s.apply(
-            COORDINATOR,
-            Control::CreateSpecialist {
-                name: "api-specialist".into(),
-                role: "Owns backend API".into(),
-                resources: vec!["backend".into()],
-                allowed_paths: vec!["src/api".into()],
-            },
-            1,
+        assert!(s.sync_specialists(&[
+            (
+                "worker-backend".into(),
+                vec![ResourceDescriptor {
+                    id: "git:backend".into(),
+                    kind: "git".into(),
+                    scopes: vec!["src".into()],
+                    checks: vec![],
+                }],
+            ),
+            (
+                "worker-frontend".into(),
+                vec![ResourceDescriptor {
+                    id: "git:frontend".into(),
+                    kind: "git".into(),
+                    scopes: vec!["src".into()],
+                    checks: vec![],
+                }],
+            ),
+            (
+                "worker-linear".into(),
+                vec![ResourceDescriptor {
+                    id: "linear:roadmap".into(),
+                    kind: "linear".into(),
+                    scopes: vec!["issues".into()],
+                    checks: vec![],
+                }],
+            ),
+        ]));
+        assert_eq!(s.specialists.len(), 3);
+
+        // Same relative path `src/contract.json` on two DIFFERENT git repos does NOT conflict!
+        assign(&mut s, "back", "worker-backend", "src/contract.json", &[]).unwrap();
+        assign(&mut s, "front", "worker-frontend", "src/contract.json", &[]).unwrap();
+        assign(
+            &mut s,
+            "ticket",
+            "worker-linear",
+            "linear:roadmap:issues/ENG-1.json",
+            &[],
         )
         .unwrap();
-        s.apply(
-            COORDINATOR,
-            Control::CreateSpecialist {
-                name: "ui-specialist".into(),
-                role: "Owns frontend UI".into(),
-                resources: vec!["frontend".into()],
-                allowed_paths: vec!["src/components".into()],
-            },
-            1,
-        )
-        .unwrap();
+        assert_eq!(s.ready(2), vec!["back", "front", "ticket"]);
 
-        // Cannot assign frontend resource to api-specialist (not granted).
+        // Overlapping path on the SAME resource (`git:backend`) is rejected.
         assert!(
-            s.apply(
-                COORDINATOR,
-                Control::Assign {
-                    id: "bad-resource".into(),
-                    owner: "api-specialist".into(),
-                    description: "Touch frontend".into(),
-                    resource: Some("frontend".into()),
-                    paths: vec!["src/api".into()],
-                    dependencies: vec![],
-                    deadline_secs: 60,
-                },
-                1,
+            assign(
+                &mut s,
+                "conflict",
+                "worker-backend",
+                "git:backend:src/contract.json",
+                &[]
             )
             .is_err()
         );
-
-        // Cannot assign path outside specialist's allowed_paths.
+        // Assigning a resource not owned by `worker-frontend` is rejected.
         assert!(
-            s.apply(
-                COORDINATOR,
-                Control::Assign {
-                    id: "bad-path".into(),
-                    owner: "api-specialist".into(),
-                    description: "Touch db".into(),
-                    resource: Some("backend".into()),
-                    paths: vec!["src/db".into()],
-                    dependencies: vec![],
-                    deadline_secs: 60,
-                },
-                1,
+            assign(
+                &mut s,
+                "wrong-resource",
+                "worker-frontend",
+                "linear:roadmap:issues/ENG-2.json",
+                &[]
             )
             .is_err()
         );
+    }
+    #[test]
+    fn local_specialists_enforce_strict_frontend_backend_boundaries() {
+        let mut cfg = test_config(PathBuf::from("/repo"));
+        cfg.authorized_paths = vec!["frontend".into(), "backend".into(), "docs".into()];
+        cfg.max_active = 4;
+        cfg.configured_specialists =
+            crate::orchestrator::connector::ResourceSpec::parse_specialist_boundaries(
+                &[
+                    "frontend=frontend".into(),
+                    "backend=backend".into(),
+                    "docs=docs".into(),
+                ],
+                COORDINATOR,
+                &[],
+                &cfg.checks,
+            )
+            .unwrap();
+        let mut s = State::new(cfg, "base".into());
+        assert_eq!(s.specialists.len(), 3);
+        assert!(!s.specialists["frontend"].remote);
+        assert!(s.specialists["frontend"].online);
 
-        // Valid assignments across different resources (even if relative paths would overlap, resources differ).
-        s.apply(
-            COORDINATOR,
-            Control::Assign {
-                id: "api-task".into(),
-                owner: "api-specialist".into(),
-                description: "Implement endpoint".into(),
-                resource: None, // inferred from api-specialist's single granted resource
-                paths: vec!["src/api/users.rs".into()],
-                dependencies: vec![],
-                deadline_secs: 60,
-            },
-            1,
-        )
-        .unwrap();
-        assert_eq!(s.assignments["api-task"].resource, "backend");
+        // Frontend specialist cannot touch backend!
+        assert!(assign(&mut s, "bad-fe", "frontend", "backend/api.rs", &[]).is_err());
+        // Backend specialist cannot touch frontend!
+        assert!(assign(&mut s, "bad-be", "backend", "frontend/app.tsx", &[]).is_err());
+        // Undeclared specialist cannot be invented to bypass boundaries!
+        assert!(assign(&mut s, "bad-rogue", "rogue", "frontend/app.tsx", &[]).is_err());
 
-        s.apply(
-            COORDINATOR,
-            Control::Assign {
-                id: "ui-task".into(),
-                owner: "ui-specialist".into(),
-                description: "Consume endpoint".into(),
-                resource: None, // inferred from ui-specialist's single granted resource
-                paths: vec!["src/components/users.tsx".into()],
-                dependencies: vec!["api-task".into()],
-                deadline_secs: 60,
-            },
-            1,
-        )
-        .unwrap();
-        assert_eq!(s.assignments["ui-task"].resource, "frontend");
+        // Each specialist can own paths strictly inside its own boundary concurrently.
+        assign(&mut s, "fe-ui", "frontend", "frontend/app.tsx", &[]).unwrap();
+        assign(&mut s, "be-api", "backend", "backend/api.rs", &[]).unwrap();
+        assign(&mut s, "doc-readme", "docs", "docs/guide.md", &[]).unwrap();
+        assert_eq!(s.ready(2), vec!["be-api", "doc-readme", "fe-ui"]);
     }
 }
