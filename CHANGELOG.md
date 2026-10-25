@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/iltumio/buddies/compare/v0.3.0...v0.3.1) - 2026-10-25
+
+### Added
+
+- *(orchestrator)* add machine config, multi-resource support, and autonomous service mode
+
+### Fixed
+
+- *(release)* leave 0.3.1 notes for the release PR
+
+### Other
+
+- Merge specialist workers and machine orchestration for v0.3.1
+- release v0.1.11
+- Abstract room communication transport with Iroh P2P and in-memory backends
+
 ### Fixed
 
 - Restore machine orchestrator TOML/JSON configuration and autonomous service mode alongside specialist groups, resource connectors, and the message monitor.
