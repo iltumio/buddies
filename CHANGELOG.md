@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/iltumio/buddies/compare/v0.1.10...v0.1.11) - 2026-10-21
+
+### Added
+
+- *(orchestrator)* add machine config, multi-resource support, and autonomous service mode
+
+### Other
+
+- Abstract room communication transport with Iroh P2P and in-memory backends
+
 ## [0.1.10](https://github.com/iltumio/buddies/compare/v0.1.9...v0.1.10) - 2026-10-11
 
 ### Added
