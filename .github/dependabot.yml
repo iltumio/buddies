@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # vitepress-plugin-mermaid 2.x only supports Mermaid 10 and 11.
+    ignore:
+      - dependency-name: mermaid
+        update-types: [version-update:semver-major]
   - package-ecosystem: cargo
     directory: /
     schedule:
