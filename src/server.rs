@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,12 +12,15 @@ use rmcp::{ErrorData as McpError, ServerHandler, tool, tool_handler, tool_router
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::activity::{ConflictEvent, diff_summary};
+use crate::activity::{ConflictEvent, ConflictKind, diff_summary};
+use crate::impact::RepoImpactGraph;
 use crate::memory::{MemoryEntry, MemoryKind, SearchFilters};
+use crate::negotiation::{NegotiationDecision, NegotiationProposal, NegotiationResponse};
 use crate::node::BuddiesNode;
 use crate::protocol::{P2PMessage, P2PMessageBody, SignerIdentity, TaskResult};
 use crate::room::PendingTask;
 use crate::skill::{SkillEntry, SkillSearchFilters, SkillVote, skill_content_hash};
+use crate::watcher::WatchContext;
 
 #[derive(Clone)]
 pub struct BuddiesServer {
@@ -38,28 +42,55 @@ impl BuddiesServer {
 fn conflict_notification_payload(event: &ConflictEvent) -> serde_json::Value {
     let (peer_added, peer_removed) = diff_summary(&event.peer.diff);
     let (local_added, local_removed) = diff_summary(&event.local.diff);
+    let instructions = match event.kind {
+        ConflictKind::Direct => format!(
+            "Peer '{}' (agent '{}') changed '{}' (branch '{}'), which you have also modified locally. \
+             Call get_peer_diff to inspect their change and propose_operation / respond_negotiation to coordinate.",
+            event.peer.author, event.peer.agent, event.peer.path, event.peer.branch
+        ),
+        ConflictKind::Impact => format!(
+            "Peer '{}' (agent '{}') changed '{}' (branch '{}'), which transitively impacts your modified file '{}'. \
+             Call get_peer_diff and analyze_file_impact to inspect the blast radius, and propose_operation to negotiate contracts.",
+            event.peer.author,
+            event.peer.agent,
+            event.peer.path,
+            event.peer.branch,
+            event.local.path
+        ),
+    };
     serde_json::json!({
+        "conflict_kind": event.kind.to_string(),
         "repo": event.peer.repo,
         "path": event.peer.path,
         "peer": event.peer.author,
+        "agent": event.peer.agent,
         "branch": event.peer.branch,
+        "worktree": event.peer.worktree,
+        "task_id": event.peer.task_id,
+        "sprint": event.peer.sprint,
         "kind": event.peer.kind.to_string(),
         "timestamp": event.peer.timestamp,
         "lines_added": peer_added,
         "lines_removed": peer_removed,
+        "touched_symbols": event.peer.touched_symbols,
+        "affected_files": event.peer.affected_files,
+        "impact_truncated": event.peer.impact_truncated,
         "local": {
+            "path": event.local.path,
             "peer": event.local.author,
+            "agent": event.local.agent,
             "branch": event.local.branch,
+            "worktree": event.local.worktree,
+            "task_id": event.local.task_id,
+            "sprint": event.local.sprint,
             "kind": event.local.kind.to_string(),
             "timestamp": event.local.timestamp,
             "lines_added": local_added,
             "lines_removed": local_removed,
+            "touched_symbols": event.local.touched_symbols,
+            "affected_files": event.local.affected_files,
         },
-        "instructions": format!(
-            "Peer '{}' changed '{}' (branch '{}'), which you have also modified locally. \
-             Call get_peer_diff to inspect their change and reconcile before continuing.",
-            event.peer.author, event.peer.path, event.peer.branch
-        ),
+        "instructions": instructions,
     })
 }
 
@@ -351,6 +382,28 @@ pub struct WatchRepoRequest {
     pub room: String,
     #[schemars(description = "Repo name agreed with teammates (default: directory name)")]
     pub repo_name: Option<String>,
+    #[schemars(description = "Optional git worktree label (auto-detected if omitted)")]
+    pub worktree: Option<String>,
+    #[schemars(description = "Optional agent identifier override")]
+    pub agent: Option<String>,
+    #[schemars(description = "Optional current task ID associated with changes in this repo")]
+    pub task_id: Option<String>,
+    #[schemars(description = "Optional sprint or milestone label associated with changes")]
+    pub sprint: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetWatchContextRequest {
+    #[schemars(description = "Absolute path to the watched local git repository")]
+    pub repo_path: String,
+    #[schemars(description = "Optional git worktree label")]
+    pub worktree: Option<String>,
+    #[schemars(description = "Optional agent identifier override")]
+    pub agent: Option<String>,
+    #[schemars(description = "Optional current task ID associated with changes in this repo")]
+    pub task_id: Option<String>,
+    #[schemars(description = "Optional sprint or milestone label associated with changes")]
+    pub sprint: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -373,6 +426,78 @@ pub struct GetPeerDiffRequest {
     pub path: String,
     #[schemars(description = "Peer (author) name whose diff to fetch")]
     pub peer: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AnalyzeFileImpactRequest {
+    #[schemars(description = "Absolute path to a local git repository (Rust or TypeScript)")]
+    pub repo_path: String,
+    #[schemars(description = "Repo-relative path of the file to analyze (e.g. src/lib.rs)")]
+    pub path: String,
+    #[schemars(description = "Optional unified diff to extract touched symbols from")]
+    pub diff: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProposeOperationRequest {
+    #[schemars(with = "Option<String>")]
+    pub proposal_id: Option<Uuid>,
+    pub room: String,
+    pub repo: String,
+    #[schemars(
+        description = "Optional absolute path to the repository to auto-compute affected_files"
+    )]
+    pub repo_path: Option<String>,
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
+    pub task_id: Option<String>,
+    pub sprint: Option<String>,
+    #[schemars(description = "Repo-relative file paths this operation intends to modify")]
+    pub target_files: Vec<String>,
+    #[schemars(
+        description = "Optional explicitly known affected files; merged with static impact analysis"
+    )]
+    pub affected_files: Option<Vec<String>>,
+    #[schemars(
+        description = "Coordination strategy: interface_contract, sequential_order, file_ownership, or rebase_agreement (default: interface_contract)"
+    )]
+    pub strategy: Option<String>,
+    #[schemars(description = "Summary of the planned operation and how conflicts will be avoided")]
+    pub summary: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RespondNegotiationRequest {
+    /// Revision returned by list_negotiations; rejects stale decisions.
+    pub revision: String,
+    #[schemars(with = "Option<String>")]
+    pub response_id: Option<Uuid>,
+    pub room: String,
+    #[schemars(with = "String")]
+    pub proposal_id: Uuid,
+    #[schemars(description = "One of: accept, counter, reject, resolve")]
+    pub decision: String,
+    #[schemars(description = "Explanation, counter-proposal details, or conflict resolution plan")]
+    pub message: String,
+    #[schemars(
+        description = "Optional updated contract or coordination plan when counter-proposing or accepting"
+    )]
+    pub counter_plan: Option<String>,
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
+    pub task_id: Option<String>,
+    pub sprint: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListNegotiationsRequest {
+    pub room: Option<String>,
+    pub repo: Option<String>,
+    pub sprint: Option<String>,
+    #[schemars(
+        description = "Optional repo-relative path to check for overlapping or affected negotiations"
+    )]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -473,6 +598,12 @@ fn now_ts() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+fn negotiation_output(proposal: &NegotiationProposal) -> serde_json::Value {
+    let mut value = serde_json::to_value(proposal).expect("negotiation serialization");
+    value["revision"] = serde_json::json!(proposal.current_revision());
+    value
 }
 
 fn ok_json<T: Serialize>(v: &T) -> Result<CallToolResult, McpError> {
@@ -1371,17 +1502,23 @@ impl BuddiesServer {
 
     #[tool(
         name = "watch_repo",
-        description = "Watch a local git repository and broadcast every uncommitted file change (with diff) to peers in the room. Enables check_file_activity, get_peer_diff, and proactive conflict notifications. WARNING: this shares source-code diffs with everyone in the room."
+        description = "Watch a local git repository and broadcast every uncommitted file change (with diff, branch, worktree, agent, task_id, sprint, touched_symbols, and affected_files) to peers in the room. Enables check_file_activity, get_peer_diff, and proactive direct + transitive conflict notifications. WARNING: this shares source-code diffs with everyone in the room."
     )]
     async fn watch_repo(
         &self,
         Parameters(req): Parameters<WatchRepoRequest>,
     ) -> Result<CallToolResult, McpError> {
         let _membership = self.node.local_membership.lock().await;
+        let context = WatchContext {
+            worktree: req.worktree,
+            agent: req.agent,
+            task_id: req.task_id,
+            sprint: req.sprint,
+        };
         let state = self
             .node
             .watcher_manager
-            .watch(Path::new(&req.repo_path), &req.room, req.repo_name)
+            .watch_with_context(Path::new(&req.repo_path), &req.room, req.repo_name, context)
             .await
             .map_err(|e| err(e.to_string()))?;
         self.node
@@ -1392,6 +1529,37 @@ impl BuddiesServer {
             "watching": true,
             "repo": state.repo,
             "room": state.room,
+            "worktree": state.worktree,
+            "agent": state.agent,
+            "task_id": state.task_id,
+            "sprint": state.sprint,
+        }))
+    }
+
+    #[tool(
+        name = "set_watch_context",
+        description = "Update the active worktree, agent, task_id, or sprint metadata attached to automatic file diff broadcasts for a watched repository."
+    )]
+    async fn set_watch_context(
+        &self,
+        Parameters(req): Parameters<SetWatchContextRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let context = WatchContext {
+            worktree: req.worktree,
+            agent: req.agent,
+            task_id: req.task_id,
+            sprint: req.sprint,
+        };
+        let updated = self
+            .node
+            .watcher_manager
+            .update_context(Path::new(&req.repo_path), context)
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        ok_json(&serde_json::json!({
+            "updated": true,
+            "repo_path": req.repo_path,
+            "state": updated,
         }))
     }
 
@@ -1411,7 +1579,7 @@ impl BuddiesServer {
 
     #[tool(
         name = "check_file_activity",
-        description = "Check which peers recently changed files in a watched repo. Call this BEFORE editing files in a shared repo to avoid conflicts. Returns per-file: peer, branch, change kind, timestamp, and diff line counts."
+        description = "Check which peers recently changed files in a watched repo. Call this BEFORE editing files in a shared repo to avoid conflicts. Returns per-file: peer, agent, branch, worktree, task_id, sprint, change kind, timestamp, diff line counts, touched_symbols, and affected_files."
     )]
     async fn check_file_activity(
         &self,
@@ -1430,11 +1598,18 @@ impl BuddiesServer {
                 serde_json::json!({
                     "path": e.path,
                     "peer": e.author,
+                    "agent": e.agent,
                     "kind": e.kind.to_string(),
                     "branch": e.branch,
+                    "worktree": e.worktree,
+                    "task_id": e.task_id,
+                    "sprint": e.sprint,
                     "timestamp": e.timestamp,
                     "lines_added": added,
                     "lines_removed": removed,
+                    "touched_symbols": e.touched_symbols,
+                    "affected_files": e.affected_files,
+                    "impact_truncated": e.impact_truncated,
                 })
             })
             .collect();
@@ -1443,7 +1618,7 @@ impl BuddiesServer {
 
     #[tool(
         name = "get_peer_diff",
-        description = "Get the full diff of a peer's latest change to a file in a watched repo."
+        description = "Get the full diff and impact metadata of a peer's latest change to a file in a watched repo."
     )]
     async fn get_peer_diff(
         &self,
@@ -1460,9 +1635,16 @@ impl BuddiesServer {
                 "repo": e.repo,
                 "path": e.path,
                 "peer": e.author,
+                "agent": e.agent,
                 "branch": e.branch,
+                "worktree": e.worktree,
+                "task_id": e.task_id,
+                "sprint": e.sprint,
                 "kind": e.kind.to_string(),
                 "timestamp": e.timestamp,
+                "touched_symbols": e.touched_symbols,
+                "affected_files": e.affected_files,
+                    "impact_truncated": e.impact_truncated,
                 "diff": e.diff,
             })),
             None => Err(err(format!(
@@ -1470,6 +1652,273 @@ impl BuddiesServer {
                 req.peer, req.path, req.repo
             ))),
         }
+    }
+
+    #[tool(
+        name = "analyze_file_impact",
+        description = "Analyze the static dependency graph of a Rust or TypeScript repository to determine all files directly or transitively affected by modifying a given file, plus its exported/touched symbols."
+    )]
+    async fn analyze_file_impact(
+        &self,
+        Parameters(req): Parameters<AnalyzeFileImpactRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let repo_path = std::path::PathBuf::from(&req.repo_path);
+        let path = req.path.clone();
+        let diff = req.diff.clone();
+        let report = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let canonical = repo_path
+                .canonicalize()
+                .map_err(|e| anyhow::anyhow!("cannot resolve '{}': {e}", repo_path.display()))?;
+            let graph = RepoImpactGraph::build(&canonical);
+            Ok(graph.report_for(&canonical, &path, diff.as_deref()))
+        })
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        .map_err(|e| err(e.to_string()))?;
+
+        ok_json(&report)
+    }
+
+    #[tool(
+        name = "propose_operation",
+        description = "Propose a planned file/contract operation to peers in the room before or during editing. Automatically computes transitively affected files if the repo is watched or repo_path is provided, stores the proposal, and broadcasts it to all peers for negotiation."
+    )]
+    async fn propose_operation(
+        &self,
+        Parameters(req): Parameters<ProposeOperationRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        self.node
+            .clients
+            .require_member(self.session_id, &req.room)
+            .map_err(|e| err(e.to_string()))?;
+
+        let mut affected: BTreeSet<String> = req
+            .affected_files
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.replace('\\', "/"))
+            .collect();
+
+        let watched = self.node.watcher_manager.find_watched_repo(&req.repo).await;
+        let scan_root = req
+            .repo_path
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| watched.as_ref().map(|(root, _)| root.clone()));
+
+        if let Some(root) = scan_root.clone() {
+            let targets = req.target_files.clone();
+            if let Ok(Ok(auto_affected)) =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                    let canonical = root.canonicalize().unwrap_or(root);
+                    let graph = RepoImpactGraph::build(&canonical);
+                    let mut aff = Vec::new();
+                    for target in &targets {
+                        aff.extend(graph.affected_files(target));
+                    }
+                    Ok(aff)
+                })
+                .await
+            {
+                affected.extend(auto_affected);
+            }
+        }
+
+        let watched_state = watched.map(|(_, state)| state);
+        let proposer = self.node.room_manager.peer_id().to_owned();
+        let agent = watched_state
+            .as_ref()
+            .map(|s| s.agent.clone())
+            .unwrap_or_else(|| self.node.room_manager.agent_name().to_owned());
+        let branch = if let Some(branch) = req.branch {
+            branch
+        } else if let Some(root) = scan_root {
+            let output = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .output()
+                .await
+                .map_err(|e| err(e.to_string()))?;
+            if !output.status.success() {
+                return Err(err("cannot detect branch; provide branch explicitly"));
+            }
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        } else {
+            return Err(err("provide branch or a local repository path"));
+        };
+        let worktree = req
+            .worktree
+            .or_else(|| watched_state.as_ref().and_then(|s| s.worktree.clone()));
+        let task_id = req
+            .task_id
+            .or_else(|| watched_state.as_ref().and_then(|s| s.task_id.clone()));
+        let sprint = req
+            .sprint
+            .or_else(|| watched_state.as_ref().and_then(|s| s.sprint.clone()));
+        let strategy = req.strategy.unwrap_or_else(|| "interface_contract".into());
+        let now = now_ts();
+
+        let proposal_id = req.proposal_id.unwrap_or_else(Uuid::new_v4);
+        let previous = self
+            .node
+            .storage
+            .read_negotiations(move |s| Ok(s.get(proposal_id).cloned()))
+            .await
+            .map_err(|e| err(e.to_string()))?;
+        let proposal = NegotiationProposal {
+            id: proposal_id,
+            room: req.room.clone(),
+            repo: req.repo,
+            proposer,
+            proposer_identity: self.node.room_manager.signer_identity_label(),
+            agent,
+            branch,
+            worktree,
+            task_id,
+            sprint,
+            target_files: req.target_files,
+            affected_files: affected.into_iter().collect(),
+            strategy,
+            summary: req.summary,
+            status: crate::negotiation::NegotiationStatus::Open,
+            agreed_plan: None,
+            responses: Vec::new(),
+            timestamp: previous.map(|p| p.timestamp).unwrap_or(now),
+        };
+
+        let stored = {
+            let proposal = proposal.clone();
+            self.node
+                .storage
+                .negotiations(move |store| store.upsert_proposal(proposal, now))
+                .await
+                .map_err(|e| err(e.to_string()))?
+        };
+
+        let msg = P2PMessage::new(P2PMessageBody::NegotiationProposed { proposal });
+        self.node
+            .room_manager
+            .broadcast_to_room(&req.room, msg)
+            .await
+            .map_err(|e| {
+                err(format!(
+                    "proposal {proposal_id} saved locally; publication failed: {e}"
+                ))
+            })?;
+
+        ok_json(&negotiation_output(&stored))
+    }
+
+    #[tool(
+        name = "respond_negotiation",
+        description = "Accept, counter-propose, reject, or resolve a peer's operation proposal (propose_operation). Broadcasts your response to the room and updates the negotiation state."
+    )]
+    async fn respond_negotiation(
+        &self,
+        Parameters(req): Parameters<RespondNegotiationRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        self.node
+            .clients
+            .require_member(self.session_id, &req.room)
+            .map_err(|e| err(e.to_string()))?;
+
+        let decision: NegotiationDecision = req
+            .decision
+            .parse()
+            .map_err(|e: anyhow::Error| err(e.to_string()))?;
+        let now = now_ts();
+        let proposal_id = req.proposal_id;
+        let current = self
+            .node
+            .storage
+            .read_negotiations(move |store| Ok(store.get(proposal_id).cloned()))
+            .await
+            .map_err(|e| err(e.to_string()))?
+            .ok_or_else(|| err("unknown proposal"))?;
+        let previous_response = req
+            .response_id
+            .and_then(|id| current.responses.iter().find(|r| r.id == id))
+            .cloned();
+        if current.room != req.room
+            || (previous_response.is_none() && current.current_revision() != req.revision)
+        {
+            return Err(err("stale revision or wrong room; reload the proposal"));
+        }
+        let response = NegotiationResponse {
+            id: req.response_id.unwrap_or_else(Uuid::new_v4),
+            revision: req.revision,
+            responder_identity: self.node.room_manager.signer_identity_label(),
+            responder: self.node.room_manager.peer_id().to_owned(),
+            agent: self.node.room_manager.agent_name().to_owned(),
+            branch: req.branch,
+            worktree: req.worktree,
+            task_id: req.task_id,
+            sprint: req.sprint,
+            decision,
+            message: req.message,
+            counter_plan: req.counter_plan,
+            timestamp: previous_response
+                .as_ref()
+                .map(|r| r.timestamp)
+                .unwrap_or(now),
+        };
+        let response_id = response.id;
+
+        let room = req.room.clone();
+        let proposal_id = req.proposal_id;
+        let response_for_store = response.clone();
+        let updated = self
+            .node
+            .storage
+            .negotiations(move |store| {
+                store.record_response(&room, proposal_id, response_for_store, now)
+            })
+            .await
+            .map_err(|e| err(e.to_string()))?;
+
+        let msg = P2PMessage::new(P2PMessageBody::NegotiationResponded {
+            room: req.room.clone(),
+            proposal_id: req.proposal_id,
+            response,
+        });
+        self.node
+            .room_manager
+            .broadcast_to_room(&req.room, msg)
+            .await
+            .map_err(|e| err(format!("response {response_id} saved locally for proposal {proposal_id}; publication failed: {e}")))?;
+
+        ok_json(&negotiation_output(&updated))
+    }
+
+    #[tool(
+        name = "list_negotiations",
+        description = "List active and resolved operation negotiations across peers, optionally filtered by room, repo, sprint, or file path (matches target_files and affected_files)."
+    )]
+    async fn list_negotiations(
+        &self,
+        Parameters(req): Parameters<ListNegotiationsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let now = now_ts();
+        let proposals = self
+            .node
+            .storage
+            .read_negotiations(move |store| {
+                Ok(store.list(
+                    req.room.as_deref(),
+                    req.repo.as_deref(),
+                    req.sprint.as_deref(),
+                    req.path.as_deref(),
+                    now,
+                ))
+            })
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        ok_json(&serde_json::json!({
+            "count": proposals.len(),
+            "negotiations": proposals.iter().map(negotiation_output).collect::<Vec<_>>(),
+        }))
     }
 }
 
@@ -1500,10 +1949,12 @@ impl ServerHandler for BuddiesServer {
                  acknowledge_message as read, handled or failed. Read get_conversation before acting on replies. \
                  State your responsibility, consult peers before changing shared contracts, and report blockers. \
                  Updates are context; answer questions and requests but do not reply to every status update. \
-                 To collaborate on a shared git repo, call 'watch_repo' with the repo path and room; \
+                 To collaborate on a shared git repo, call 'watch_repo' with the repo path, room, and optional worktree/task_id/sprint; \
+                 call 'analyze_file_impact' to inspect the Rust/TypeScript blast radius of a file; \
+                 call 'propose_operation' and 'respond_negotiation' to negotiate contracts and file ownership; \
                  then call 'check_file_activity' before editing files to see what peers changed, and \
                  'get_peer_diff' to read a peer's change. When you receive a \
-                 'notifications/buddies/fileConflict' notification, inspect the peer's diff and \
+                 'notifications/buddies/fileConflict' notification (direct or impact), inspect the peer's diff and \
                  reconcile with your local changes before continuing to edit that file.")
     }
 
@@ -1542,39 +1993,66 @@ mod tests {
         assert!(versions.contains(&ProtocolVersion::V_2025_11_25));
         assert!(!versions.contains(&ProtocolVersion::V_2026_07_28));
     }
-    use crate::activity::{ConflictEvent, FileActivityEntry, FileChangeKind};
+    use crate::activity::{ConflictEvent, ConflictKind, FileActivityEntry, FileChangeKind};
 
     fn activity(author: &str, branch: &str, diff: &str, timestamp: u64) -> FileActivityEntry {
         FileActivityEntry {
             repo: "repo".into(),
             branch: branch.into(),
+            worktree: Some("wt-main".into()),
+            agent: "codex".into(),
+            task_id: Some("TASK-1".into()),
+            sprint: Some("sprint-4".into()),
             path: "src/lib.rs".into(),
             kind: FileChangeKind::Changed,
             diff: diff.into(),
             content_hash: "abc".into(),
             author: author.into(),
             timestamp,
+            touched_symbols: vec!["run".into()],
+            affected_files: vec!["src/main.rs".into()],
+            impact_truncated: false,
         }
     }
 
     #[test]
     fn conflict_payload_contains_local_and_peer_metadata() {
         let event = ConflictEvent {
+            kind: ConflictKind::Direct,
             local: activity("me", "feature/local", "+ours\n", 10),
             peer: activity("alice", "feature/peer", "+theirs\n-old\n", 20),
         };
 
         let payload = conflict_notification_payload(&event);
 
+        assert_eq!(payload["conflict_kind"], "direct");
         assert_eq!(payload["peer"], "alice");
+        assert_eq!(payload["agent"], "codex");
         assert_eq!(payload["branch"], "feature/peer");
+        assert_eq!(payload["worktree"], "wt-main");
+        assert_eq!(payload["task_id"], "TASK-1");
+        assert_eq!(payload["sprint"], "sprint-4");
         assert_eq!(payload["timestamp"], 20);
         assert_eq!(payload["lines_added"], 1);
         assert_eq!(payload["lines_removed"], 1);
+        assert_eq!(payload["touched_symbols"], serde_json::json!(["run"]));
+        assert_eq!(
+            payload["affected_files"],
+            serde_json::json!(["src/main.rs"])
+        );
         assert_eq!(payload["local"]["peer"], "me");
         assert_eq!(payload["local"]["branch"], "feature/local");
         assert_eq!(payload["local"]["timestamp"], 10);
         assert_eq!(payload["local"]["lines_added"], 1);
         assert_eq!(payload["local"]["lines_removed"], 0);
+    }
+
+    #[test]
+    fn negotiation_output_exposes_the_revision_required_for_responses() {
+        let proposal = crate::negotiation::tests::fixture_proposal(100);
+        assert_eq!(
+            negotiation_output(&proposal)["revision"],
+            proposal.current_revision()
+        );
     }
 }

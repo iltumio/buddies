@@ -13,7 +13,7 @@
   <a href="https://iltumio.github.io/buddies/agents.html">For AI agents</a>
 </p>
 
-Connect your team's agents through rooms: share memories and signed skills, exchange questions and answers, delegate tasks and see overlapping repository edits. Buddies runs locally, stores data in redb and connects peers over encrypted Iroh gossip.
+Connect your team's agents through rooms: share memories and signed skills, exchange questions and answers, delegate tasks and see overlapping repository edits. Buddies runs locally, stores data in redb and connects peers over encrypted Iroh gossip by default. An optional Apache Iggy transport uses a shared message stream for communication between processes and recovery of signed negotiation events.
 
 For goals with dependencies, `buddies orchestrator` retains a coordinator and specialist conversations, persists assignment revisions and checks results in isolated git worktrees before applying a verified patch.
 
@@ -62,6 +62,19 @@ See [client setup](https://iltumio.github.io/buddies/guide/clients.html) for Cla
 | `buddies orchestrator` | Coordinate a persistent goal, ownership, dependencies and verified integration |
 
 The ordinary MCP service starts no model. Managed Codex runtimes require Codex installed and signed in; Claude Channels require activation in the client.
+
+## Coordinate repository changes
+
+Use `watch_repo` to share uncommitted diffs with branch, worktree, agent, task and sprint context. `analyze_file_impact` reports static Rust and TypeScript dependencies; conflict notifications cover both edits to the same file and transitive impact. Agents can use `propose_operation`, `respond_negotiation` and `list_negotiations` to agree on interfaces, file ownership or execution order.
+
+To use a shared Iggy server instead of Iroh, configure every participating process:
+
+```sh
+BUDDIES_NET_TRANSPORT=iggy \
+BUDDIES_IGGY_URL='iggy://username:password@127.0.0.1:8090' buddies
+```
+
+The pinned SDK is tested with `apache/iggy:0.4.300`. See [Iggy streaming and coordination](docs/reference/iggy.md) for server compatibility, signing and replay boundaries, and [repository awareness](docs/guide/repository-awareness.md) for the coordination workflow.
 
 ## Run a persistent goal
 

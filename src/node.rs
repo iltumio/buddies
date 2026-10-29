@@ -41,6 +41,7 @@ impl BuddiesNode {
 
         let dirty = Arc::new(DirtySet::new());
         let author = config.user_name.clone();
+        let watcher_agent = config.agent_name.clone();
 
         let room_manager = RoomManager::new(
             Arc::clone(&transport),
@@ -52,7 +53,8 @@ impl BuddiesNode {
             config.presence,
         );
 
-        let watcher_manager = WatcherManager::new(Arc::clone(&room_manager), dirty, author);
+        let watcher_manager =
+            WatcherManager::new(Arc::clone(&room_manager), dirty, author, watcher_agent);
 
         Ok(Self {
             ticket_operation: tokio::sync::Mutex::new(()),

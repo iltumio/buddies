@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::activity::FileActivityEntry;
 use crate::memory::{MemoryEntry, SearchFilters};
+use crate::negotiation::{NegotiationProposal, NegotiationResponse};
 use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult};
 
 pub type TopicId = iroh_gossip::proto::TopicId;
@@ -136,8 +137,74 @@ pub enum P2PMessageBody {
         score: i8,
     },
     FileActivity {
+        #[serde(with = "legacy_activity")]
         entry: FileActivityEntry,
     },
+    NegotiationProposed {
+        proposal: NegotiationProposal,
+    },
+    NegotiationResponded {
+        room: String,
+        proposal_id: Uuid,
+        response: NegotiationResponse,
+    },
+    /// Version 2 preserves the old variant's positional layout for older peers.
+    FileActivityV2 {
+        entry: FileActivityEntry,
+    },
+}
+
+mod legacy_activity {
+    use super::*;
+    #[derive(Serialize, Deserialize)]
+    struct Legacy {
+        repo: String,
+        branch: String,
+        path: String,
+        kind: crate::activity::FileChangeKind,
+        diff: String,
+        content_hash: String,
+        author: String,
+        timestamp: u64,
+    }
+    pub fn serialize<S: serde::Serializer>(
+        entry: &FileActivityEntry,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Legacy {
+            repo: entry.repo.clone(),
+            branch: entry.branch.clone(),
+            path: entry.path.clone(),
+            kind: entry.kind,
+            diff: entry.diff.clone(),
+            content_hash: entry.content_hash.clone(),
+            author: entry.author.clone(),
+            timestamp: entry.timestamp,
+        }
+        .serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<FileActivityEntry, D::Error> {
+        let old = Legacy::deserialize(deserializer)?;
+        Ok(FileActivityEntry {
+            repo: old.repo,
+            branch: old.branch,
+            path: old.path,
+            kind: old.kind,
+            diff: old.diff,
+            content_hash: old.content_hash,
+            author: old.author,
+            timestamp: old.timestamp,
+            worktree: None,
+            agent: String::new(),
+            task_id: None,
+            sprint: None,
+            touched_symbols: Vec::new(),
+            affected_files: Vec::new(),
+            impact_truncated: false,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +240,10 @@ impl P2PMessage {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            bytes.len() <= crate::transport::GOSSIP_MAX_MESSAGE_SIZE,
+            "P2P frame exceeds size limit"
+        );
         Ok(postcard::from_bytes(bytes)?)
     }
 }
@@ -242,5 +313,64 @@ mod tests {
             .voting_label()
             .is_none()
         );
+    }
+
+    #[test]
+    fn legacy_activity_layout_and_signing_payload_are_frozen() {
+        use super::*;
+        #[derive(Serialize)]
+        struct OldActivity {
+            repo: String,
+            branch: String,
+            path: String,
+            kind: crate::activity::FileChangeKind,
+            diff: String,
+            content_hash: String,
+            author: String,
+            timestamp: u64,
+        }
+        let old = OldActivity {
+            repo: "repo".into(),
+            branch: "main".into(),
+            path: "src/lib.rs".into(),
+            kind: crate::activity::FileChangeKind::Changed,
+            diff: "+x".into(),
+            content_hash: "abc".into(),
+            author: "alice".into(),
+            timestamp: 1000,
+        };
+        // Old enum index 13, followed by its exact original field order.
+        let bytes = postcard::to_allocvec(&(
+            [7u8; 16],
+            1000u64,
+            13u8,
+            &old,
+            Option::<SignerIdentity>::None,
+            Option::<Vec<u8>>::None,
+        ))
+        .unwrap();
+        let decoded = P2PMessage::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_bytes().as_ref(), bytes);
+        assert_eq!(
+            decoded.signing_payload().as_ref(),
+            postcard::to_allocvec(&([7u8; 16], 1000u64, 13u8, &old)).unwrap()
+        );
+        let P2PMessageBody::FileActivity { mut entry } = decoded.body else {
+            panic!("legacy variant");
+        };
+        assert_eq!(entry.path, "src/lib.rs");
+        assert!(entry.agent.is_empty());
+        entry.agent = "codex".into();
+        entry.task_id = Some("TASK-1".into());
+        entry.impact_truncated = true;
+        let v2 = P2PMessage::new(P2PMessageBody::FileActivityV2 {
+            entry: entry.clone(),
+        });
+        let P2PMessageBody::FileActivityV2 { entry: roundtrip } =
+            P2PMessage::from_bytes(&v2.to_bytes()).unwrap().body
+        else {
+            panic!("v2");
+        };
+        assert_eq!(roundtrip, entry);
     }
 }
