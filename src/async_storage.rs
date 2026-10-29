@@ -60,6 +60,20 @@ impl AsyncStorage {
         self.run(move |storage| storage.conversations(operation))
             .await
     }
+    pub async fn negotiations<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut crate::negotiation::NegotiationStore) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.run(move |storage| storage.negotiations(operation))
+            .await
+    }
+    pub async fn read_negotiations<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&crate::negotiation::NegotiationStore) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.run(move |storage| storage.read_negotiations(operation))
+            .await
+    }
     pub async fn room_ticket(&self, room: &str) -> Result<Option<crate::ticket::RoomTicket>> {
         let room = room.to_owned();
         self.run(move |storage| storage.room_ticket(&room)).await

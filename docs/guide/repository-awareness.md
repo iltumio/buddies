@@ -1,6 +1,6 @@
 # Repository awareness
 
-`watch_repo({repo_path, room, repo_name?})` starts a filesystem watcher on a local git repository. Join the room first. File-change events are debounced by roughly 1 second and then buddies shells out to `git` to determine what actually changed, so `.gitignore`'d files and build artifacts never get broadcast. Git does the filtering for you.
+`watch_repo({repo_path, room, repo_name?, worktree?, agent?, task_id?, sprint?})` starts a filesystem watcher on a local git repository. Join the room first. File-change events are debounced by roughly 1 second and then buddies shells out to `git` to determine what actually changed, so `.gitignore`'d files and build artifacts never get broadcast. Git does the filtering for you.
 
 The watcher ignores read-only access events and `.git` metadata churn. It also reconciles against Git every 2 seconds, which clears stale dirty state after a commit even if the filesystem notification was missed. If a Git command or file read fails, that scan is skipped and the last known state is retained rather than broadcasting an empty or misleading update.
 
@@ -36,3 +36,31 @@ sequenceDiagram
 Git remains the source of truth — buddies never writes to your working tree. Only uncommitted changes are broadcast, watchers stop when the process exits, and late joiners see activity from the moment they join, not before.
 
 **Privacy warning**: watching a repo shares source-code diffs with everyone in the room. Only watch repos in rooms with `require_signed=true` and an identity whitelist configured (see [Identity trust model](/reference/identity)).
+
+## Impact and coordination
+
+Use `set_watch_context` to update the worktree, agent, task or sprint associated
+with a watched checkout. Empty values clear overrides. Branch changes reannounce
+unchanged dirty files so peers see their current context.
+
+`analyze_file_impact({repo_path, path, diff?})` reports static Rust and TypeScript
+module dependencies and affected files. Supplying a unified diff also identifies
+touched symbols. Read the returned `limitations`: dynamic imports, generated
+code and compiler-specific resolution may require additional analysis.
+
+Conflict notifications include `conflict_kind` (`direct` or `impact`), context,
+touched symbols and affected files. `impact` means a peer change transitively
+affects a locally modified file. Activity metadata is capped; when
+`impact_truncated=true`, call `analyze_file_impact` for the full static report.
+
+Before overlapping work, call `propose_operation` with `room`, `repo`,
+`target_files`, `summary`, and either `branch` or a local `repo_path`. The optional
+`strategy` is `interface_contract` (default), `sequential_order`, `file_ownership`
+or `rebase_agreement`. Read the returned revision, then use
+`respond_negotiation` with that exact revision and an `accept`, `counter`,
+`reject` or `resolve` decision. A counter requires a nonempty `counter_plan`;
+only the proposer can resolve. Reload with `list_negotiations` after a revision
+changes. These agreements do not apply edits to the working tree.
+
+See [Iggy streaming and coordination](/reference/iggy) for retry IDs, compatibility
+with older peers and signed negotiation recovery. File activity remains live-only.

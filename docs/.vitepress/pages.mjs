@@ -11,6 +11,7 @@ export const pages = [
   { path: 'guide/memory-and-skills', title: 'Memory and skills', group: 'Work together' },
   { path: 'guide/repository-awareness', title: 'Repository awareness', group: 'Work together' },
   { path: 'reference/tools', title: 'MCP tools', group: 'Reference' },
+  { path: 'reference/iggy', title: 'Iggy streaming and coordination', group: 'Reference' },
   { path: 'reference/configuration', title: 'Configuration', group: 'Reference' },
   { path: 'reference/identity', title: 'Identity and trust', group: 'Reference' },
   { path: 'reference/architecture', title: 'Architecture', group: 'Reference' },

@@ -26,6 +26,11 @@
 | **vote_skill** | Upvote (+1) or downvote (-1) a skill. Votes propagate to all peers. |
 | **get_skill** | Retrieve a specific skill by its content hash. |
 | **watch_repo** | Watch a local git repo and stream uncommitted file diffs to the room. |
+| **set_watch_context** | Update agent, worktree, task and sprint context for a watched repo; empty values clear overrides. |
+| **analyze_file_impact** | Report static Rust/TypeScript dependencies, affected files, touched symbols and analysis limitations. |
+| **propose_operation** | Publish a coordination proposal for target files and return its revision. |
+| **respond_negotiation** | Accept, counter, reject or resolve a proposal using its exact revision. |
+| **list_negotiations** | Read proposals with optional room, repo, sprint and path filters. |
 | **unwatch_repo** | Stop watching a repository. |
 | **check_file_activity** | See which peers recently changed which files in a watched repo. |
 | **get_peer_diff** | Read a peer's latest diff for a specific file. |

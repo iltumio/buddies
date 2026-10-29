@@ -70,3 +70,6 @@ If binary compilation fails, the release stays a draft. Rerun the failed jobs,
 or manually run the **Build** workflow with `release_tag` set to the existing
 version tag. Uploads are idempotent. Regular CI can also be run manually through
 its `workflow_dispatch` trigger.
+
+For the optional Iggy transport, compatibility constraints and the disposable
+server test, see [Iggy streaming and coordination](./reference/iggy.md).

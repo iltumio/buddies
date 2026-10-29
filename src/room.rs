@@ -324,6 +324,10 @@ impl RoomManager {
         &self.user_name
     }
 
+    pub fn agent_name(&self) -> &str {
+        &self.agent_name
+    }
+
     pub async fn join_room(
         self: &Arc<Self>,
         room_name: &str,
@@ -476,13 +480,30 @@ impl RoomManager {
             .sender
             .clone()
             .ok_or_else(|| anyhow::anyhow!("room is reconnecting: {room_name}"))?;
-        let msg = self.try_sign_message(msg).await?;
-        let bytes = msg.to_bytes();
-        anyhow::ensure!(
-            bytes.len() <= crate::node::GOSSIP_MAX_MESSAGE_SIZE,
-            "gossip message exceeds size limit"
-        );
-        tokio::time::timeout(Duration::from_secs(5), sender.broadcast(bytes)).await??;
+        // Publish the frozen legacy shape as well, so rolling upgrades still
+        // deliver basic file activity to old peers. Extended peers merge V2.
+        let messages = if let P2PMessageBody::FileActivityV2 { entry } = &msg.body {
+            vec![
+                P2PMessage::new(P2PMessageBody::FileActivity {
+                    entry: entry.clone(),
+                }),
+                msg,
+            ]
+        } else {
+            vec![msg]
+        };
+        let mut frames = Vec::new();
+        for message in messages {
+            let bytes = self.try_sign_message(message).await?.to_bytes();
+            anyhow::ensure!(
+                bytes.len() <= crate::node::GOSSIP_MAX_MESSAGE_SIZE,
+                "gossip message exceeds size limit"
+            );
+            frames.push(bytes);
+        }
+        for bytes in frames {
+            tokio::time::timeout(Duration::from_secs(5), sender.broadcast(bytes)).await??;
+        }
         Ok(())
     }
 
@@ -780,6 +801,7 @@ impl RoomManager {
             tokio::select! {
                 event = receiver.next_event() => match event? {
                     Some(TransportEvent::Received(content)) => self.handle_message(room, &content).await,
+                    Some(TransportEvent::Historical(content)) => self.handle_historical_message(room, &content).await,
                     Some(TransportEvent::NeighborUp(id)) => {
                         neighbors.insert(id);
                         if known.len() < 128 { known.insert(id); }
@@ -844,12 +866,36 @@ impl RoomManager {
         self.handle_verified_message(room_name, msg).await;
     }
 
+    /// History is limited to signed immutable negotiation events. Presence,
+    /// tasks, votes and other live actions never regain authority through replay.
+    async fn handle_historical_message(&self, room: &str, content: &Bytes) {
+        let Ok(msg) = P2PMessage::from_bytes(content) else {
+            return;
+        };
+        if self.verify_message(room, &msg, true).await {
+            self.handle_verified_message_with_history(room, msg, true)
+                .await;
+        }
+    }
+
     /// Ingress seam after envelope verification. Keeping this crate-visible
     /// lets tests exercise authorization, persistence, and conflict delivery
     /// without constructing a real gossip transport.
     pub(crate) async fn handle_verified_message(&self, room_name: &str, msg: P2PMessage) {
+        self.handle_verified_message_with_history(room_name, msg, false)
+            .await;
+    }
+
+    async fn handle_verified_message_with_history(
+        &self,
+        room_name: &str,
+        msg: P2PMessage,
+        historical: bool,
+    ) {
+        let legacy_activity = matches!(&msg.body, P2PMessageBody::FileActivity { .. });
         let signed_by = msg.signed_by.clone();
-        if signed_by.is_some()
+        if !historical
+            && signed_by.is_some()
             && let Some(peers) = self.peers.write().await.get_mut(room_name)
         {
             for peer in peers
@@ -1106,7 +1152,7 @@ impl RoomManager {
                     warn!(error = %e, "failed to store received skill vote");
                 }
             }
-            P2PMessageBody::FileActivity { entry } => {
+            P2PMessageBody::FileActivity { entry } | P2PMessageBody::FileActivityV2 { entry } => {
                 let author_is_authenticated = {
                     let peers = self.peers.read().await;
                     peers.get(room_name).is_some_and(|room_peers| {
@@ -1121,14 +1167,121 @@ impl RoomManager {
                     warn!(room = %room_name, author = %entry.author, reason, "dropped invalid file activity");
                     return;
                 }
+                if legacy_activity
+                    && let Ok(Some(existing)) = self
+                        .storage
+                        .get_peer_file_activity(&entry.repo, &entry.path, &entry.author, now_unix())
+                        .await
+                    && existing.timestamp >= entry.timestamp
+                    && existing.content_hash == entry.content_hash
+                    && existing.branch == entry.branch
+                    && !existing.agent.is_empty()
+                {
+                    return;
+                }
                 if let Err(e) = self.storage.store_file_activity(&entry, now_unix()).await {
                     warn!(error = %e, "failed to store received file activity");
                 }
-                if let Some(local) = self.dirty.get(&entry.repo, &entry.path) {
-                    info!(repo = %entry.repo, path = %entry.path, peer = %entry.author, "conflicting file activity from peer");
-                    let _ = self
-                        .conflict_broadcast
-                        .send(ConflictEvent { local, peer: entry });
+                for conflict in self.dirty.find_conflicts(&entry) {
+                    info!(
+                        repo = %entry.repo,
+                        path = %entry.path,
+                        local_path = %conflict.local.path,
+                        kind = %conflict.kind,
+                        peer = %entry.author,
+                        "conflicting file activity from peer"
+                    );
+                    let _ = self.conflict_broadcast.send(conflict);
+                }
+            }
+            P2PMessageBody::NegotiationProposed { proposal } => {
+                if proposal.room != room_name
+                    || (proposal.timestamp > now_unix().saturating_add(MAX_MESSAGE_AGE_SECS)
+                        || now_unix().saturating_sub(proposal.timestamp)
+                            > crate::negotiation::NEGOTIATION_RETENTION_SECS)
+                {
+                    warn!(room = %room_name, proposal_room = %proposal.room, "dropped cross-room or stale negotiation proposal");
+                    return;
+                }
+                let identity = signed_by.as_ref().map(|s| s.to_label());
+                let author_is_authenticated = proposal.proposer_identity == identity
+                    && if historical {
+                        identity.is_some()
+                    } else {
+                        let peers = self.peers.read().await;
+                        peers.get(room_name).is_some_and(|room_peers| {
+                            peer_action_is_authenticated(
+                                room_peers,
+                                &proposal.proposer,
+                                signed_by.as_ref(),
+                            )
+                        })
+                    };
+                if !author_is_authenticated {
+                    warn!(room = %room_name, proposer = %proposal.proposer, "dropped negotiation proposal whose proposer does not match the joined peer identity");
+                    return;
+                }
+                if let Err(e) = proposal.validate() {
+                    warn!(room = %room_name, proposer = %proposal.proposer, error = %e, "dropped invalid negotiation proposal");
+                    return;
+                }
+                let now = now_unix();
+                if let Err(e) = self
+                    .storage
+                    .negotiations(move |store| {
+                        store.upsert_proposal(proposal, now)?;
+                        Ok(())
+                    })
+                    .await
+                {
+                    warn!(error = %e, "failed to store received negotiation proposal");
+                }
+            }
+            P2PMessageBody::NegotiationResponded {
+                room,
+                proposal_id,
+                response,
+            } => {
+                if room != room_name
+                    || (response.timestamp > now_unix().saturating_add(MAX_MESSAGE_AGE_SECS)
+                        || now_unix().saturating_sub(response.timestamp)
+                            > crate::negotiation::NEGOTIATION_RETENTION_SECS)
+                {
+                    warn!(room = %room_name, response_room = %room, "dropped cross-room or stale negotiation response");
+                    return;
+                }
+                let identity = signed_by.as_ref().map(|s| s.to_label());
+                let responder_is_authenticated = response.responder_identity == identity
+                    && if historical {
+                        identity.is_some()
+                    } else {
+                        let peers = self.peers.read().await;
+                        peers.get(room_name).is_some_and(|room_peers| {
+                            peer_action_is_authenticated(
+                                room_peers,
+                                &response.responder,
+                                signed_by.as_ref(),
+                            )
+                        })
+                    };
+                if !responder_is_authenticated {
+                    warn!(room = %room_name, responder = %response.responder, "dropped negotiation response whose responder does not match the joined peer identity");
+                    return;
+                }
+                if let Err(e) = response.validate() {
+                    warn!(room = %room_name, responder = %response.responder, error = %e, "dropped invalid negotiation response");
+                    return;
+                }
+                let now = now_unix();
+                if let Err(e) = self
+                    .storage
+                    .negotiations(move |store| {
+                        store.record_response(&room, proposal_id, response, now)?;
+                        Ok(())
+                    })
+                    .await
+                {
+                    warn!(error = %e, "failed to store received negotiation response");
                 }
             }
         }
@@ -1157,6 +1310,19 @@ impl RoomManager {
     }
 
     async fn verify_incoming_message(&self, room_name: &str, msg: &P2PMessage) -> bool {
+        self.verify_message(room_name, msg, false).await
+    }
+
+    async fn verify_message(&self, room_name: &str, msg: &P2PMessage, historical: bool) -> bool {
+        if historical
+            && !matches!(
+                msg.body,
+                P2PMessageBody::NegotiationProposed { .. }
+                    | P2PMessageBody::NegotiationResponded { .. }
+            )
+        {
+            return false;
+        }
         let whitelist = {
             let whitelists = self.room_whitelists.read().await;
             whitelists.get(room_name).cloned().unwrap_or_default()
@@ -1167,7 +1333,7 @@ impl RoomManager {
         };
 
         let Some(identity) = msg.signed_by.as_ref() else {
-            if must_be_signed || !whitelist.is_empty() {
+            if historical || must_be_signed || !whitelist.is_empty() {
                 warn!(room = %room_name, "dropped unsigned message due to identity policy");
                 return false;
             }
@@ -1199,7 +1365,14 @@ impl RoomManager {
 
         // Replay protection, only after the signature checks out so that
         // unverified traffic cannot poison the nonce cache.
-        if !is_message_fresh(msg.sent_at, now_unix()) {
+        let age_limit = if historical {
+            crate::negotiation::NEGOTIATION_RETENTION_SECS
+        } else {
+            MAX_MESSAGE_AGE_SECS
+        };
+        if msg.sent_at > now_unix().saturating_add(MAX_MESSAGE_AGE_SECS)
+            || now_unix().saturating_sub(msg.sent_at) > age_limit
+        {
             warn!(room = %room_name, identity = %identity.to_label(), sent_at = msg.sent_at, "dropped signed message outside freshness window");
             return false;
         }
@@ -1220,7 +1393,7 @@ impl RoomManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::FileActivityEntry;
+    use crate::activity::{ConflictKind, FileActivityEntry};
     use crate::memory::MemoryKind;
     use crate::node::{BuddiesNode, BuddiesNodeConfig};
     use crate::transport::{IrohTransport, LocalHub, TransportBackend};
@@ -1312,12 +1485,19 @@ mod tests {
         FileActivityEntry {
             repo: repo.into(),
             branch: "main".into(),
+            worktree: None,
+            agent: "codex".into(),
+            task_id: None,
+            sprint: None,
             path: path.into(),
             kind: crate::activity::FileChangeKind::Changed,
             diff: "+line\n".into(),
             content_hash: "abc".into(),
             author: author.into(),
             timestamp,
+            touched_symbols: vec![],
+            affected_files: vec![],
+            impact_truncated: false,
         }
     }
 
@@ -1433,6 +1613,50 @@ mod tests {
             vec![peer.clone()]
         );
         let conflict = conflicts.try_recv().expect("conflict event");
+        assert_eq!(conflict.kind, ConflictKind::Direct);
+        assert_eq!(conflict.local, local);
+        assert_eq!(conflict.peer, peer);
+
+        node.shutdown().await.expect("shutdown node");
+    }
+
+    #[tokio::test]
+    async fn verified_ingress_reports_transitive_impact_conflict() {
+        let node = regression_node().await;
+        let mut conflicts = node.subscribe_conflict_events();
+        let now = now_unix();
+        let local = activity("repo", "src/consumer.rs", "local", now);
+        node.room_manager.dirty.update_repo(
+            "repo",
+            HashSet::from(["src/consumer.rs".to_string()]),
+            [local.clone()],
+        );
+
+        node.room_manager
+            .handle_verified_message(
+                "room-a",
+                P2PMessage::new(P2PMessageBody::Join {
+                    name: "alice".into(),
+                    agent: "codex".into(),
+                }),
+            )
+            .await;
+
+        let mut peer = activity("repo", "src/shared.rs", "alice", now);
+        peer.touched_symbols = vec!["SharedContract".into()];
+        peer.affected_files = vec!["src/consumer.rs".into()];
+
+        node.room_manager
+            .handle_verified_message(
+                "room-a",
+                P2PMessage::new(P2PMessageBody::FileActivity {
+                    entry: peer.clone(),
+                }),
+            )
+            .await;
+
+        let conflict = conflicts.try_recv().expect("impact conflict event");
+        assert_eq!(conflict.kind, ConflictKind::Impact);
         assert_eq!(conflict.local, local);
         assert_eq!(conflict.peer, peer);
 
@@ -2149,5 +2373,51 @@ mod tests {
         returned.shutdown().await;
         ta.shutdown().await.unwrap();
         tb.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_history_recovers_negotiations_without_replaying_live_actions() {
+        let node = regression_node().await;
+        let (_keys, signer) = crate::identity::test_signer().await;
+        let now = now_unix();
+        let mut proposal = crate::negotiation::tests::fixture_proposal(now - 3600);
+        proposal.proposer_identity = Some(signer.identity().to_label());
+        let id = proposal.id;
+        let mut msg = P2PMessage::new(P2PMessageBody::NegotiationProposed { proposal });
+        msg.sent_at = now - 3600;
+        msg.signature = Some(signer.sign(&msg.signing_payload()).await.unwrap());
+        msg.signed_by = Some(signer.identity());
+        node.room_manager
+            .handle_message("dev", &msg.to_bytes())
+            .await;
+        assert!(
+            node.storage
+                .read_negotiations(move |s| Ok(s.get(id).cloned()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        node.room_manager
+            .handle_historical_message("dev", &msg.to_bytes())
+            .await;
+        assert!(
+            node.storage
+                .read_negotiations(move |s| Ok(s.get(id).cloned()))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let mut live = P2PMessage::new(P2PMessageBody::Join {
+            name: "ghost".into(),
+            agent: "codex".into(),
+        });
+        live.sent_at = now - 3600;
+        live.signature = Some(signer.sign(&live.signing_payload()).await.unwrap());
+        live.signed_by = Some(signer.identity());
+        node.room_manager
+            .handle_historical_message("dev", &live.to_bytes())
+            .await;
+        assert!(node.room_manager.get_room_peers("dev").await.is_empty());
+        node.shutdown().await.unwrap();
     }
 }

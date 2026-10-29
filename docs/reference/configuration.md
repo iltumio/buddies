@@ -19,6 +19,28 @@
 | `BUDDIES_SSH_PUBLIC_KEY` | inferred | SSH public key value or path when `BUDDIES_SIGNER=ssh` |
 | `BUDDIES_SIGNING_KEY` | unset | Generic fallback for `BUDDIES_GPG_KEY_ID` or `BUDDIES_SSH_PRIVATE_KEY` |
 
+## Room transport
+
+`BUDDIES_NET_TRANSPORT` selects communication between peers independently of the
+stdio/HTTP MCP setting `BUDDIES_TRANSPORT`.
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `BUDDIES_NET_TRANSPORT` | `iroh` | `iroh`, `iggy`, or process-local `local` |
+| `BUDDIES_IGGY_URL` | required for Iggy | Connection URL; `memory` explicitly selects the nonpersistent in-process test broker |
+| `BUDDIES_IGGY_STREAM` | `buddies` | Shared stream containing room topics |
+| `BUDDIES_IGGY_PARTITIONS` | `1` | Exactly one partition per room is supported |
+| `BUDDIES_IGGY_POLL_MS` | `40` | Poll interval, clamped to 5–5000 ms |
+| `BUDDIES_IGGY_REPLAY` | `true` | `false`, `0`, or `latest` disables historical replay |
+| `BUDDIES_IGGY_USERNAME` | `iggy` | Username when the URL is supplied as a bare host and port |
+| `BUDDIES_IGGY_PASSWORD` | `iggy` | Password when the URL is supplied as a bare host and port |
+| `BUDDIES_IGGY_PROTOCOL` | TCP | Protocol suffix when constructing a URL from a bare host and port |
+
+URL lookup falls back to `BUDDIES_IGGY_CONNECTION_STRING`, then
+`IGGY_CONNECTION_STRING`. A full URL supplies its own credentials and protocol.
+See [Iggy streaming and coordination](./iggy.md) for the compatible server version
+and which signed events may be recovered from history.
+
 ### Startup identity options
 
 - Use existing git signing identity (default):

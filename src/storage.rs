@@ -9,6 +9,9 @@ use crate::activity::FileActivityEntry;
 use crate::memory::{MemoryEntry, SearchFilters};
 use crate::skill::{SkillEntry, SkillSearchFilters, SkillSearchResult, SkillVote};
 
+const NEGOTIATIONS_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("negotiation_proposals_v2");
+
 const ROOM_TICKETS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("room_tickets");
 const NODE_SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("node_settings");
 
@@ -43,6 +46,7 @@ impl Storage {
             let _ = tx.open_table(SKILLS_TABLE)?;
             let _ = tx.open_table(SKILL_VOTES_TABLE)?;
             let _ = tx.open_table(FILE_ACTIVITY_TABLE)?;
+            let _ = tx.open_table(NEGOTIATIONS_TABLE)?;
         }
         tx.commit()?;
         Ok(Self { db })
@@ -58,6 +62,7 @@ impl Storage {
             let _ = tx.open_table(SKILLS_TABLE)?;
             let _ = tx.open_table(SKILL_VOTES_TABLE)?;
             let _ = tx.open_table(FILE_ACTIVITY_TABLE)?;
+            let _ = tx.open_table(NEGOTIATIONS_TABLE)?;
         }
         tx.commit()?;
         Ok(Self { db })
@@ -111,6 +116,54 @@ impl Storage {
         };
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Each proposal is its own row; unchanged histories are never rewritten.
+    pub fn negotiations<T>(
+        &self,
+        operation: impl FnOnce(&mut crate::negotiation::NegotiationStore) -> Result<T>,
+    ) -> Result<T> {
+        let tx = self.db.begin_write()?;
+        let result = {
+            let mut table = tx.open_table(NEGOTIATIONS_TABLE)?;
+            let mut previous = std::collections::BTreeMap::new();
+            let mut entries = Vec::new();
+            for row in table.iter()? {
+                let (key, value) = row?;
+                let proposal: crate::negotiation::NegotiationProposal =
+                    serde_json::from_slice(value.value())?;
+                entries.push(proposal.clone());
+                previous.insert(key.value().to_owned(), proposal);
+            }
+            let mut store = crate::negotiation::NegotiationStore::from_entries(entries);
+            let result = operation(&mut store)?;
+            for proposal in store.entries() {
+                let key = proposal.id.to_string();
+                if previous.remove(&key).as_ref() != Some(proposal) {
+                    let bytes = serde_json::to_vec(proposal)?;
+                    table.insert(key.as_str(), bytes.as_slice())?;
+                }
+            }
+            for key in previous.keys() {
+                table.remove(key.as_str())?;
+            }
+            result
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub fn read_negotiations<T>(
+        &self,
+        operation: impl FnOnce(&crate::negotiation::NegotiationStore) -> Result<T>,
+    ) -> Result<T> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(NEGOTIATIONS_TABLE)?;
+        let mut entries = Vec::new();
+        for row in table.iter()? {
+            entries.push(serde_json::from_slice(row?.1.value())?);
+        }
+        operation(&crate::negotiation::NegotiationStore::from_entries(entries))
     }
 
     /// Create the transport identity once, atomically with its persistence.
@@ -449,12 +502,19 @@ mod tests {
         FileActivityEntry {
             repo: repo.to_string(),
             branch: "main".to_string(),
+            worktree: None,
+            agent: "codex".to_string(),
+            task_id: None,
+            sprint: None,
             path: path.to_string(),
             kind: FileChangeKind::Changed,
             diff: "+line\n".to_string(),
             content_hash: "abc".to_string(),
             author: peer.to_string(),
             timestamp,
+            touched_symbols: vec![],
+            affected_files: vec![],
+            impact_truncated: false,
         }
     }
 
@@ -748,6 +808,33 @@ mod tests {
             storage
                 .search_skills("", &crate::skill::SkillSearchFilters::default(), 50)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn negotiation_rows_survive_reopen_and_rejected_mutations_are_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("negotiations.redb");
+        let proposal = crate::negotiation::tests::fixture_proposal(100);
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage
+                .negotiations(|store| store.upsert_proposal(proposal.clone(), 100))
+                .unwrap();
+            let mut forged = proposal.clone();
+            forged.proposer = "mallory".into();
+            assert!(
+                storage
+                    .negotiations(|store| store.upsert_proposal(forged, 100))
+                    .is_err()
+            );
+        }
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(
+            storage
+                .read_negotiations(|store| Ok(store.get(proposal.id).cloned()))
+                .unwrap(),
+            Some(proposal)
         );
     }
 }

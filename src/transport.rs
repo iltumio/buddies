@@ -13,6 +13,7 @@ use iroh_gossip::net::Gossip;
 use tokio::sync::{Mutex, Notify, broadcast};
 
 use crate::async_storage::AsyncStorage;
+use crate::iggy_transport::{IggyConfig, IggyTransport};
 use crate::protocol::TopicId;
 
 /// Maximum gossip frame size. Must comfortably exceed the largest message
@@ -33,6 +34,8 @@ pub type RoomSubscription = (Arc<dyn RoomSender>, Box<dyn RoomReceiver>);
 pub enum TransportEvent {
     /// A serialized `P2PMessage` payload arrived on the room topic.
     Received(Bytes),
+    /// A record predating this subscription; only authenticated durable events may replay.
+    Historical(Bytes),
     /// A direct transport neighbor became reachable on this topic.
     NeighborUp(EndpointId),
     /// A direct transport neighbor disconnected on this topic.
@@ -58,7 +61,8 @@ pub trait RoomReceiver: Send {
 
 /// Pluggable communication transport for room pub/sub and peer discovery.
 ///
-/// Implementations include [`IrohTransport`] (P2P over `iroh` + `iroh-gossip`)
+/// Implementations include [`IrohTransport`] (P2P over `iroh` + `iroh-gossip`),
+/// [`IggyTransport`] (persistent message streaming over `iggy-rs`),
 /// and [`LocalTransport`] (in-memory pub/sub without any network sockets).
 pub trait RoomTransport: Send + Sync {
     /// Stable node/endpoint identifier for this transport instance.
@@ -87,6 +91,8 @@ pub enum TransportBackend {
     /// P2P QUIC + gossip transport powered by Iroh (default).
     #[default]
     Iroh,
+    /// Persistent message streaming powered by Apache Iggy (`iggy-rs`).
+    Iggy(IggyConfig),
     /// In-memory transport (no UDP/QUIC sockets; shares a [`LocalHub`] across in-process nodes).
     Local(LocalHub),
     /// Custom user-provided [`RoomTransport`] implementation.
@@ -98,6 +104,7 @@ impl std::fmt::Debug for TransportBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Iroh => f.write_str("TransportBackend::Iroh"),
+            Self::Iggy(_) => f.write_str("TransportBackend::Iggy"),
             Self::Local(_) => f.write_str("TransportBackend::Local"),
             Self::Custom(_) => f.write_str("TransportBackend::Custom"),
         }
@@ -105,14 +112,15 @@ impl std::fmt::Debug for TransportBackend {
 }
 
 impl TransportBackend {
-    /// Resolve the transport backend from `BUDDIES_NET_TRANSPORT` (`"iroh"` or `"local"`).
+    /// Resolve the transport backend from `BUDDIES_NET_TRANSPORT` (`"iroh"`, `"iggy"`, or `"local"`).
     pub fn from_env() -> Result<Self> {
         match std::env::var("BUDDIES_NET_TRANSPORT") {
             Ok(val) => match val.trim().to_ascii_lowercase().as_str() {
                 "" | "iroh" | "p2p" => Ok(Self::Iroh),
+                "iggy" | "iggy-rs" | "stream" => Ok(Self::Iggy(IggyConfig::from_env()?)),
                 "local" | "memory" | "in-memory" => Ok(Self::Local(LocalHub::global())),
                 other => anyhow::bail!(
-                    "unsupported BUDDIES_NET_TRANSPORT '{other}' (expected 'iroh' or 'local')"
+                    "unsupported BUDDIES_NET_TRANSPORT '{other}' (expected 'iroh', 'iggy', or 'local')"
                 ),
             },
             Err(_) => Ok(Self::Iroh),
@@ -124,6 +132,12 @@ impl TransportBackend {
             Self::Iroh => {
                 let secret = storage.endpoint_secret().await?;
                 Ok(Arc::new(IrohTransport::bind(secret).await?))
+            }
+            Self::Iggy(config) => {
+                let secret = storage.endpoint_secret().await?;
+                Ok(Arc::new(
+                    IggyTransport::new(secret.public(), config.clone()).await?,
+                ))
             }
             Self::Local(hub) => {
                 let secret = storage.endpoint_secret().await?;

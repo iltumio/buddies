@@ -47,7 +47,7 @@ for the other mode.
 
 To configure a machine as an autonomous orchestrator that accepts delegated tasks
 and creates specialists with scoped access to local machine resources, pass
-`--config <path>` (see [`contrib/orchestrator.toml`](../contrib/orchestrator.toml)):
+`--config <path>` (see [`contrib/orchestrator.toml`](https://github.com/iltumio/buddies/blob/main/contrib/orchestrator.toml)):
 
 ```toml
 room = "Machine-Orchestrator"
@@ -77,7 +77,7 @@ buddies orchestrator --config ~/.config/buddies/orchestrator.toml
 ```
 
 Or install it as a user `systemd` service using
-[`contrib/systemd/buddies-orchestrator.service`](../contrib/systemd/buddies-orchestrator.service):
+[`contrib/systemd/buddies-orchestrator.service`](https://github.com/iltumio/buddies/blob/main/contrib/systemd/buddies-orchestrator.service):
 
 ```sh
 mkdir -p ~/.config/systemd/user ~/.config/buddies
